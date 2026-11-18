@@ -8,6 +8,7 @@ import type {
   UserPreferences,
   ViewMode,
 } from '../types/attendance';
+import { normalizeMemberType } from './attendance';
 
 export const SESSIONS_STORAGE_KEY = 'team-spirit:sessions:v1';
 export const MEMBERS_STORAGE_KEY = 'team-spirit:members:v1';
@@ -42,6 +43,7 @@ export const DEFAULT_PREFERENCES: UserPreferences = {
   activeSessionId: null,
   selectedMemberId: null,
   viewMode: 'list',
+  sessionHubViewMode: 'grid',
   calendarViewMode: 'month',
   filter: 'all',
   searchQuery: '',
@@ -72,9 +74,12 @@ function isValidMember(value: unknown): value is ClubMember {
 }
 
 function normalizeMember(raw: ClubMember): ClubMember {
+  const memberType = normalizeMemberType(raw.memberType);
   return {
     id: raw.id,
     name: raw.name.trim(),
+    memberType,
+    className: memberType === 'student' ? cleanOptionalString(raw.className) : undefined,
     role: cleanOptionalString(raw.role),
     email: cleanOptionalString(raw.email),
     phone: cleanOptionalString(raw.phone),
@@ -267,6 +272,12 @@ export function loadPreferences(): UserPreferences {
         ? (parsed.viewMode as ViewMode)
         : DEFAULT_PREFERENCES.viewMode;
 
+    const sessionHubViewMode =
+      typeof parsed.sessionHubViewMode === 'string' &&
+      VALID_VIEWS.has(parsed.sessionHubViewMode as ViewMode)
+        ? (parsed.sessionHubViewMode as ViewMode)
+        : DEFAULT_PREFERENCES.sessionHubViewMode;
+
     const calendarViewMode =
       typeof parsed.calendarViewMode === 'string' &&
       VALID_CALENDAR_VIEWS.has(parsed.calendarViewMode as CalendarViewMode)
@@ -300,6 +311,7 @@ export function loadPreferences(): UserPreferences {
       activeSessionId,
       selectedMemberId,
       viewMode,
+      sessionHubViewMode,
       calendarViewMode,
       filter,
       searchQuery,

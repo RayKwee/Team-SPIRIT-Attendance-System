@@ -3,10 +3,12 @@ import type {
   AttendanceStatus,
   ClubMember,
   LocalSyncStore,
+  MemberType,
   SyncedAttendanceRecord,
   SyncedMemberRecord,
   SyncedSessionRecord,
 } from '../types/attendance';
+import { normalizeMemberType } from '../utils/attendance';
 import {
   clearLegacyWorkspaceStorage,
   loadMembers as loadLegacyMembers,
@@ -20,6 +22,8 @@ export const LOCAL_ONLY_STORE_KEY = 'team-spirit:local-store:v1';
 interface DbMemberRow {
   id: string;
   name: string;
+  member_type?: string | null;
+  class_name: string | null;
   role: string | null;
   email: string | null;
   phone: string | null;
@@ -63,12 +67,16 @@ export interface RemoteSnapshot {
 const MISSING_TABLE_USER_MESSAGE =
   'Supabase tables (club_members, attendance_sessions, session_attendance) were not found. Run supabase/schema.sql in your Supabase SQL Editor, then click to retry.';
 
+const MISSING_COLUMN_USER_MESSAGE =
+  'Supabase club_members columns (member_type, class_name) are missing. Run the updated supabase/schema.sql in your Supabase SQL Editor, then click to retry.';
+
 const PERMISSION_DENIED_USER_MESSAGE =
   'Supabase denied access (403 Forbidden). Run the updated GRANT & RLS script in supabase/schema.sql in your Supabase SQL Editor, then click to retry.';
 
 const AUTH_EXPIRED_USER_MESSAGE =
   'Your Supabase Cloud Sync session expired or is invalid. Sign out and sign back in via Cloud Sync.';
 
+const MISSING_COLUMN_PATTERN = /could not find the .* column|column .* does not exist/i;
 const MISSING_TABLE_PATTERN = /could not find the table|relation .* does not exist|schema cache/i;
 const PERMISSION_DENIED_PATTERN =
   /permission denied|insufficient_privilege|row-level security|forbidden|not allowed/i;
@@ -80,6 +88,7 @@ export class SupabaseSyncError extends Error {
   readonly code?: string;
   readonly status?: number;
   readonly isMissingTable: boolean;
+  readonly isMissingColumn: boolean;
   readonly isPermissionDenied: boolean;
   readonly isAuthExpired: boolean;
 
@@ -89,6 +98,7 @@ export class SupabaseSyncError extends Error {
       code?: string;
       status?: number;
       isMissingTable?: boolean;
+      isMissingColumn?: boolean;
       isPermissionDenied?: boolean;
       isAuthExpired?: boolean;
     },
@@ -98,6 +108,7 @@ export class SupabaseSyncError extends Error {
     this.code = options?.code;
     this.status = options?.status;
     this.isMissingTable = Boolean(options?.isMissingTable);
+    this.isMissingColumn = Boolean(options?.isMissingColumn);
     this.isPermissionDenied = Boolean(options?.isPermissionDenied);
     this.isAuthExpired = Boolean(options?.isAuthExpired);
   }
@@ -147,6 +158,20 @@ export function toSupabaseSyncError(
     }
   } else if (typeof error === 'string') {
     rawMessage = error;
+  }
+
+  const isMissingColumn =
+    code === 'PGRST204' ||
+    code === '42703' ||
+    MISSING_COLUMN_PATTERN.test(rawMessage) ||
+    MISSING_COLUMN_PATTERN.test(details);
+
+  if (isMissingColumn) {
+    return new SupabaseSyncError(MISSING_COLUMN_USER_MESSAGE, {
+      code,
+      status: status ?? 400,
+      isMissingColumn: true,
+    });
   }
 
   const isMissingTable =
@@ -239,9 +264,12 @@ function cleanOptionalText(value: string | null | undefined): string | undefined
 }
 
 export function memberFromDbRow(row: DbMemberRow): SyncedMemberRecord {
+  const memberType = normalizeMemberType(row.member_type);
   return {
     id: row.id,
     name: row.name,
+    memberType,
+    className: memberType === 'student' ? cleanOptionalText(row.class_name) : undefined,
     role: cleanOptionalText(row.role),
     email: cleanOptionalText(row.email),
     phone: cleanOptionalText(row.phone),
@@ -255,9 +283,12 @@ export function memberFromDbRow(row: DbMemberRow): SyncedMemberRecord {
 }
 
 export function memberToDbRow(member: SyncedMemberRecord): DbMemberRow {
+  const memberType: MemberType = normalizeMemberType(member.memberType);
   return {
     id: member.id,
     name: member.name,
+    member_type: memberType,
+    class_name: memberType === 'student' ? (member.className ?? null) : null,
     role: member.role ?? null,
     email: member.email ?? null,
     phone: member.phone ?? null,
@@ -338,8 +369,20 @@ function loadStoreByKey(storageKey: string): LocalSyncStore {
     const raw = window.localStorage.getItem(storageKey);
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<LocalSyncStore>;
+      const normalizedMembers: Record<string, SyncedMemberRecord> = {};
+      if (parsed.members && typeof parsed.members === 'object') {
+        for (const [id, rec] of Object.entries(parsed.members)) {
+          if (!rec || typeof rec !== 'object') continue;
+          const memberType = normalizeMemberType(rec.memberType);
+          normalizedMembers[id] = {
+            ...rec,
+            memberType,
+            className: memberType === 'student' ? cleanOptionalText(rec.className) : undefined,
+          };
+        }
+      }
       store = {
-        members: parsed.members && typeof parsed.members === 'object' ? parsed.members : {},
+        members: normalizedMembers,
         sessions: parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {},
         attendance:
           parsed.attendance && typeof parsed.attendance === 'object' ? parsed.attendance : {},

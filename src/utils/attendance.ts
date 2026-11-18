@@ -3,6 +3,7 @@ import type {
   AttendanceStatus,
   ClubMember,
   MemberProfileInput,
+  MemberType,
 } from '../types/attendance';
 
 export const STATUS_LABELS: Record<AttendanceStatus, string> = {
@@ -11,6 +12,22 @@ export const STATUS_LABELS: Record<AttendanceStatus, string> = {
   absent_without_reason: 'Absent w/o Reason',
   unmarked: 'Unmarked',
 };
+
+export const MEMBER_TYPE_LABELS: Record<MemberType, string> = {
+  student: 'Student',
+  teacher: 'Teacher',
+  visitor: 'Visitor',
+};
+
+export const MEMBER_TYPES: readonly MemberType[] = ['student', 'teacher', 'visitor'];
+
+/** Normalizes any unknown or legacy memberType value to a valid MemberType. */
+export function normalizeMemberType(value: unknown): MemberType {
+  if (value === 'teacher' || value === 'visitor' || value === 'student') {
+    return value;
+  }
+  return 'student';
+}
 
 export interface SessionAttendanceSummary {
   totalMembers: number;
@@ -43,10 +60,13 @@ export function generateId(prefix: string): string {
 export function buildClubMember(input: string | MemberProfileInput): ClubMember {
   const normalized: MemberProfileInput =
     typeof input === 'string' ? { name: input } : input;
+  const memberType = normalizeMemberType(normalized.memberType);
   const now = new Date().toISOString();
   return {
     id: generateId('member'),
     name: normalized.name.trim(),
+    memberType,
+    className: memberType === 'student' ? normalized.className?.trim() || undefined : undefined,
     role: normalized.role?.trim() || undefined,
     email: normalized.email?.trim() || undefined,
     phone: normalized.phone?.trim() || undefined,
@@ -63,9 +83,12 @@ export function applyMemberProfileUpdate(
   member: ClubMember,
   input: MemberProfileInput,
 ): ClubMember {
+  const memberType = normalizeMemberType(input.memberType ?? member.memberType);
   return {
     ...member,
     name: input.name.trim(),
+    memberType,
+    className: memberType === 'student' ? input.className?.trim() || undefined : undefined,
     role: input.role?.trim() || undefined,
     email: input.email?.trim() || undefined,
     phone: input.phone?.trim() || undefined,

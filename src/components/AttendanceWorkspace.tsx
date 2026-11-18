@@ -16,13 +16,16 @@ import type {
   ViewMode,
 } from '../types/attendance';
 import {
+  MEMBER_TYPE_LABELS,
   STATUS_LABELS,
   getMemberInitials,
   getSessionAssignedMembers,
+  normalizeMemberType,
 } from '../utils/attendance';
 import { formatSessionDate, formatSessionTime, formatTimestamp } from '../utils/date';
 import { ConfirmDialog } from './ConfirmDialog';
 import {
+  PixelArrowLeftIcon,
   PixelCalendarIcon,
   PixelClockIcon,
   PixelCloseIcon,
@@ -38,14 +41,12 @@ import {
 } from './PixelIcons';
 
 interface AttendanceWorkspaceProps {
-  sessions: AttendanceSession[];
-  activeSession: AttendanceSession | null;
+  activeSession: AttendanceSession;
   members: ClubMember[];
   preferences: UserPreferences;
-  onOpenCreateSession: () => void;
+  onBackToHub: () => void;
   onOpenMemberManager: () => void;
   onOpenMemberProfile: (memberId: string) => void;
-  onSelectSession: (sessionId: string) => void;
   onDeleteSession: (sessionId: string) => void;
   onAssignMemberToSession: (memberId: string) => void;
   onRemoveMemberFromSession: (memberId: string) => void;
@@ -145,14 +146,12 @@ function MemberAttendanceControls({
 
 /** Focused session attendance workspace with directory search-and-suggest assignment. */
 export function AttendanceWorkspace({
-  sessions,
   activeSession,
   members,
   preferences,
-  onOpenCreateSession,
+  onBackToHub,
   onOpenMemberManager,
   onOpenMemberProfile,
-  onSelectSession,
   onDeleteSession,
   onAssignMemberToSession,
   onRemoveMemberFromSession,
@@ -203,7 +202,14 @@ export function AttendanceWorkspace({
     const query = suggestQuery.trim().toLowerCase();
     const matches = members.filter((member) => {
       if (!query) return true;
-      return [member.name, member.role, member.handle]
+      const memberType = normalizeMemberType(member.memberType);
+      return [
+        member.name,
+        memberType === 'student' ? member.className : undefined,
+        MEMBER_TYPE_LABELS[memberType],
+        member.role,
+        member.handle,
+      ]
         .filter((value): value is string => Boolean(value))
         .some((value) => value.toLowerCase().includes(query));
     });
@@ -226,11 +232,11 @@ export function AttendanceWorkspace({
 
   useEffect(() => {
     setHighlightedIndex(0);
-  }, [suggestQuery, activeSession?.id]);
+  }, [suggestQuery, activeSession.id]);
 
   const activePendingAction =
     pendingAction?.kind === 'session'
-      ? sessions.some((session) => session.id === pendingAction.session.id)
+      ? activeSession.id === pendingAction.session.id
         ? pendingAction
         : null
       : pendingAction?.kind === 'remove_from_session'
@@ -239,45 +245,12 @@ export function AttendanceWorkspace({
           : null
         : null;
 
-  if (!activeSession) {
-    return (
-      <section className="tracker-panel" aria-label="Attendance session workspace">
-        <div className="tracker-panel-header">
-          <div className="panel-title-group">
-            <h2 className="panel-title">Session Workspace</h2>
-            <span className="sync-pill" title="Changes save automatically to local browser storage">
-              <span className="sync-dot" aria-hidden="true" />
-              Saved Locally
-            </span>
-          </div>
-        </div>
-
-        <div className="reserved-empty-state">
-          <div className="empty-badge">
-            <PixelTerminalIcon />
-            <span>No Sessions Logged</span>
-          </div>
-          <h3 className="empty-title">Start your first Team SPIRIT session</h3>
-          <p className="empty-description">
-            Log a session with its date, time, and optional details to build its attendance
-            checklist from your Member Manager directory. Every session and mark saves automatically
-            on this device.
-          </p>
-          <button type="button" className="btn-primary" onClick={onOpenCreateSession}>
-            <PixelPlusIcon />
-            <span>Log First Session</span>
-          </button>
-        </div>
-      </section>
-    );
-  }
-
   const { filter, viewMode, searchQuery, confirmSessionMemberRemoval } = preferences;
   const trimmedQuery = searchQuery.trim().toLowerCase();
 
   function getEntry(memberId: string): SessionAttendanceEntry {
     return (
-      activeSession?.attendance[memberId] ?? {
+      activeSession.attendance[memberId] ?? {
         status: 'unmarked',
         updatedAt: '',
       }
@@ -287,9 +260,12 @@ export function AttendanceWorkspace({
   const filteredMembers = assignedMembers.filter((member) => {
     const entry = getEntry(member.id);
     const matchesStatus = filter === 'all' || entry.status === filter;
+    const memberType = normalizeMemberType(member.memberType);
     const matchesQuery =
       trimmedQuery.length === 0 ||
       member.name.toLowerCase().includes(trimmedQuery) ||
+      (memberType === 'student' && Boolean(member.className?.toLowerCase().includes(trimmedQuery))) ||
+      MEMBER_TYPE_LABELS[memberType].toLowerCase().includes(trimmedQuery) ||
       Boolean(member.role?.toLowerCase().includes(trimmedQuery));
     return matchesStatus && matchesQuery;
   });
@@ -367,35 +343,22 @@ export function AttendanceWorkspace({
     <section className="tracker-panel" aria-label="Attendance session workspace">
       <div className="tracker-panel-header">
         <div className="panel-title-group">
+          <button
+            type="button"
+            className="btn-secondary btn-compact checklist-back-btn"
+            onClick={onBackToHub}
+            title="Return to Sessions Hub"
+          >
+            <PixelArrowLeftIcon />
+            <span>All Sessions</span>
+          </button>
           <h2 className="panel-title">Session Checklist</h2>
           <span className="panel-count">
             {filteredMembers.length} / {assignedMembers.length}
           </span>
-          <span className="sync-pill" title="Changes save automatically to local browser storage">
-            <span className="sync-dot" aria-hidden="true" />
-            Saved Locally
-          </span>
         </div>
 
         <div className="panel-header-actions">
-          {sessions.length > 1 && (
-            <label className="session-select-wrap">
-              <span className="sr-only">Switch active session</span>
-              <select
-                className="form-control session-select"
-                value={activeSession.id}
-                onChange={(event) => onSelectSession(event.target.value)}
-                aria-label="Active session"
-              >
-                {sessions.map((session) => (
-                  <option key={session.id} value={session.id}>
-                    {session.name} ({session.date})
-                  </option>
-                ))}
-              </select>
-            </label>
-          )}
-
           {assignedMembers.length > 0 && (
             <button
               type="button"
@@ -469,7 +432,7 @@ export function AttendanceWorkspace({
             placeholder={
               members.length === 0
                 ? 'No members in Member Manager yet — open Members to create them...'
-                : 'Search Member Manager to add member to this session...'
+                : 'Search by name, class, type, or role to add member...'
             }
             value={suggestQuery}
             onFocus={() => setIsSuggestOpen(true)}
@@ -536,6 +499,7 @@ export function AttendanceWorkspace({
                 <>
                   {availableSuggestions.map((member, index) => {
                     const isHighlighted = index === highlightedIndex;
+                    const memberType = normalizeMemberType(member.memberType);
                     return (
                       <button
                         key={member.id}
@@ -550,7 +514,18 @@ export function AttendanceWorkspace({
                           {getMemberInitials(member.name)}
                         </span>
                         <span className="session-suggest-info">
-                          <span className="session-suggest-name">{member.name}</span>
+                          <span className="session-suggest-name-row">
+                            <span className="session-suggest-name">{member.name}</span>
+                            {memberType === 'student'
+                              ? member.className && (
+                                  <span className="member-class-pill">{member.className}</span>
+                                )
+                              : (
+                                  <span className={`member-type-pill is-${memberType}`}>
+                                    {MEMBER_TYPE_LABELS[memberType]}
+                                  </span>
+                                )}
+                          </span>
                           {(member.role || member.handle) && (
                             <span className="session-suggest-sub">
                               {[member.role, member.handle].filter(Boolean).join(' • ')}
@@ -565,22 +540,36 @@ export function AttendanceWorkspace({
                     );
                   })}
 
-                  {alreadyAssignedSuggestions.map((member) => (
-                    <div
-                      key={member.id}
-                      className="session-suggest-option is-assigned"
-                      aria-disabled="true"
-                    >
-                      <span className="session-suggest-avatar" aria-hidden="true">
-                        {getMemberInitials(member.name)}
-                      </span>
-                      <span className="session-suggest-info">
-                        <span className="session-suggest-name">{member.name}</span>
-                        {member.role && <span className="session-suggest-sub">{member.role}</span>}
-                      </span>
-                      <span className="session-assigned-badge">In session</span>
-                    </div>
-                  ))}
+                  {alreadyAssignedSuggestions.map((member) => {
+                    const memberType = normalizeMemberType(member.memberType);
+                    return (
+                      <div
+                        key={member.id}
+                        className="session-suggest-option is-assigned"
+                        aria-disabled="true"
+                      >
+                        <span className="session-suggest-avatar" aria-hidden="true">
+                          {getMemberInitials(member.name)}
+                        </span>
+                        <span className="session-suggest-info">
+                          <span className="session-suggest-name-row">
+                            <span className="session-suggest-name">{member.name}</span>
+                            {memberType === 'student'
+                              ? member.className && (
+                                  <span className="member-class-pill">{member.className}</span>
+                                )
+                              : (
+                                  <span className={`member-type-pill is-${memberType}`}>
+                                    {MEMBER_TYPE_LABELS[memberType]}
+                                  </span>
+                                )}
+                          </span>
+                          {member.role && <span className="session-suggest-sub">{member.role}</span>}
+                        </span>
+                        <span className="session-assigned-badge">In session</span>
+                      </div>
+                    );
+                  })}
                 </>
               )}
             </div>
@@ -622,7 +611,7 @@ export function AttendanceWorkspace({
             <input
               type="search"
               className="search-input"
-              placeholder="Filter checklist..."
+              placeholder="Filter by name, class, role..."
               value={searchQuery}
               onChange={(event) => onUpdatePreferences({ searchQuery: event.target.value })}
               aria-label="Filter assigned session members"
@@ -680,6 +669,7 @@ export function AttendanceWorkspace({
           <div className="roster-line-list" role="list" aria-label="Session attendance checklist">
             {filteredMembers.map((member) => {
               const entry = getEntry(member.id);
+              const memberType = normalizeMemberType(member.memberType);
 
               return (
                 <article key={member.id} className="roster-line-row" role="listitem">
@@ -693,6 +683,20 @@ export function AttendanceWorkspace({
                       >
                         {member.name}
                       </button>
+                      {memberType === 'student'
+                        ? member.className && (
+                            <span
+                              className="member-class-pill"
+                              title={`Class: ${member.className}`}
+                            >
+                              {member.className}
+                            </span>
+                          )
+                        : (
+                            <span className={`member-type-pill is-${memberType}`}>
+                              {MEMBER_TYPE_LABELS[memberType]}
+                            </span>
+                          )}
                       {member.role && <span className="member-role-pill">{member.role}</span>}
                       <span className={`status-badge status-${entry.status}`}>
                         {STATUS_LABELS[entry.status]}
@@ -732,6 +736,7 @@ export function AttendanceWorkspace({
           <div className="block-grid">
             {filteredMembers.map((member) => {
               const entry = getEntry(member.id);
+              const memberType = normalizeMemberType(member.memberType);
 
               return (
                 <article key={member.id} className="block-card">
@@ -765,6 +770,20 @@ export function AttendanceWorkspace({
                         {member.name}
                       </button>
                     </h3>
+                    {memberType === 'student'
+                      ? member.className && (
+                          <span
+                            className="member-class-pill"
+                            title={`Class: ${member.className}`}
+                          >
+                            {member.className}
+                          </span>
+                        )
+                      : (
+                          <span className={`member-type-pill is-${memberType}`}>
+                            {MEMBER_TYPE_LABELS[memberType]}
+                          </span>
+                        )}
                     {member.role && <span className="member-role-pill">{member.role}</span>}
                   </div>
 

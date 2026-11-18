@@ -6,6 +6,7 @@ import { Header } from './components/Header';
 import { MemberManagerSidebar } from './components/MemberManagerSidebar';
 import { Preloader } from './components/Preloader';
 import { SessionCalendarWorkspace } from './components/SessionCalendarWorkspace';
+import { SessionHub } from './components/SessionHub';
 import { SettingsModal } from './components/SettingsModal';
 import { StatsStrip } from './components/StatsStrip';
 import { useSupabaseAuth } from './hooks/useSupabaseAuth';
@@ -19,7 +20,7 @@ import type {
 } from './types/attendance';
 import { getCurrentPeriodLabel, toIsoDateString } from './utils/date';
 import { usePreloaderPhase } from './utils/preloader';
-import { useAppRoute } from './utils/router';
+import { useAppRoute, type AppPage } from './utils/router';
 import {
   PREFS_STORAGE_KEY,
   loadPreferences,
@@ -58,6 +59,7 @@ export function App() {
   } = useSyncedAttendanceData(isCloudConnected ? user?.id ?? null : null);
 
   const [preferences, setPreferences] = useState<UserPreferences>(() => loadPreferences());
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [selectedDateKey, setSelectedDateKey] = useState<string>(() => toIsoDateString(new Date()));
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
@@ -69,10 +71,9 @@ export function App() {
     handlePreloaderComplete,
   } = usePreloaderPhase();
 
-  const activeSession =
-    sessions.find((session) => session.id === preferences.activeSessionId) ??
-    sessions[0] ??
-    null;
+  const activeSession = activeSessionId
+    ? sessions.find((session) => session.id === activeSessionId) ?? null
+    : null;
 
   // Persist workspace UI preferences locally.
   useEffect(() => {
@@ -94,28 +95,32 @@ export function App() {
   function handleCreateSession(input: NewSessionInput) {
     const newSession = createSession(input);
     setSelectedDateKey(newSession.date);
+    if (activePage === 'tracker') {
+      setActiveSessionId(newSession.id);
+      setPreferences((prev) => ({
+        ...prev,
+        filter: 'all',
+        searchQuery: '',
+      }));
+    }
+  }
+
+  function handleSelectSession(sessionId: string) {
+    setActiveSessionId(sessionId);
     setPreferences((prev) => ({
       ...prev,
-      activeSessionId: newSession.id,
       filter: 'all',
       searchQuery: '',
     }));
   }
 
-  function handleSelectSession(sessionId: string) {
-    setPreferences((prev) => ({ ...prev, activeSessionId: sessionId }));
+  function handleBackToSessionHub() {
+    setActiveSessionId(null);
   }
 
   function handleDeleteSession(sessionId: string) {
-    const remaining = sessions.filter((session) => session.id !== sessionId);
     deleteSession(sessionId);
-    setPreferences((prefPrev) => ({
-      ...prefPrev,
-      activeSessionId:
-        prefPrev.activeSessionId === sessionId
-          ? remaining[0]?.id ?? null
-          : prefPrev.activeSessionId,
-    }));
+    setActiveSessionId((current) => (current === sessionId ? null : current));
   }
 
   function handleAddMember(input: string | MemberProfileInput): ClubMember {
@@ -185,10 +190,21 @@ export function App() {
     setPreferences((prev) => ({ ...prev, ...patch }));
   }
 
+  function handleNavigate(page: AppPage) {
+    if (page === 'tracker') {
+      setActiveSessionId(null);
+    }
+    if (page !== activePage) {
+      navigateTo(page);
+    }
+  }
+
   function handleOpenSessionInTracker(sessionId: string) {
+    setActiveSessionId(sessionId);
     setPreferences((prev) => ({
       ...prev,
-      activeSessionId: sessionId,
+      filter: 'all',
+      searchQuery: '',
     }));
     navigateTo('tracker');
   }
@@ -210,6 +226,7 @@ export function App() {
     setIsCreateModalOpen(false);
     setIsSettingsModalOpen(false);
     setIsCloudSyncModalOpen(false);
+    setActiveSessionId(null);
     setPreferences((prev) => ({
       ...prev,
       activeSessionId: null,
@@ -247,7 +264,7 @@ export function App() {
           syncStatus={syncStatus}
           pendingSyncCount={pendingCount}
           syncError={syncError}
-          onNavigate={navigateTo}
+          onNavigate={handleNavigate}
           onRetrySync={() => void flushPendingChanges()}
           onOpenCloudSync={() => setIsCloudSyncModalOpen(true)}
           onDisconnectCloudSync={() => void handleDisconnectCloudSync()}
@@ -260,29 +277,45 @@ export function App() {
           <div key={activePage} className="workspace-view-stage">
             {activePage === 'tracker' ? (
               <>
-                <StatsStrip members={members} activeSession={activeSession} />
-                <AttendanceWorkspace
+                <StatsStrip
+                  members={members}
                   sessions={sessions}
                   activeSession={activeSession}
-                  members={members}
-                  preferences={preferences}
-                  onOpenCreateSession={() => setIsCreateModalOpen(true)}
-                  onOpenMemberManager={() =>
-                    handleUpdatePreferences({
-                      isMemberSidebarOpen: true,
-                      selectedMemberId: null,
-                    })
-                  }
-                  onOpenMemberProfile={handleOpenMemberProfile}
-                  onSelectSession={handleSelectSession}
-                  onDeleteSession={handleDeleteSession}
-                  onAssignMemberToSession={handleAssignMemberToSession}
-                  onRemoveMemberFromSession={handleRemoveMemberFromSession}
-                  onToggleAttendanceStatus={handleToggleAttendanceStatus}
-                  onSetAbsenceReason={handleSetAbsenceReason}
-                  onResetSessionMarks={handleResetSessionMarks}
-                  onUpdatePreferences={handleUpdatePreferences}
                 />
+                {activeSession ? (
+                  <AttendanceWorkspace
+                    activeSession={activeSession}
+                    members={members}
+                    preferences={preferences}
+                    onBackToHub={handleBackToSessionHub}
+                    onOpenMemberManager={() =>
+                      handleUpdatePreferences({
+                        isMemberSidebarOpen: true,
+                        selectedMemberId: null,
+                      })
+                    }
+                    onOpenMemberProfile={handleOpenMemberProfile}
+                    onDeleteSession={handleDeleteSession}
+                    onAssignMemberToSession={handleAssignMemberToSession}
+                    onRemoveMemberFromSession={handleRemoveMemberFromSession}
+                    onToggleAttendanceStatus={handleToggleAttendanceStatus}
+                    onSetAbsenceReason={handleSetAbsenceReason}
+                    onResetSessionMarks={handleResetSessionMarks}
+                    onUpdatePreferences={handleUpdatePreferences}
+                  />
+                ) : (
+                  <SessionHub
+                    sessions={sessions}
+                    members={members}
+                    viewMode={preferences.sessionHubViewMode}
+                    onChangeViewMode={(mode) =>
+                      handleUpdatePreferences({ sessionHubViewMode: mode })
+                    }
+                    onSelectSession={handleSelectSession}
+                    onDeleteSession={handleDeleteSession}
+                    onOpenCreateSession={() => setIsCreateModalOpen(true)}
+                  />
+                )}
               </>
             ) : (
               <SessionCalendarWorkspace

@@ -12,10 +12,14 @@ import type {
   AttendanceStatus,
   ClubMember,
   MemberProfileInput,
+  MemberType,
 } from '../types/attendance';
 import {
+  MEMBER_TYPES,
+  MEMBER_TYPE_LABELS,
   STATUS_LABELS,
   getMemberInitials,
+  normalizeMemberType,
   summarizeMemberAttendance,
   type MemberAttendanceStats,
 } from '../utils/attendance';
@@ -99,6 +103,8 @@ const RING_CATEGORIES: {
 
 interface MemberFormValues {
   name: string;
+  memberType: MemberType;
+  className: string;
   role: string;
   joinedDate: string;
   email: string;
@@ -110,6 +116,8 @@ interface MemberFormValues {
 function emptyFormValues(): MemberFormValues {
   return {
     name: '',
+    memberType: 'student',
+    className: '',
     role: '',
     joinedDate: '',
     email: '',
@@ -120,8 +128,11 @@ function emptyFormValues(): MemberFormValues {
 }
 
 function memberToFormValues(member: ClubMember): MemberFormValues {
+  const memberType = normalizeMemberType(member.memberType);
   return {
     name: member.name,
+    memberType,
+    className: memberType === 'student' ? (member.className ?? '') : '',
     role: member.role ?? '',
     joinedDate: member.joinedDate ?? '',
     email: member.email ?? '',
@@ -349,7 +360,10 @@ export function MemberManagerSidebar({
 }: MemberManagerSidebarProps) {
   const titleId = useId();
   const roleListId = useId();
+  const classListId = useId();
   const nameInputId = useId();
+  const memberTypeLabelId = useId();
+  const classInputId = useId();
   const roleInputId = useId();
   const joinedInputId = useId();
   const emailInputId = useId();
@@ -358,6 +372,7 @@ export function MemberManagerSidebar({
   const notesInputId = useId();
 
   const nameInputRef = useRef<HTMLInputElement | null>(null);
+  const classInputRef = useRef<HTMLInputElement | null>(null);
 
   const [viewMode, setViewMode] = useState<SidebarViewMode>(() =>
     selectedMemberId && members.some((member) => member.id === selectedMemberId)
@@ -417,6 +432,16 @@ export function MemberManagerSidebar({
     return Array.from(roles).sort((a, b) => a.localeCompare(b));
   }, [members]);
 
+  const distinctClasses = useMemo(() => {
+    const classes = new Set<string>();
+    for (const member of members) {
+      if (normalizeMemberType(member.memberType) === 'student' && member.className) {
+        classes.add(member.className);
+      }
+    }
+    return Array.from(classes).sort((a, b) => a.localeCompare(b));
+  }, [members]);
+
   const memberStatsMap = useMemo(() => {
     const map = new Map<string, MemberAttendanceStats>();
     for (const member of members) {
@@ -433,7 +458,16 @@ export function MemberManagerSidebar({
         (roleFilter === '__unassigned__' ? !member.role : member.role === roleFilter);
       if (!matchesRole) return false;
       if (!query) return true;
-      return [member.name, member.role, member.email, member.phone, member.handle]
+      const memberType = normalizeMemberType(member.memberType);
+      return [
+        member.name,
+        memberType === 'student' ? member.className : undefined,
+        MEMBER_TYPE_LABELS[memberType],
+        member.role,
+        member.email,
+        member.phone,
+        member.handle,
+      ]
         .filter((value): value is string => Boolean(value))
         .some((value) => value.toLowerCase().includes(query));
     });
@@ -491,8 +525,18 @@ export function MemberManagerSidebar({
       return;
     }
 
+    const isStudent = formValues.memberType === 'student';
+    const cleanedClass = formValues.className.trim();
+    if (isStudent && !cleanedClass) {
+      setFormError('Class is required for students.');
+      classInputRef.current?.focus();
+      return;
+    }
+
     const payload: MemberProfileInput = {
       name: cleanedName,
+      memberType: formValues.memberType,
+      className: isStudent ? cleanedClass : undefined,
       role: formValues.role.trim() || undefined,
       joinedDate: formValues.joinedDate.trim() || undefined,
       email: formValues.email.trim() || undefined,
@@ -537,6 +581,10 @@ export function MemberManagerSidebar({
     setPendingDeleteMember(null);
     executeDeleteMember(deletingId);
   }
+
+  const selectedMemberType = selectedMember
+    ? normalizeMemberType(selectedMember.memberType)
+    : 'student';
 
   const displayedAbsences = activeProfileStats
     ? (absenceFilter === 'reasons_only'
@@ -602,7 +650,7 @@ export function MemberManagerSidebar({
                     <input
                       type="search"
                       className="search-input member-search-input"
-                      placeholder="Search name, role, contact..."
+                      placeholder="Search name, class, type, role..."
                       value={searchQuery}
                       onChange={(event) => setSearchQuery(event.target.value)}
                       aria-label="Search member directory"
@@ -642,7 +690,7 @@ export function MemberManagerSidebar({
                     </h3>
                     <p className="empty-description">
                       {members.length === 0
-                        ? 'Add club members with optional role and contact details. Only a name is required.'
+                        ? 'Add students (with class), teachers, or visitors with optional role and contact details.'
                         : 'Try clearing your search term or switching the role filter.'}
                     </p>
                     {members.length === 0 && (
@@ -658,6 +706,7 @@ export function MemberManagerSidebar({
                       const stats = memberStatsMap.get(member.id);
                       const rateLabel =
                         stats && stats.markedRate !== null ? `${stats.markedRate}%` : '--%';
+                      const memberType = normalizeMemberType(member.memberType);
 
                       return (
                         <li key={member.id} className="member-directory-item">
@@ -680,6 +729,20 @@ export function MemberManagerSidebar({
                             <div className="member-directory-main">
                               <div className="member-directory-name-row">
                                 <span className="member-directory-name">{member.name}</span>
+                                {memberType === 'student'
+                                  ? member.className && (
+                                      <span
+                                        className="member-class-pill"
+                                        title={`Class: ${member.className}`}
+                                      >
+                                        {member.className}
+                                      </span>
+                                    )
+                                  : (
+                                      <span className={`member-type-pill is-${memberType}`}>
+                                        {MEMBER_TYPE_LABELS[memberType]}
+                                      </span>
+                                    )}
                                 {member.role && (
                                   <span className="member-role-pill">{member.role}</span>
                                 )}
@@ -773,6 +836,24 @@ export function MemberManagerSidebar({
                     <div className="member-profile-heading">
                       <h3 className="member-profile-name">{selectedMember.name}</h3>
                       <div className="member-profile-badges">
+                        {selectedMemberType === 'student' ? (
+                          <>
+                            {selectedMember.className ? (
+                              <span className="member-class-pill">
+                                Class: {selectedMember.className}
+                              </span>
+                            ) : (
+                              <span className="member-muted-pill">
+                                <span>No class set</span>
+                              </span>
+                            )}
+                            <span className="member-type-pill is-student">Student</span>
+                          </>
+                        ) : (
+                          <span className={`member-type-pill is-${selectedMemberType}`}>
+                            {MEMBER_TYPE_LABELS[selectedMemberType]}
+                          </span>
+                        )}
                         {selectedMember.role ? (
                           <span className="member-role-pill">{selectedMember.role}</span>
                         ) : (
@@ -990,6 +1071,65 @@ export function MemberManagerSidebar({
                     required
                   />
                 </div>
+
+                <div className="form-field">
+                  <span id={memberTypeLabelId} className="form-field-label">
+                    Member Type <span className="required-mark">*</span>
+                  </span>
+                  <div
+                    className="member-type-segmented"
+                    role="radiogroup"
+                    aria-labelledby={memberTypeLabelId}
+                  >
+                    {MEMBER_TYPES.map((typeOption) => {
+                      const isSelected = formValues.memberType === typeOption;
+                      return (
+                        <button
+                          key={typeOption}
+                          type="button"
+                          role="radio"
+                          aria-checked={isSelected}
+                          className={`member-type-option is-${typeOption} ${isSelected ? 'is-selected' : ''}`}
+                          onClick={() => {
+                            setFormValues((prev) => ({ ...prev, memberType: typeOption }));
+                            if (formError) setFormError('');
+                          }}
+                        >
+                          {MEMBER_TYPE_LABELS[typeOption]}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {formValues.memberType === 'student' && (
+                  <div className="form-field">
+                    <label htmlFor={classInputId}>
+                      Class <span className="required-mark">*</span>
+                    </label>
+                    <input
+                      ref={classInputRef}
+                      id={classInputId}
+                      type="text"
+                      list={classListId}
+                      className="form-control"
+                      placeholder="e.g. 4E1, 3A, CS101"
+                      value={formValues.className}
+                      onChange={(event) => {
+                        setFormValues((prev) => ({ ...prev, className: event.target.value }));
+                        if (formError) setFormError('');
+                      }}
+                      required
+                    />
+                    {distinctClasses.length > 0 && (
+                      <datalist id={classListId}>
+                        {distinctClasses.map((cls) => (
+                          <option key={cls} value={cls} />
+                        ))}
+                      </datalist>
+                    )}
+                  </div>
+                )}
 
                 <div className="modal-grid-2">
                   <div className="form-field">

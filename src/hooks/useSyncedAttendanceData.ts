@@ -44,7 +44,12 @@ const BACKGROUND_SYNC_INTERVAL_MS = 15_000;
 const CHANGE_SYNC_COOLDOWN_MS = 1_000;
 
 function isBlockingSyncError(error: SupabaseSyncError): boolean {
-  return error.isMissingTable || error.isPermissionDenied || error.isAuthExpired;
+  return (
+    error.isMissingTable ||
+    error.isMissingColumn ||
+    error.isPermissionDenied ||
+    error.isAuthExpired
+  );
 }
 
 export interface UseSyncedAttendanceDataResult {

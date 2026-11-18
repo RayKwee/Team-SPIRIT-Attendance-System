@@ -140,9 +140,7 @@ export function Header({
               onClick={(event) => {
                 if (!isUnmodifiedPrimaryClick(event)) return;
                 event.preventDefault();
-                if (!isCurrent) {
-                  onNavigate(link.page);
-                }
+                onNavigate(link.page);
               }}
             >
               {link.page === 'tracker' ? <PixelListIcon /> : <PixelCalendarIcon />}

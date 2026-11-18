@@ -10,10 +10,14 @@ export type ViewMode = 'list' | 'grid';
 
 export type CalendarViewMode = 'day' | 'week' | 'month' | 'year';
 
+export type MemberType = 'student' | 'teacher' | 'visitor';
+
 /** Individual club member record keyed by a unique primary key (`id`). */
 export interface ClubMember {
   id: string;
   name: string;
+  memberType?: MemberType;
+  className?: string;
   role?: string;
   email?: string;
   phone?: string;
@@ -27,6 +31,8 @@ export interface ClubMember {
 /** Input payload collected when creating or updating a club member profile. */
 export interface MemberProfileInput {
   name: string;
+  memberType?: MemberType;
+  className?: string;
   role?: string;
   email?: string;
   phone?: string;
@@ -104,6 +110,7 @@ export interface UserPreferences {
   activeSessionId: string | null;
   selectedMemberId: string | null;
   viewMode: ViewMode;
+  sessionHubViewMode: ViewMode;
   calendarViewMode: CalendarViewMode;
   filter: FilterStatus;
   searchQuery: string;

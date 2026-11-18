@@ -5,8 +5,10 @@ import type {
   ClubMember,
 } from '../types/attendance';
 import {
+  MEMBER_TYPE_LABELS,
   STATUS_LABELS,
   getSessionAssignedMembers,
+  normalizeMemberType,
   summarizeSessionAttendance,
   summarizeSessionsAggregate,
   type SessionAttendanceSummary,
@@ -935,18 +937,35 @@ export function SessionCalendarWorkspace({
                             const entry = session.attendance[member.id];
                             const status = entry?.status ?? 'unmarked';
                             const reason = entry?.reason?.trim();
+                            const memberType = normalizeMemberType(member.memberType);
 
                             return (
                               <li key={member.id} className="day-member-item">
                                 <div className="day-member-main">
-                                  <button
-                                    type="button"
-                                    className="day-member-name roster-member-profile-btn"
-                                    onClick={() => onOpenMemberProfile(member.id)}
-                                    title={`View ${member.name}'s profile & stats`}
-                                  >
-                                    {member.name}
-                                  </button>
+                                  <div className="day-member-identity">
+                                    <button
+                                      type="button"
+                                      className="day-member-name roster-member-profile-btn"
+                                      onClick={() => onOpenMemberProfile(member.id)}
+                                      title={`View ${member.name}'s profile & stats`}
+                                    >
+                                      {member.name}
+                                    </button>
+                                    {memberType === 'student'
+                                      ? member.className && (
+                                          <span
+                                            className="member-class-pill"
+                                            title={`Class: ${member.className}`}
+                                          >
+                                            {member.className}
+                                          </span>
+                                        )
+                                      : (
+                                          <span className={`member-type-pill is-${memberType}`}>
+                                            {MEMBER_TYPE_LABELS[memberType]}
+                                          </span>
+                                        )}
+                                  </div>
                                   <span className={`status-badge status-${status}`}>
                                     {STATUS_LABELS[status]}
                                   </span>

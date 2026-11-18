@@ -5,6 +5,10 @@
 create table if not exists public.club_members (
   id text primary key,
   name text not null,
+  member_type text not null default 'student'
+    constraint club_members_member_type_check
+    check (member_type in ('student', 'teacher', 'visitor')),
+  class_name text,
   role text,
   email text,
   phone text,
@@ -15,6 +19,24 @@ create table if not exists public.club_members (
   updated_at timestamptz not null default now(),
   deleted_at timestamptz
 );
+
+-- Idempotent column upgrades for pre-existing public.club_members tables
+alter table public.club_members
+  add column if not exists member_type text not null default 'student';
+alter table public.club_members
+  add column if not exists class_name text;
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'club_members_member_type_check'
+      and conrelid = 'public.club_members'::regclass
+  ) then
+    alter table public.club_members
+      add constraint club_members_member_type_check
+      check (member_type in ('student', 'teacher', 'visitor'));
+  end if;
+end $$;
 
 -- 2. Attendance Sessions table (with timestamped soft-delete support)
 create table if not exists public.attendance_sessions (
