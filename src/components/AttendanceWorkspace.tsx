@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import {
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from 'react';
 import type {
   AttendanceSession,
   AttendanceStatus,
@@ -8,14 +15,17 @@ import type {
   UserPreferences,
   ViewMode,
 } from '../types/attendance';
-import { STATUS_LABELS } from '../utils/attendance';
+import {
+  STATUS_LABELS,
+  getMemberInitials,
+  getSessionAssignedMembers,
+} from '../utils/attendance';
 import { formatSessionDate, formatSessionTime, formatTimestamp } from '../utils/date';
 import { ConfirmDialog } from './ConfirmDialog';
 import {
   PixelCalendarIcon,
-  PixelCheckIcon,
   PixelClockIcon,
-  PixelEditIcon,
+  PixelCloseIcon,
   PixelGridIcon,
   PixelListIcon,
   PixelPinIcon,
@@ -24,6 +34,7 @@ import {
   PixelSearchIcon,
   PixelTerminalIcon,
   PixelTrashIcon,
+  PixelUsersIcon,
 } from './PixelIcons';
 
 interface AttendanceWorkspaceProps {
@@ -32,11 +43,12 @@ interface AttendanceWorkspaceProps {
   members: ClubMember[];
   preferences: UserPreferences;
   onOpenCreateSession: () => void;
+  onOpenMemberManager: () => void;
+  onOpenMemberProfile: (memberId: string) => void;
   onSelectSession: (sessionId: string) => void;
   onDeleteSession: (sessionId: string) => void;
-  onAddMember: (name: string) => void;
-  onRenameMember: (memberId: string, nextName: string) => void;
-  onDeleteMembers: (memberIds: string[]) => void;
+  onAssignMemberToSession: (memberId: string) => void;
+  onRemoveMemberFromSession: (memberId: string) => void;
   onToggleAttendanceStatus: (
     memberId: string,
     targetStatus: Exclude<AttendanceStatus, 'unmarked'>,
@@ -131,306 +143,101 @@ function MemberAttendanceControls({
   );
 }
 
-interface DragSelectionState {
-  startIndex: number;
-  lastAppliedIndex: number;
-  baseSelectedIds: Set<string>;
-  action: 'select' | 'deselect';
-  startedOnCheckbox: boolean;
-  startMemberId: string;
-  hasDraggedAcrossRows: boolean;
-}
-
-function isInteractiveChildTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof Element)) return false;
-  return Boolean(target.closest('button, input, select, textarea, a, form'));
-}
-
-function findMemberIndexAtPoint(
-  container: HTMLElement | null,
-  clientX: number,
-  clientY: number,
-  viewMode: ViewMode,
-): number | null {
-  if (!container) return null;
-  const hitElement = document
-    .elementFromPoint(clientX, clientY)
-    ?.closest<HTMLElement>('[data-member-index]');
-  if (hitElement && container.contains(hitElement)) {
-    const parsed = Number(hitElement.dataset.memberIndex);
-    if (!Number.isNaN(parsed)) return parsed;
-  }
-
-  const items = Array.from(container.querySelectorAll<HTMLElement>('[data-member-index]'));
-  if (items.length === 0) return null;
-
-  if (viewMode === 'list') {
-    const firstRect = items[0].getBoundingClientRect();
-    const firstIdx = Number(items[0].dataset.memberIndex);
-    if (clientY < firstRect.top && !Number.isNaN(firstIdx)) return firstIdx;
-
-    const lastItem = items[items.length - 1];
-    const lastRect = lastItem.getBoundingClientRect();
-    const lastIdx = Number(lastItem.dataset.memberIndex);
-    if (clientY > lastRect.bottom && !Number.isNaN(lastIdx)) return lastIdx;
-
-    let closestIndex: number | null = null;
-    let closestDistance = Number.POSITIVE_INFINITY;
-    for (const item of items) {
-      const idx = Number(item.dataset.memberIndex);
-      if (Number.isNaN(idx)) continue;
-      const rect = item.getBoundingClientRect();
-      if (clientY >= rect.top && clientY <= rect.bottom) {
-        return idx;
-      }
-      const midY = (rect.top + rect.bottom) / 2;
-      const distance = Math.abs(clientY - midY);
-      if (distance < closestDistance) {
-        closestDistance = distance;
-        closestIndex = idx;
-      }
-    }
-    return closestIndex;
-  }
-
-  let closestIndex: number | null = null;
-  let closestDistance = Number.POSITIVE_INFINITY;
-  for (const item of items) {
-    const idx = Number(item.dataset.memberIndex);
-    if (Number.isNaN(idx)) continue;
-    const rect = item.getBoundingClientRect();
-    if (
-      clientX >= rect.left &&
-      clientX <= rect.right &&
-      clientY >= rect.top &&
-      clientY <= rect.bottom
-    ) {
-      return idx;
-    }
-    const midX = (rect.left + rect.right) / 2;
-    const midY = (rect.top + rect.bottom) / 2;
-    const distance = Math.hypot(clientX - midX, clientY - midY);
-    if (distance < closestDistance) {
-      closestDistance = distance;
-      closestIndex = idx;
-    }
-  }
-  return closestIndex;
-}
-
-function buildMembersDeleteDialogCopy(targetMembers: ClubMember[]): {
-  badgeLabel: string;
-  title: string;
-  message: string;
-  confirmLabel: string;
-} {
-  if (targetMembers.length === 1) {
-    const [member] = targetMembers;
-    return {
-      badgeLabel: 'Delete Member',
-      title: `Remove "${member.name}"?`,
-      message: `Are you sure you want to permanently delete "${member.name}" from the locally saved Team SPIRIT roster? Their attendance marks across all saved sessions will also be removed.`,
-      confirmLabel: 'Delete Member',
-    };
-  }
-
-  const previewNames = targetMembers
-    .slice(0, 4)
-    .map((member) => member.name)
-    .join(', ');
-  const remainder = targetMembers.length - 4;
-  const namesSummary =
-    remainder > 0 ? `${previewNames}, and ${remainder} more` : previewNames;
-
-  return {
-    badgeLabel: 'Delete Members',
-    title: `Delete ${targetMembers.length} selected members?`,
-    message: `Are you sure you want to permanently delete ${targetMembers.length} selected members (${namesSummary}) from the locally saved Team SPIRIT roster? Their attendance marks across all saved sessions will also be removed.`,
-    confirmLabel: `Delete ${targetMembers.length} Members`,
-  };
-}
-
-/** Primary workspace housing session details, member management, and line-by-line attendance. */
+/** Focused session attendance workspace with directory search-and-suggest assignment. */
 export function AttendanceWorkspace({
   sessions,
   activeSession,
   members,
   preferences,
   onOpenCreateSession,
+  onOpenMemberManager,
+  onOpenMemberProfile,
   onSelectSession,
   onDeleteSession,
-  onAddMember,
-  onRenameMember,
-  onDeleteMembers,
+  onAssignMemberToSession,
+  onRemoveMemberFromSession,
   onToggleAttendanceStatus,
   onSetAbsenceReason,
   onResetSessionMarks,
   onUpdatePreferences,
 }: AttendanceWorkspaceProps) {
-  const [newMemberName, setNewMemberName] = useState('');
-  const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
-  const [editingMemberName, setEditingMemberName] = useState('');
-  const [isSelectionMode, setIsSelectionMode] = useState(false);
-  const [selectedMemberIds, setSelectedMemberIds] = useState<string[]>([]);
-  const [isDragSelecting, setIsDragSelecting] = useState(false);
-  const [pendingDelete, setPendingDelete] = useState<
-    | { kind: 'members'; members: ClubMember[] }
+  const suggestListboxId = useId();
+  const suggestWrapRef = useRef<HTMLDivElement | null>(null);
+  const suggestInputRef = useRef<HTMLInputElement | null>(null);
+
+  const [suggestQuery, setSuggestQuery] = useState('');
+  const [isSuggestOpen, setIsSuggestOpen] = useState(false);
+  const [highlightedIndex, setHighlightedIndex] = useState(0);
+  const [pendingAction, setPendingAction] = useState<
     | { kind: 'session'; session: AttendanceSession }
+    | { kind: 'remove_from_session'; member: ClubMember }
     | null
   >(null);
 
-  const rosterContainerRef = useRef<HTMLDivElement | null>(null);
-  const selectAllRef = useRef<HTMLInputElement | null>(null);
-  const filteredMembersRef = useRef<ClubMember[]>([]);
-  const viewModeRef = useRef<ViewMode>(preferences.viewMode);
-  const dragSessionRef = useRef<DragSelectionState | null>(null);
-  const suppressCheckboxClickMemberIdRef = useRef<string | null>(null);
-
-  const memberIdSet = new Set(members.map((member) => member.id));
-  const selectionModeActive = isSelectionMode && members.length > 0;
-  const validSelectedIds = selectionModeActive
-    ? selectedMemberIds.filter((id) => memberIdSet.has(id))
-    : [];
-  const selectedSet = new Set(validSelectedIds);
-  const selectedMembers = members.filter((member) => selectedSet.has(member.id));
-
-  const activePendingDelete =
-    pendingDelete?.kind === 'members'
-      ? (() => {
-          const remaining = pendingDelete.members.filter((member) =>
-            memberIdSet.has(member.id),
-          );
-          return remaining.length > 0 ? { kind: 'members' as const, members: remaining } : null;
-        })()
-      : pendingDelete?.kind === 'session'
-        ? sessions.some((session) => session.id === pendingDelete.session.id)
-          ? pendingDelete
-          : null
-        : null;
-
-  const { filter, viewMode, searchQuery } = preferences;
-  const trimmedQuery = searchQuery.trim().toLowerCase();
-
-  function getEntry(memberId: string): SessionAttendanceEntry {
-    return (
-      activeSession?.attendance[memberId] ?? {
-        status: 'unmarked',
-        updatedAt: '',
-      }
-    );
-  }
-
-  const filteredMembers = activeSession
-    ? members.filter((member) => {
-        const entry = getEntry(member.id);
-        const matchesStatus = filter === 'all' || entry.status === filter;
-        const matchesQuery =
-          trimmedQuery.length === 0 || member.name.toLowerCase().includes(trimmedQuery);
-        return matchesStatus && matchesQuery;
-      })
-    : [];
-
-  filteredMembersRef.current = filteredMembers;
-  viewModeRef.current = viewMode;
-
-  const visibleSelectedCount = filteredMembers.filter((member) =>
-    selectedSet.has(member.id),
-  ).length;
-  const allVisibleSelected =
-    filteredMembers.length > 0 && visibleSelectedCount === filteredMembers.length;
-  const someVisibleSelected = visibleSelectedCount > 0 && !allVisibleSelected;
-
   useEffect(() => {
-    if (selectAllRef.current) {
-      selectAllRef.current.indeterminate = someVisibleSelected;
-    }
-  }, [someVisibleSelected]);
-
-  const applyDragRange = useCallback(
-    (startIndex: number, endIndex: number, baseIds: Set<string>, action: 'select' | 'deselect') => {
-      const currentMembers = filteredMembersRef.current;
-      const rangeStart = Math.max(0, Math.min(startIndex, endIndex));
-      const rangeEnd = Math.min(currentMembers.length - 1, Math.max(startIndex, endIndex));
-      const next = new Set(baseIds);
-
-      for (let i = rangeStart; i <= rangeEnd; i += 1) {
-        const id = currentMembers[i]?.id;
-        if (!id) continue;
-        if (action === 'select') {
-          next.add(id);
-        } else {
-          next.delete(id);
-        }
+    function handleDocumentMouseDown(event: MouseEvent) {
+      if (
+        suggestWrapRef.current &&
+        event.target instanceof Node &&
+        !suggestWrapRef.current.contains(event.target)
+      ) {
+        setIsSuggestOpen(false);
       }
-
-      setSelectedMemberIds(Array.from(next));
-    },
-    [],
-  );
-
-  const endDragSelection = useCallback(() => {
-    const activeDrag = dragSessionRef.current;
-    if (!activeDrag) return;
-    if (activeDrag.hasDraggedAcrossRows) {
-      window.setTimeout(() => {
-        suppressCheckboxClickMemberIdRef.current = null;
-      }, 0);
-    } else {
-      suppressCheckboxClickMemberIdRef.current = null;
     }
-    dragSessionRef.current = null;
-    setIsDragSelecting(false);
+
+    document.addEventListener('mousedown', handleDocumentMouseDown);
+    return () => document.removeEventListener('mousedown', handleDocumentMouseDown);
   }, []);
 
-  useEffect(() => {
-    function handleWindowPointerMove(event: globalThis.PointerEvent) {
-      const activeDrag = dragSessionRef.current;
-      if (!activeDrag) return;
+  const assignedMembers = useMemo(
+    () => getSessionAssignedMembers(activeSession, members),
+    [activeSession, members],
+  );
 
-      const nextIndex = findMemberIndexAtPoint(
-        rosterContainerRef.current,
-        event.clientX,
-        event.clientY,
-        viewModeRef.current,
-      );
-      if (nextIndex === null) return;
+  const assignedMemberIdSet = useMemo(
+    () => new Set(assignedMembers.map((member) => member.id)),
+    [assignedMembers],
+  );
 
-      if (activeDrag.startedOnCheckbox && !activeDrag.hasDraggedAcrossRows) {
-        if (nextIndex === activeDrag.startIndex) {
-          return;
-        }
-        activeDrag.hasDraggedAcrossRows = true;
-        suppressCheckboxClickMemberIdRef.current = activeDrag.startMemberId;
-        setIsDragSelecting(true);
-      }
+  const { availableSuggestions, alreadyAssignedSuggestions } = useMemo(() => {
+    const query = suggestQuery.trim().toLowerCase();
+    const matches = members.filter((member) => {
+      if (!query) return true;
+      return [member.name, member.role, member.handle]
+        .filter((value): value is string => Boolean(value))
+        .some((value) => value.toLowerCase().includes(query));
+    });
 
-      if (nextIndex !== activeDrag.lastAppliedIndex || !activeDrag.hasDraggedAcrossRows) {
-        activeDrag.lastAppliedIndex = nextIndex;
-        applyDragRange(
-          activeDrag.startIndex,
-          nextIndex,
-          activeDrag.baseSelectedIds,
-          activeDrag.action,
-        );
+    const available: ClubMember[] = [];
+    const alreadyAssigned: ClubMember[] = [];
+    for (const member of matches) {
+      if (assignedMemberIdSet.has(member.id)) {
+        alreadyAssigned.push(member);
+      } else {
+        available.push(member);
       }
     }
 
-    function handleWindowPointerUp() {
-      endDragSelection();
-    }
-
-    window.addEventListener('pointermove', handleWindowPointerMove);
-    window.addEventListener('pointerup', handleWindowPointerUp);
-    window.addEventListener('pointercancel', handleWindowPointerUp);
-    window.addEventListener('blur', handleWindowPointerUp);
-
-    return () => {
-      window.removeEventListener('pointermove', handleWindowPointerMove);
-      window.removeEventListener('pointerup', handleWindowPointerUp);
-      window.removeEventListener('pointercancel', handleWindowPointerUp);
-      window.removeEventListener('blur', handleWindowPointerUp);
+    return {
+      availableSuggestions: available.slice(0, 8),
+      alreadyAssignedSuggestions: query ? alreadyAssigned.slice(0, 4) : [],
     };
-  }, [applyDragRange, endDragSelection]);
+  }, [assignedMemberIdSet, members, suggestQuery]);
+
+  useEffect(() => {
+    setHighlightedIndex(0);
+  }, [suggestQuery, activeSession?.id]);
+
+  const activePendingAction =
+    pendingAction?.kind === 'session'
+      ? sessions.some((session) => session.id === pendingAction.session.id)
+        ? pendingAction
+        : null
+      : pendingAction?.kind === 'remove_from_session'
+        ? assignedMemberIdSet.has(pendingAction.member.id)
+          ? pendingAction
+          : null
+        : null;
 
   if (!activeSession) {
     return (
@@ -452,8 +259,9 @@ export function AttendanceWorkspace({
           </div>
           <h3 className="empty-title">Start your first Team SPIRIT session</h3>
           <p className="empty-description">
-            Log a session with its date, time, and optional details to open the line-by-line member
-            attendance roster. Every session and mark saves automatically on this device.
+            Log a session with its date, time, and optional details to build its attendance
+            checklist from your Member Manager directory. Every session and mark saves automatically
+            on this device.
           </p>
           <button type="button" className="btn-primary" onClick={onOpenCreateSession}>
             <PixelPlusIcon />
@@ -464,158 +272,91 @@ export function AttendanceWorkspace({
     );
   }
 
-  const hasAnyMarked = members.some((member) => getEntry(member.id).status !== 'unmarked');
+  const { filter, viewMode, searchQuery, confirmSessionMemberRemoval } = preferences;
+  const trimmedQuery = searchQuery.trim().toLowerCase();
 
-  function handleToggleSelectionMode() {
-    if (selectionModeActive) {
-      endDragSelection();
-      setIsSelectionMode(false);
-      setSelectedMemberIds([]);
-    } else {
-      setIsSelectionMode(true);
-    }
-  }
-
-  function handleToggleMemberSelected(memberId: string) {
-    if (suppressCheckboxClickMemberIdRef.current === memberId) {
-      suppressCheckboxClickMemberIdRef.current = null;
-      return;
-    }
-    setSelectedMemberIds((prev) => {
-      const next = new Set(prev.filter((id) => memberIdSet.has(id)));
-      if (next.has(memberId)) {
-        next.delete(memberId);
-      } else {
-        next.add(memberId);
+  function getEntry(memberId: string): SessionAttendanceEntry {
+    return (
+      activeSession?.attendance[memberId] ?? {
+        status: 'unmarked',
+        updatedAt: '',
       }
-      return Array.from(next);
-    });
+    );
   }
 
-  function handleToggleSelectAll() {
-    if (filteredMembers.length === 0) return;
-    setSelectedMemberIds((prev) => {
-      const next = new Set(prev.filter((id) => memberIdSet.has(id)));
-      if (allVisibleSelected) {
-        for (const member of filteredMembers) {
-          next.delete(member.id);
-        }
-      } else {
-        for (const member of filteredMembers) {
-          next.add(member.id);
-        }
-      }
-      return Array.from(next);
-    });
+  const filteredMembers = assignedMembers.filter((member) => {
+    const entry = getEntry(member.id);
+    const matchesStatus = filter === 'all' || entry.status === filter;
+    const matchesQuery =
+      trimmedQuery.length === 0 ||
+      member.name.toLowerCase().includes(trimmedQuery) ||
+      Boolean(member.role?.toLowerCase().includes(trimmedQuery));
+    return matchesStatus && matchesQuery;
+  });
+
+  const hasAnyMarked = assignedMembers.some((member) => getEntry(member.id).status !== 'unmarked');
+
+  function handleSelectSuggestion(member: ClubMember) {
+    onAssignMemberToSession(member.id);
+    setSuggestQuery('');
+    setHighlightedIndex(0);
+    setIsSuggestOpen(true);
+    suggestInputRef.current?.focus();
   }
 
-  function handleClearSelection() {
-    setSelectedMemberIds([]);
-  }
-
-  function handleMemberPointerDown(
-    event: ReactPointerEvent<HTMLElement>,
-    member: ClubMember,
-    index: number,
-  ) {
-    if (!selectionModeActive || event.button !== 0) return;
-    const target = event.target;
-    const startedOnCheckbox =
-      target instanceof HTMLInputElement && target.dataset.selectionCheckbox === 'true';
-
-    if (!startedOnCheckbox && isInteractiveChildTarget(target)) {
+  function handleSuggestKeyDown(event: ReactKeyboardEvent<HTMLInputElement>) {
+    if (event.key === 'Escape') {
+      setIsSuggestOpen(false);
       return;
     }
 
-    const baseSelectedIds = new Set(validSelectedIds);
-    const action: 'select' | 'deselect' = baseSelectedIds.has(member.id) ? 'deselect' : 'select';
-
-    dragSessionRef.current = {
-      startIndex: index,
-      lastAppliedIndex: index,
-      baseSelectedIds,
-      action,
-      startedOnCheckbox,
-      startMemberId: member.id,
-      hasDraggedAcrossRows: false,
-    };
-
-    if (!startedOnCheckbox) {
+    if (event.key === 'ArrowDown') {
       event.preventDefault();
-      setIsDragSelecting(true);
-      applyDragRange(index, index, baseSelectedIds, action);
+      if (!isSuggestOpen) {
+        setIsSuggestOpen(true);
+        return;
+      }
+      if (availableSuggestions.length > 0) {
+        setHighlightedIndex((prev) => (prev + 1) % availableSuggestions.length);
+      }
+      return;
+    }
+
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (availableSuggestions.length > 0) {
+        setHighlightedIndex((prev) =>
+          prev <= 0 ? availableSuggestions.length - 1 : prev - 1,
+        );
+      }
+      return;
+    }
+
+    if (event.key === 'Enter' && isSuggestOpen) {
+      const targetMember = availableSuggestions[highlightedIndex] ?? availableSuggestions[0];
+      if (targetMember) {
+        event.preventDefault();
+        handleSelectSuggestion(targetMember);
+      }
     }
   }
 
-  function handleAddSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const cleaned = newMemberName.trim();
-    if (!cleaned) return;
-    onAddMember(cleaned);
-    setNewMemberName('');
-  }
-
-  function handleStartEdit(member: ClubMember) {
-    setEditingMemberId(member.id);
-    setEditingMemberName(member.name);
-  }
-
-  function handleCancelEdit() {
-    setEditingMemberId(null);
-    setEditingMemberName('');
-  }
-
-  function handleSaveEdit(event: FormEvent<HTMLFormElement>, memberId: string) {
-    event.preventDefault();
-    const cleaned = editingMemberName.trim();
-    if (!cleaned) return;
-    onRenameMember(memberId, cleaned);
-    setEditingMemberId(null);
-    setEditingMemberName('');
-  }
-
-  function handleToggleStatus(
-    memberId: string,
-    target: Exclude<AttendanceStatus, 'unmarked'>,
-  ) {
-    onToggleAttendanceStatus(memberId, target);
-  }
-
-  function handleRequestDeleteMember(member: ClubMember) {
-    setPendingDelete({ kind: 'members', members: [member] });
-  }
-
-  function handleRequestDeleteSelected() {
-    if (selectedMembers.length === 0) return;
-    setPendingDelete({ kind: 'members', members: selectedMembers });
-  }
-
-  function handleRequestDeleteSession(session: AttendanceSession) {
-    setPendingDelete({ kind: 'session', session });
-  }
-
-  function handleCancelDelete() {
-    setPendingDelete(null);
-  }
-
-  function handleConfirmDelete() {
-    if (!activePendingDelete) return;
-    if (activePendingDelete.kind === 'members') {
-      const deletedIds = activePendingDelete.members.map((member) => member.id);
-      const deletedIdSet = new Set(deletedIds);
-      if (editingMemberId && deletedIdSet.has(editingMemberId)) {
-        setEditingMemberId(null);
-        setEditingMemberName('');
-      }
-      onDeleteMembers(deletedIds);
-      setSelectedMemberIds((prev) => prev.filter((id) => !deletedIdSet.has(id)));
-      if (members.length - deletedIds.length <= 0) {
-        setIsSelectionMode(false);
-      }
+  function handleRequestRemoveMember(member: ClubMember) {
+    if (confirmSessionMemberRemoval) {
+      setPendingAction({ kind: 'remove_from_session', member });
     } else {
-      onDeleteSession(activePendingDelete.session.id);
+      onRemoveMemberFromSession(member.id);
     }
-    setPendingDelete(null);
+  }
+
+  function handleConfirmPendingAction() {
+    if (!activePendingAction) return;
+    if (activePendingAction.kind === 'session') {
+      onDeleteSession(activePendingAction.session.id);
+    } else {
+      onRemoveMemberFromSession(activePendingAction.member.id);
+    }
+    setPendingAction(null);
   }
 
   function handleViewChange(nextView: ViewMode) {
@@ -626,9 +367,9 @@ export function AttendanceWorkspace({
     <section className="tracker-panel" aria-label="Attendance session workspace">
       <div className="tracker-panel-header">
         <div className="panel-title-group">
-          <h2 className="panel-title">Attendance Roster</h2>
+          <h2 className="panel-title">Session Checklist</h2>
           <span className="panel-count">
-            {filteredMembers.length} / {members.length}
+            {filteredMembers.length} / {assignedMembers.length}
           </span>
           <span className="sync-pill" title="Changes save automatically to local browser storage">
             <span className="sync-dot" aria-hidden="true" />
@@ -655,13 +396,13 @@ export function AttendanceWorkspace({
             </label>
           )}
 
-          {members.length > 0 && (
+          {assignedMembers.length > 0 && (
             <button
               type="button"
               className="btn-secondary"
               onClick={onResetSessionMarks}
               disabled={!hasAnyMarked}
-              title="Reset all member statuses in this session to Unmarked"
+              title="Reset all assigned member statuses in this session to Unmarked"
             >
               <PixelRefreshIcon />
               <span>Reset Marks</span>
@@ -671,7 +412,7 @@ export function AttendanceWorkspace({
           <button
             type="button"
             className="icon-btn icon-btn-danger"
-            onClick={() => handleRequestDeleteSession(activeSession)}
+            onClick={() => setPendingAction({ kind: 'session', session: activeSession })}
             title="Delete current session"
             aria-label={`Delete session ${activeSession.name}`}
           >
@@ -712,29 +453,153 @@ export function AttendanceWorkspace({
         </div>
       </div>
 
-      <form className="add-member-bar" onSubmit={handleAddSubmit}>
-        <div className="add-member-input-wrap">
+      <div className="session-assign-bar" ref={suggestWrapRef}>
+        <div className="session-suggest-combobox">
+          <span className="session-suggest-icon" aria-hidden="true">
+            <PixelSearchIcon />
+          </span>
           <input
+            ref={suggestInputRef}
             type="text"
-            className="form-control add-member-input"
-            placeholder="Add member name to roster (e.g. Alex Tan)..."
-            value={newMemberName}
-            onChange={(event) => setNewMemberName(event.target.value)}
-            aria-label="New member name"
+            role="combobox"
+            aria-expanded={isSuggestOpen}
+            aria-controls={suggestListboxId}
+            aria-autocomplete="list"
+            className="form-control session-suggest-input"
+            placeholder={
+              members.length === 0
+                ? 'No members in Member Manager yet — open Members to create them...'
+                : 'Search Member Manager to add member to this session...'
+            }
+            value={suggestQuery}
+            onFocus={() => setIsSuggestOpen(true)}
+            onChange={(event) => {
+              setSuggestQuery(event.target.value);
+              setIsSuggestOpen(true);
+            }}
+            onKeyDown={handleSuggestKeyDown}
+            aria-label="Search Member Manager directory to add member to session"
           />
+
+          {suggestQuery.length > 0 && (
+            <button
+              type="button"
+              className="session-suggest-clear"
+              onClick={() => {
+                setSuggestQuery('');
+                suggestInputRef.current?.focus();
+              }}
+              aria-label="Clear member search"
+            >
+              <PixelCloseIcon width={11} height={11} />
+            </button>
+          )}
+
+          {isSuggestOpen && (
+            <div
+              id={suggestListboxId}
+              className="session-suggest-dropdown"
+              role="listbox"
+              aria-label="Member Manager suggestions"
+            >
+              {members.length === 0 ? (
+                <div className="session-suggest-empty">
+                  <span>Your Member Manager directory is empty.</span>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-compact"
+                    onClick={() => {
+                      setIsSuggestOpen(false);
+                      onOpenMemberManager();
+                    }}
+                  >
+                    <PixelUsersIcon />
+                    <span>Open Member Manager</span>
+                  </button>
+                </div>
+              ) : availableSuggestions.length === 0 && alreadyAssignedSuggestions.length === 0 ? (
+                <div className="session-suggest-empty">
+                  <span>No member matching &ldquo;{suggestQuery.trim()}&rdquo; in Member Manager.</span>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-compact"
+                    onClick={() => {
+                      setIsSuggestOpen(false);
+                      onOpenMemberManager();
+                    }}
+                  >
+                    <PixelUsersIcon />
+                    <span>Manage Members</span>
+                  </button>
+                </div>
+              ) : (
+                <>
+                  {availableSuggestions.map((member, index) => {
+                    const isHighlighted = index === highlightedIndex;
+                    return (
+                      <button
+                        key={member.id}
+                        type="button"
+                        role="option"
+                        aria-selected={isHighlighted}
+                        className={`session-suggest-option ${isHighlighted ? 'is-highlighted' : ''}`}
+                        onMouseEnter={() => setHighlightedIndex(index)}
+                        onClick={() => handleSelectSuggestion(member)}
+                      >
+                        <span className="session-suggest-avatar" aria-hidden="true">
+                          {getMemberInitials(member.name)}
+                        </span>
+                        <span className="session-suggest-info">
+                          <span className="session-suggest-name">{member.name}</span>
+                          {(member.role || member.handle) && (
+                            <span className="session-suggest-sub">
+                              {[member.role, member.handle].filter(Boolean).join(' • ')}
+                            </span>
+                          )}
+                        </span>
+                        <span className="session-suggest-action">
+                          <PixelPlusIcon width={11} height={11} />
+                          <span>Add</span>
+                        </span>
+                      </button>
+                    );
+                  })}
+
+                  {alreadyAssignedSuggestions.map((member) => (
+                    <div
+                      key={member.id}
+                      className="session-suggest-option is-assigned"
+                      aria-disabled="true"
+                    >
+                      <span className="session-suggest-avatar" aria-hidden="true">
+                        {getMemberInitials(member.name)}
+                      </span>
+                      <span className="session-suggest-info">
+                        <span className="session-suggest-name">{member.name}</span>
+                        {member.role && <span className="session-suggest-sub">{member.role}</span>}
+                      </span>
+                      <span className="session-assigned-badge">In session</span>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          )}
         </div>
+
         <button
-          type="submit"
-          className="btn-primary"
-          disabled={newMemberName.trim().length === 0}
+          type="button"
+          className="btn-secondary"
+          onClick={onOpenMemberManager}
+          title="Open central Member Manager directory"
         >
-          <PixelPlusIcon />
-          <span>Add Member</span>
+          <PixelUsersIcon />
+          <span>Member Directory</span>
         </button>
-      </form>
+      </div>
 
       <div className="tracker-toolbar">
-        <div className="filter-pills" role="tablist" aria-label="Filter roster by status">
+        <div className="filter-pills" role="tablist" aria-label="Filter session checklist by status">
           {FILTER_OPTIONS.map((option) => (
             <button
               key={option.value}
@@ -750,25 +615,6 @@ export function AttendanceWorkspace({
         </div>
 
         <div className="toolbar-right">
-          {members.length > 0 && (
-            <button
-              type="button"
-              className={`btn-secondary btn-compact selection-toggle-btn ${
-                selectionModeActive ? 'is-active' : ''
-              }`}
-              aria-pressed={selectionModeActive}
-              onClick={handleToggleSelectionMode}
-              title={
-                selectionModeActive
-                  ? 'Exit bulk selection mode'
-                  : 'Select multiple members (click or drag across rows)'
-              }
-            >
-              <PixelCheckIcon />
-              <span>{selectionModeActive ? 'Done' : 'Select'}</span>
-            </button>
-          )}
-
           <div className="search-box">
             <span className="search-icon">
               <PixelSearchIcon />
@@ -776,10 +622,10 @@ export function AttendanceWorkspace({
             <input
               type="search"
               className="search-input"
-              placeholder="Search members..."
+              placeholder="Filter checklist..."
               value={searchQuery}
               onChange={(event) => onUpdatePreferences({ searchQuery: event.target.value })}
-              aria-label="Search roster members"
+              aria-label="Filter assigned session members"
             />
           </div>
 
@@ -804,155 +650,64 @@ export function AttendanceWorkspace({
         </div>
       </div>
 
-      {selectionModeActive && (
-        <div className="bulk-selection-bar" role="region" aria-label="Bulk selection controls">
-          <div className="bulk-selection-left">
-            <label className="select-all-label">
-              <input
-                ref={selectAllRef}
-                type="checkbox"
-                className="selection-checkbox"
-                checked={allVisibleSelected}
-                disabled={filteredMembers.length === 0}
-                onChange={handleToggleSelectAll}
-              />
-              <span>Select All</span>
-            </label>
-
-            <span className="selection-count-pill">
-              {selectedMembers.length} selected
-            </span>
-
-            <span className="selection-hint">
-              Click or drag across rows to select
-            </span>
-          </div>
-
-          <div className="bulk-selection-right">
-            {selectedMembers.length > 0 && (
-              <>
-                <button
-                  type="button"
-                  className="btn-secondary btn-compact"
-                  onClick={handleClearSelection}
-                >
-                  Clear
-                </button>
-                <button
-                  type="button"
-                  className="btn-danger btn-compact"
-                  onClick={handleRequestDeleteSelected}
-                >
-                  <PixelTrashIcon />
-                  <span>Delete selected...</span>
-                </button>
-              </>
-            )}
-          </div>
-        </div>
-      )}
-
       <div className="tracker-body">
         {filteredMembers.length === 0 ? (
           <div className="reserved-empty-state">
             <div className="empty-badge">
               <PixelTerminalIcon />
-              <span>{members.length === 0 ? 'Roster Empty' : 'No Matches'}</span>
+              <span>{assignedMembers.length === 0 ? 'Session Empty' : 'No Matches'}</span>
             </div>
             <h3 className="empty-title">
-              {members.length === 0
-                ? 'Add your first Team SPIRIT member'
-                : 'No matching roster members'}
+              {assignedMembers.length === 0
+                ? 'Assign members to this session'
+                : 'No matching members in this session'}
             </h3>
             <p className="empty-description">
-              {members.length === 0
-                ? 'Enter a member name above to build your line-by-line attendance list. All member names and marks save automatically on this device.'
-                : 'Try clearing your search filter or selecting a different status tab.'}
+              {assignedMembers.length === 0
+                ? members.length === 0
+                  ? 'First add club members in the Member Manager, then search and click their names above to add them to this session.'
+                  : 'Type a member name in the search bar above and click a suggestion to add them to this session’s attendance checklist.'
+                : 'Try clearing your checklist filter or switching the status tab.'}
             </p>
+            {assignedMembers.length === 0 && members.length === 0 && (
+              <button type="button" className="btn-primary" onClick={onOpenMemberManager}>
+                <PixelUsersIcon />
+                <span>Open Member Manager</span>
+              </button>
+            )}
           </div>
         ) : viewMode === 'list' ? (
-          <div
-            ref={rosterContainerRef}
-            className={`roster-line-list ${isDragSelecting ? 'is-drag-selecting' : ''}`}
-            role="list"
-            aria-label="Line-by-line attendance roster"
-          >
-            {filteredMembers.map((member, index) => {
+          <div className="roster-line-list" role="list" aria-label="Session attendance checklist">
+            {filteredMembers.map((member) => {
               const entry = getEntry(member.id);
-              const isEditing = editingMemberId === member.id;
-              const isSelected = selectedSet.has(member.id);
 
               return (
-                <article
-                  key={member.id}
-                  data-member-id={member.id}
-                  data-member-index={index}
-                  className={`roster-line-row ${
-                    selectionModeActive ? 'is-selectable' : ''
-                  } ${isSelected ? 'is-bulk-selected' : ''}`}
-                  role="listitem"
-                  onPointerDown={(event) => handleMemberPointerDown(event, member, index)}
-                >
-                  {selectionModeActive && (
-                    <div className="roster-line-select">
-                      <input
-                        type="checkbox"
-                        className="selection-checkbox"
-                        data-selection-checkbox="true"
-                        checked={isSelected}
-                        onChange={() => handleToggleMemberSelected(member.id)}
-                        aria-label={`Select ${member.name}`}
-                      />
-                    </div>
-                  )}
-
+                <article key={member.id} className="roster-line-row" role="listitem">
                   <div className="roster-line-member">
-                    {isEditing ? (
-                      <form
-                        className="inline-rename-form"
-                        onSubmit={(event) => handleSaveEdit(event, member.id)}
+                    <div className="roster-member-identity">
+                      <button
+                        type="button"
+                        className="roster-member-name roster-member-profile-btn"
+                        onClick={() => onOpenMemberProfile(member.id)}
+                        title={`View ${member.name}'s profile & stats`}
                       >
-                        <input
-                          type="text"
-                          className="form-control inline-rename-input"
-                          value={editingMemberName}
-                          onChange={(event) => setEditingMemberName(event.target.value)}
-                          aria-label={`Rename ${member.name}`}
-                          autoFocus
-                        />
-                        <button
-                          type="submit"
-                          className="btn-secondary btn-compact"
-                          disabled={editingMemberName.trim().length === 0}
-                        >
-                          Save
-                        </button>
-                        <button
-                          type="button"
-                          className="btn-secondary btn-compact"
-                          onClick={handleCancelEdit}
-                        >
-                          Cancel
-                        </button>
-                      </form>
-                    ) : (
-                      <div className="roster-member-identity">
-                        <span className="roster-member-name">{member.name}</span>
-                        <span className={`status-badge status-${entry.status}`}>
-                          {STATUS_LABELS[entry.status]}
-                        </span>
-                        <span className="roster-updated-meta mono-cell">
-                          {formatTimestamp(entry.updatedAt)}
-                        </span>
-                      </div>
-                    )}
+                        {member.name}
+                      </button>
+                      {member.role && <span className="member-role-pill">{member.role}</span>}
+                      <span className={`status-badge status-${entry.status}`}>
+                        {STATUS_LABELS[entry.status]}
+                      </span>
+                      <span className="roster-updated-meta mono-cell">
+                        {formatTimestamp(entry.updatedAt)}
+                      </span>
+                    </div>
                   </div>
 
                   <div className="roster-line-controls">
                     <MemberAttendanceControls
                       member={member}
                       entry={entry}
-                      onToggleStatus={handleToggleStatus}
+                      onToggleStatus={onToggleAttendanceStatus}
                       onReasonChange={onSetAbsenceReason}
                     />
                   </div>
@@ -960,23 +715,13 @@ export function AttendanceWorkspace({
                   <div className="roster-line-manage">
                     <button
                       type="button"
-                      className="icon-btn"
-                      onClick={() => handleStartEdit(member)}
-                      aria-label={`Edit ${member.name}`}
-                      title="Rename member"
-                    >
-                      <PixelEditIcon />
-                      <span>Edit</span>
-                    </button>
-                    <button
-                      type="button"
                       className="icon-btn icon-btn-danger"
-                      onClick={() => handleRequestDeleteMember(member)}
-                      aria-label={`Delete ${member.name}`}
-                      title="Delete member"
+                      onClick={() => handleRequestRemoveMember(member)}
+                      aria-label={`Remove ${member.name} from this session`}
+                      title="Remove from this session"
                     >
-                      <PixelTrashIcon />
-                      <span>Delete</span>
+                      <PixelCloseIcon width={12} height={12} />
+                      <span>Remove</span>
                     </button>
                   </div>
                 </article>
@@ -984,37 +729,14 @@ export function AttendanceWorkspace({
             })}
           </div>
         ) : (
-          <div
-            ref={rosterContainerRef}
-            className={`block-grid ${isDragSelecting ? 'is-drag-selecting' : ''}`}
-          >
-            {filteredMembers.map((member, index) => {
+          <div className="block-grid">
+            {filteredMembers.map((member) => {
               const entry = getEntry(member.id);
-              const isEditing = editingMemberId === member.id;
-              const isSelected = selectedSet.has(member.id);
 
               return (
-                <article
-                  key={member.id}
-                  data-member-id={member.id}
-                  data-member-index={index}
-                  className={`block-card ${selectionModeActive ? 'is-selectable' : ''} ${
-                    isSelected ? 'is-bulk-selected' : ''
-                  }`}
-                  onPointerDown={(event) => handleMemberPointerDown(event, member, index)}
-                >
+                <article key={member.id} className="block-card">
                   <div className="block-card-top">
                     <div className="block-card-top-left">
-                      {selectionModeActive && (
-                        <input
-                          type="checkbox"
-                          className="selection-checkbox"
-                          data-selection-checkbox="true"
-                          checked={isSelected}
-                          onChange={() => handleToggleMemberSelected(member.id)}
-                          aria-label={`Select ${member.name}`}
-                        />
-                      )}
                       <span className={`status-badge status-${entry.status}`}>
                         {STATUS_LABELS[entry.status]}
                       </span>
@@ -1022,62 +744,35 @@ export function AttendanceWorkspace({
                     <div className="block-card-actions">
                       <button
                         type="button"
-                        className="icon-btn"
-                        onClick={() => handleStartEdit(member)}
-                        aria-label={`Edit ${member.name}`}
-                        title="Rename member"
-                      >
-                        <PixelEditIcon />
-                      </button>
-                      <button
-                        type="button"
                         className="icon-btn icon-btn-danger"
-                        onClick={() => handleRequestDeleteMember(member)}
-                        aria-label={`Delete ${member.name}`}
-                        title="Delete member"
+                        onClick={() => handleRequestRemoveMember(member)}
+                        aria-label={`Remove ${member.name} from this session`}
+                        title="Remove from this session"
                       >
-                        <PixelTrashIcon />
+                        <PixelCloseIcon width={12} height={12} />
                       </button>
                     </div>
                   </div>
 
-                  {isEditing ? (
-                    <form
-                      className="inline-rename-form"
-                      onSubmit={(event) => handleSaveEdit(event, member.id)}
-                    >
-                      <input
-                        type="text"
-                        className="form-control inline-rename-input"
-                        value={editingMemberName}
-                        onChange={(event) => setEditingMemberName(event.target.value)}
-                        aria-label={`Rename ${member.name}`}
-                        autoFocus
-                      />
-                      <button
-                        type="submit"
-                        className="btn-secondary btn-compact"
-                        disabled={editingMemberName.trim().length === 0}
-                      >
-                        Save
-                      </button>
+                  <div className="block-card-identity">
+                    <h3 className="block-card-title">
                       <button
                         type="button"
-                        className="btn-secondary btn-compact"
-                        onClick={handleCancelEdit}
+                        className="roster-member-profile-btn"
+                        onClick={() => onOpenMemberProfile(member.id)}
+                        title={`View ${member.name}'s profile & stats`}
                       >
-                        Cancel
+                        {member.name}
                       </button>
-                    </form>
-                  ) : (
-                    <h3 className="block-card-title">{member.name}</h3>
-                  )}
+                    </h3>
+                    {member.role && <span className="member-role-pill">{member.role}</span>}
+                  </div>
 
                   <MemberAttendanceControls
                     member={member}
                     entry={entry}
                     compact
-                    onToggleStatus={handleToggleStatus}
+                    onToggleStatus={onToggleAttendanceStatus}
                     onReasonChange={onSetAbsenceReason}
                   />
 
@@ -1093,31 +788,36 @@ export function AttendanceWorkspace({
 
       {(() => {
         const dialogCopy =
-          activePendingDelete?.kind === 'session'
+          activePendingAction?.kind === 'session'
             ? {
                 badgeLabel: 'Delete Session',
-                title: `Delete "${activePendingDelete.session.name}"?`,
-                message: `Are you sure you want to permanently delete the session "${activePendingDelete.session.name}" and all of its recorded attendance marks? This action cannot be undone.`,
+                title: `Delete "${activePendingAction.session.name}"?`,
+                message: `Are you sure you want to permanently delete the session "${activePendingAction.session.name}" and all of its recorded attendance marks? This action cannot be undone.`,
                 confirmLabel: 'Delete Session',
               }
-            : activePendingDelete?.kind === 'members'
-              ? buildMembersDeleteDialogCopy(activePendingDelete.members)
+            : activePendingAction?.kind === 'remove_from_session'
+              ? {
+                  badgeLabel: 'Remove from Session',
+                  title: `Remove "${activePendingAction.member.name}" from this session?`,
+                  message: `Remove "${activePendingAction.member.name}" from "${activeSession.name}"? Their attendance mark for this session will be cleared, while their Member Manager profile and other sessions remain intact.`,
+                  confirmLabel: 'Remove Member',
+                }
               : {
-                  badgeLabel: 'Delete',
+                  badgeLabel: 'Confirm',
                   title: '',
                   message: '',
-                  confirmLabel: 'Delete',
+                  confirmLabel: 'Confirm',
                 };
 
         return (
           <ConfirmDialog
-            isOpen={activePendingDelete !== null}
+            isOpen={activePendingAction !== null}
             badgeLabel={dialogCopy.badgeLabel}
             title={dialogCopy.title}
             message={dialogCopy.message}
             confirmLabel={dialogCopy.confirmLabel}
-            onConfirm={handleConfirmDelete}
-            onCancel={handleCancelDelete}
+            onConfirm={handleConfirmPendingAction}
+            onCancel={() => setPendingAction(null)}
           />
         );
       })()}

@@ -122,3 +122,75 @@ export function PixelPinIcon(props: IconProps) {
     </svg>
   );
 }
+
+export function PixelUserIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M6 2h4v1h1v4h-1v1H6V7H5V3h1V2zm-2 8h8v1h2v3H2v-3h2v-1z" />
+    </svg>
+  );
+}
+
+export function PixelUsersIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M4 2h4v1h1v3H8v1H4V6H3V3h1V2zm6 1h3v1h1v2h-1v1h-3V6h2V4h-2V3zM2 9h8v1h1v4H1v-4h1V9zm9 1h3v1h1v3h-3v-3h-1v-1z" />
+    </svg>
+  );
+}
+
+export function PixelArrowLeftIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M7 2h2v2H7V2zM5 4h2v2H5V4zM3 6h11v4H3V6zm2 4h2v2H5v-2zm2 2h2v2H7v-2z" />
+    </svg>
+  );
+}
+
+export function PixelSettingsIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M7 1h2v2h2v1l2-1 1 2-2 1v2l2 1-1 2-2-1v1H9v2H7v-2H5v-1l-2 1-1-2 2-1V7L2 6l1-2 2 1V4h2V1zm0 5v4h2V6H7z" />
+    </svg>
+  );
+}
+
+export function PixelLockIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M5 2h6v2H5V2zM3 4h2v3H3V4zm8 0h2v3h-2V4zM2 7h12v7H2V7zm5 2v3h2V9H7z" />
+    </svg>
+  );
+}
+
+export function PixelLogOutIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M2 2h7v2H4v8h5v2H2V2zm8 3h2v2h2v2h-2v2h-2V9H6V7h4V5z" />
+    </svg>
+  );
+}
+
+export function PixelEyeIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M5 4h6v1h2v1h1v4h-1v1h-2v1H5v-1H3v-1H2V6h1V5h2V4zm0 2v4h6V6H5zm2 1h2v2H7V7z" />
+    </svg>
+  );
+}
+
+export function PixelEyeOffIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M2 2h2v2H2V2zm2 2h2v2H4V4zm2 2h4v2H6V6zm4 2h2v2h-2V8zm2 2h2v2h-2v-2zm2 2h1v2h-2v-2h1zM5 4h6v1h2v1h1v3h-2V7H5V4zM2 7h2v2h2v2H4v-1H2V7zm5 4h4v1H7v-1z" />
+    </svg>
+  );
+}
+
+export function PixelAlertIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M7 2h2v2h1v2h1v2h1v2h1v2H3v-2h1V8h1V6h1V4h1V2zm0 4v4h2V6H7zm0 5v2h2v-2H7z" />
+    </svg>
+  );
+}

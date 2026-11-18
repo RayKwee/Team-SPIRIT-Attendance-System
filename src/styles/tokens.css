@@ -39,4 +39,5 @@
 
   /* Layout */
   --container-max: 1200px;
+  --member-sidebar-width: clamp(360px, 31vw, 430px);
 }

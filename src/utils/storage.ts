@@ -1,6 +1,7 @@
 import type {
   AttendanceSession,
   AttendanceStatus,
+  CalendarViewMode,
   ClubMember,
   FilterStatus,
   SessionAttendanceEntry,
@@ -30,15 +31,33 @@ const VALID_FILTERS: ReadonlySet<FilterStatus> = new Set([
 
 const VALID_VIEWS: ReadonlySet<ViewMode> = new Set(['list', 'grid']);
 
+const VALID_CALENDAR_VIEWS: ReadonlySet<CalendarViewMode> = new Set([
+  'day',
+  'week',
+  'month',
+  'year',
+]);
+
 export const DEFAULT_PREFERENCES: UserPreferences = {
   activeSessionId: null,
+  selectedMemberId: null,
   viewMode: 'list',
+  calendarViewMode: 'month',
   filter: 'all',
   searchQuery: '',
+  isMemberSidebarOpen: false,
+  confirmSessionMemberRemoval: false,
+  confirmDirectoryMemberDeletion: true,
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+function cleanOptionalString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function isValidMember(value: unknown): value is ClubMember {
@@ -50,6 +69,20 @@ function isValidMember(value: unknown): value is ClubMember {
     value.name.trim().length > 0 &&
     typeof value.createdAt === 'string'
   );
+}
+
+function normalizeMember(raw: ClubMember): ClubMember {
+  return {
+    id: raw.id,
+    name: raw.name.trim(),
+    role: cleanOptionalString(raw.role),
+    email: cleanOptionalString(raw.email),
+    phone: cleanOptionalString(raw.phone),
+    handle: cleanOptionalString(raw.handle),
+    joinedDate: cleanOptionalString(raw.joinedDate),
+    notes: cleanOptionalString(raw.notes),
+    createdAt: raw.createdAt,
+  };
 }
 
 function sanitizeAttendanceMap(value: unknown): Record<string, SessionAttendanceEntry> {
@@ -96,7 +129,34 @@ function isValidSession(value: unknown): value is AttendanceSession {
   );
 }
 
+function sanitizeMemberIds(
+  rawMemberIds: unknown,
+  attendance: Record<string, SessionAttendanceEntry>,
+): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  if (Array.isArray(rawMemberIds)) {
+    for (const id of rawMemberIds) {
+      if (typeof id === 'string' && id.length > 0 && !seen.has(id)) {
+        seen.add(id);
+        result.push(id);
+      }
+    }
+  }
+
+  for (const id of Object.keys(attendance)) {
+    if (id.length > 0 && !seen.has(id)) {
+      seen.add(id);
+      result.push(id);
+    }
+  }
+
+  return result;
+}
+
 function normalizeSession(raw: AttendanceSession): AttendanceSession {
+  const attendance = sanitizeAttendanceMap(raw.attendance);
   return {
     id: raw.id,
     name: raw.name.trim(),
@@ -110,7 +170,8 @@ function normalizeSession(raw: AttendanceSession): AttendanceSession {
     eventType:
       typeof raw.eventType === 'string' && raw.eventType.trim() ? raw.eventType.trim() : undefined,
     createdAt: raw.createdAt,
-    attendance: sanitizeAttendanceMap(raw.attendance),
+    memberIds: sanitizeMemberIds(raw.memberIds, attendance),
+    attendance,
   };
 }
 
@@ -143,7 +204,7 @@ export function loadMembers(): ClubMember[] {
     if (raw !== null) {
       const parsed: unknown = JSON.parse(raw);
       if (!Array.isArray(parsed)) return [];
-      return parsed.filter(isValidMember);
+      return parsed.filter(isValidMember).map(normalizeMember);
     }
 
     const legacyRaw = window.localStorage.getItem(LEGACY_ROSTER_STORAGE_KEY);
@@ -196,10 +257,21 @@ export function loadPreferences(): UserPreferences {
         ? parsed.activeSessionId
         : null;
 
+    const selectedMemberId =
+      typeof parsed.selectedMemberId === 'string' && parsed.selectedMemberId.length > 0
+        ? parsed.selectedMemberId
+        : null;
+
     const viewMode =
       typeof parsed.viewMode === 'string' && VALID_VIEWS.has(parsed.viewMode as ViewMode)
         ? (parsed.viewMode as ViewMode)
         : DEFAULT_PREFERENCES.viewMode;
+
+    const calendarViewMode =
+      typeof parsed.calendarViewMode === 'string' &&
+      VALID_CALENDAR_VIEWS.has(parsed.calendarViewMode as CalendarViewMode)
+        ? (parsed.calendarViewMode as CalendarViewMode)
+        : DEFAULT_PREFERENCES.calendarViewMode;
 
     const filter =
       typeof parsed.filter === 'string' && VALID_FILTERS.has(parsed.filter as FilterStatus)
@@ -209,7 +281,32 @@ export function loadPreferences(): UserPreferences {
     const searchQuery =
       typeof parsed.searchQuery === 'string' ? parsed.searchQuery : DEFAULT_PREFERENCES.searchQuery;
 
-    return { activeSessionId, viewMode, filter, searchQuery };
+    const isMemberSidebarOpen =
+      typeof parsed.isMemberSidebarOpen === 'boolean'
+        ? parsed.isMemberSidebarOpen
+        : DEFAULT_PREFERENCES.isMemberSidebarOpen;
+
+    const confirmSessionMemberRemoval =
+      typeof parsed.confirmSessionMemberRemoval === 'boolean'
+        ? parsed.confirmSessionMemberRemoval
+        : DEFAULT_PREFERENCES.confirmSessionMemberRemoval;
+
+    const confirmDirectoryMemberDeletion =
+      typeof parsed.confirmDirectoryMemberDeletion === 'boolean'
+        ? parsed.confirmDirectoryMemberDeletion
+        : DEFAULT_PREFERENCES.confirmDirectoryMemberDeletion;
+
+    return {
+      activeSessionId,
+      selectedMemberId,
+      viewMode,
+      calendarViewMode,
+      filter,
+      searchQuery,
+      isMemberSidebarOpen,
+      confirmSessionMemberRemoval,
+      confirmDirectoryMemberDeletion,
+    };
   } catch {
     return DEFAULT_PREFERENCES;
   }
@@ -221,5 +318,16 @@ export function savePreferences(preferences: UserPreferences): void {
     window.localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify(preferences));
   } catch {
     // Ignore write failures when localStorage is unavailable or full.
+  }
+}
+
+/** Clears legacy unauthenticated localStorage roster/session keys after cloud migration. */
+export function clearLegacyWorkspaceStorage(): void {
+  try {
+    window.localStorage.removeItem(SESSIONS_STORAGE_KEY);
+    window.localStorage.removeItem(MEMBERS_STORAGE_KEY);
+    window.localStorage.removeItem(LEGACY_ROSTER_STORAGE_KEY);
+  } catch {
+    // Ignore storage removal errors.
   }
 }

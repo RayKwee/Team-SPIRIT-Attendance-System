@@ -1,11 +1,30 @@
-import { useMemo, useState } from 'react';
-import type { AttendanceSession, ClubMember } from '../types/attendance';
-import { STATUS_LABELS, summarizeSessionAttendance } from '../utils/attendance';
+import { useEffect, useId, useMemo, useState, type FormEvent } from 'react';
+import type {
+  AttendanceSession,
+  CalendarViewMode,
+  ClubMember,
+} from '../types/attendance';
 import {
+  STATUS_LABELS,
+  getSessionAssignedMembers,
+  summarizeSessionAttendance,
+  summarizeSessionsAggregate,
+  type SessionAttendanceSummary,
+} from '../utils/attendance';
+import {
+  addDaysToDateKey,
+  addMonthsToDateKey,
+  addYearsToDateKey,
   buildMonthGrid,
+  buildWeekDays,
+  buildYearMonths,
   formatMonthYearLabel,
   formatSessionDate,
   formatSessionTime,
+  formatShortMonthDay,
+  formatWeekRangeLabel,
+  parseIsoDateKey,
+  parseJumpDateInput,
   toIsoDateString,
 } from '../utils/date';
 import {
@@ -21,25 +40,62 @@ interface SessionCalendarWorkspaceProps {
   sessions: AttendanceSession[];
   members: ClubMember[];
   selectedDateKey: string;
+  viewMode: CalendarViewMode;
+  onChangeViewMode: (mode: CalendarViewMode) => void;
   onSelectDate: (dateKey: string) => void;
   onOpenCreateSessionForDate: (dateKey: string) => void;
   onOpenSessionInTracker: (sessionId: string) => void;
+  onOpenMemberProfile: (memberId: string) => void;
 }
 
 const WEEKDAY_HEADERS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MINI_WEEKDAY_INITIALS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
 
-/** Interactive monthly calendar and day-detail summary backed by local session records. */
+const CALENDAR_VIEW_OPTIONS: { value: CalendarViewMode; label: string }[] = [
+  { value: 'day', label: 'Day' },
+  { value: 'week', label: 'Week' },
+  { value: 'month', label: 'Month' },
+  { value: 'year', label: 'Year' },
+];
+
+function getRateBadgeText(summary: SessionAttendanceSummary): string {
+  if (summary.totalMembers === 0) return '0 assigned';
+  return summary.rate !== null ? `${summary.rate}%` : '--%';
+}
+
+/** Interactive multi-view (Day, Week, Month, Year) calendar and day-detail summary. */
 export function SessionCalendarWorkspace({
   sessions,
   members,
   selectedDateKey,
+  viewMode,
+  onChangeViewMode,
   onSelectDate,
   onOpenCreateSessionForDate,
   onOpenSessionInTracker,
+  onOpenMemberProfile,
 }: SessionCalendarWorkspaceProps) {
-  const now = new Date();
-  const [viewYear, setViewYear] = useState(now.getFullYear());
-  const [viewMonth, setViewMonth] = useState(now.getMonth());
+  const jumpInputId = useId();
+  const jumpErrorId = useId();
+
+  const [jumpInput, setJumpInput] = useState(selectedDateKey);
+  const [isJumpFocused, setIsJumpFocused] = useState(false);
+  const [jumpError, setJumpError] = useState('');
+
+  useEffect(() => {
+    if (!isJumpFocused) {
+      setJumpInput(selectedDateKey);
+      setJumpError('');
+    }
+  }, [selectedDateKey, isJumpFocused]);
+
+  const anchorDate = useMemo(
+    () => parseIsoDateKey(selectedDateKey) ?? new Date(),
+    [selectedDateKey],
+  );
+  const viewYear = anchorDate.getFullYear();
+  const viewMonth = anchorDate.getMonth();
+  const todayKey = toIsoDateString(new Date());
 
   const sessionsByDate = useMemo(() => {
     const grouped = new Map<string, AttendanceSession[]>();
@@ -57,160 +113,706 @@ export function SessionCalendarWorkspace({
     return grouped;
   }, [sessions]);
 
+  const sessionSummariesById = useMemo(() => {
+    const map = new Map<string, SessionAttendanceSummary>();
+    for (const session of sessions) {
+      map.set(session.id, summarizeSessionAttendance(session, members));
+    }
+    return map;
+  }, [sessions, members]);
+
+  const weekDays = useMemo(() => buildWeekDays(selectedDateKey), [selectedDateKey]);
   const monthCells = useMemo(() => buildMonthGrid(viewYear, viewMonth), [viewYear, viewMonth]);
+  const yearMonths = useMemo(() => buildYearMonths(viewYear), [viewYear]);
 
   const monthPrefix = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-`;
-  const monthSessionCount = sessions.filter((session) => session.date.startsWith(monthPrefix)).length;
-  const selectedDaySessions = sessionsByDate.get(selectedDateKey) ?? [];
+  const yearPrefix = `${viewYear}-`;
 
-  function handlePrevMonth() {
-    if (viewMonth === 0) {
-      setViewYear((y) => y - 1);
-      setViewMonth(11);
-    } else {
-      setViewMonth((m) => m - 1);
+  const visiblePeriodSessions = useMemo(() => {
+    if (viewMode === 'day') {
+      return sessionsByDate.get(selectedDateKey) ?? [];
     }
-  }
+    if (viewMode === 'week') {
+      const weekKeySet = new Set(weekDays.map((day) => day.dateKey));
+      return sessions.filter((session) => weekKeySet.has(session.date));
+    }
+    if (viewMode === 'month') {
+      return sessions.filter((session) => session.date.startsWith(monthPrefix));
+    }
+    return sessions.filter((session) => session.date.startsWith(yearPrefix));
+  }, [viewMode, sessionsByDate, selectedDateKey, weekDays, sessions, monthPrefix, yearPrefix]);
 
-  function handleNextMonth() {
-    if (viewMonth === 11) {
-      setViewYear((y) => y + 1);
-      setViewMonth(0);
+  const periodAggregate = useMemo(
+    () => summarizeSessionsAggregate(visiblePeriodSessions, members),
+    [visiblePeriodSessions, members],
+  );
+
+  const selectedDaySessions = sessionsByDate.get(selectedDateKey) ?? [];
+  const selectedDayAggregate = useMemo(
+    () => summarizeSessionsAggregate(selectedDaySessions, members),
+    [selectedDaySessions, members],
+  );
+
+  function handleStepPeriod(direction: -1 | 1) {
+    if (viewMode === 'day') {
+      onSelectDate(addDaysToDateKey(selectedDateKey, direction));
+    } else if (viewMode === 'week') {
+      onSelectDate(addDaysToDateKey(selectedDateKey, direction * 7));
+    } else if (viewMode === 'month') {
+      onSelectDate(addMonthsToDateKey(selectedDateKey, direction));
     } else {
-      setViewMonth((m) => m + 1);
+      onSelectDate(addYearsToDateKey(selectedDateKey, direction));
     }
   }
 
   function handleToday() {
-    const today = new Date();
-    setViewYear(today.getFullYear());
-    setViewMonth(today.getMonth());
-    onSelectDate(toIsoDateString(today));
+    const today = toIsoDateString(new Date());
+    onSelectDate(today);
+    setJumpInput(today);
+    setJumpError('');
   }
 
-  function handleCellClick(dateKey: string, inCurrentMonth: boolean) {
-    onSelectDate(dateKey);
-    if (!inCurrentMonth) {
-      const [yStr, mStr] = dateKey.split('-');
-      const year = Number(yStr);
-      const month = Number(mStr) - 1;
-      if (!Number.isNaN(year) && !Number.isNaN(month)) {
-        setViewYear(year);
-        setViewMonth(month);
-      }
+  function handleJumpInputChange(nextValue: string) {
+    setJumpInput(nextValue);
+    if (jumpError) setJumpError('');
+
+    const parsed = parseJumpDateInput(nextValue, { allowPartial: false });
+    if (parsed) {
+      onSelectDate(parsed.dateKey);
     }
   }
 
+  function handleJumpSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const parsed = parseJumpDateInput(jumpInput, { allowPartial: true });
+    if (!parsed) {
+      setJumpError('Enter a valid date (e.g. 2026-11-18, 11/18/2026, or 2026-11)');
+      return;
+    }
+
+    setJumpError('');
+    onSelectDate(parsed.dateKey);
+    setJumpInput(parsed.dateKey);
+  }
+
+  function handleDrillToMonth(monthIndex: number) {
+    const targetPrefix = `${viewYear}-${String(monthIndex + 1).padStart(2, '0')}`;
+    const maxDay = new Date(viewYear, monthIndex + 1, 0).getDate();
+    const clampedDay = Math.min(anchorDate.getDate(), maxDay);
+    const targetDateKey = `${targetPrefix}-${String(clampedDay).padStart(2, '0')}`;
+    onSelectDate(targetDateKey);
+    onChangeViewMode('month');
+  }
+
+  const periodTitle =
+    viewMode === 'day'
+      ? formatSessionDate(selectedDateKey)
+      : viewMode === 'week'
+        ? formatWeekRangeLabel(weekDays)
+        : viewMode === 'month'
+          ? formatMonthYearLabel(viewYear, viewMonth)
+          : String(viewYear);
+
+  const periodCountLabel =
+    viewMode === 'day'
+      ? `${visiblePeriodSessions.length} today`
+      : viewMode === 'week'
+        ? `${visiblePeriodSessions.length} this week`
+        : viewMode === 'month'
+          ? `${visiblePeriodSessions.length} this month`
+          : `${visiblePeriodSessions.length} in ${viewYear}`;
+
+  const periodUnitLabel =
+    viewMode === 'day'
+      ? 'day'
+      : viewMode === 'week'
+        ? 'week'
+        : viewMode === 'month'
+          ? 'month'
+          : 'year';
+
   return (
     <div className="calendar-layout">
-      <section className="tracker-panel calendar-panel" aria-label="Monthly session calendar">
+      <section className="tracker-panel calendar-panel" aria-label="Session calendar">
         <div className="tracker-panel-header">
           <div className="panel-title-group">
             <h2 className="panel-title">Session Calendar</h2>
-            <span className="panel-count">{monthSessionCount} this month</span>
+            <span className="panel-count">{periodCountLabel}</span>
             <span className="sync-pill" title="Reads directly from local browser storage">
               <span className="sync-dot" aria-hidden="true" />
               Saved Locally
             </span>
           </div>
 
-          <div className="calendar-nav-controls">
-            <button
-              type="button"
-              className="btn-secondary btn-compact"
-              onClick={handlePrevMonth}
-              aria-label="Previous month"
-            >
-              Prev
-            </button>
-            <button type="button" className="btn-secondary btn-compact" onClick={handleToday}>
-              Today
-            </button>
-            <button
-              type="button"
-              className="btn-secondary btn-compact"
-              onClick={handleNextMonth}
-              aria-label="Next month"
-            >
-              Next
-            </button>
+          <div className="calendar-header-controls">
+            <div className="calendar-view-switcher" role="tablist" aria-label="Calendar view mode">
+              {CALENDAR_VIEW_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="tab"
+                  aria-selected={viewMode === option.value}
+                  className={`view-btn ${viewMode === option.value ? 'is-active' : ''}`}
+                  onClick={() => onChangeViewMode(option.value)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="calendar-nav-controls">
+              <button
+                type="button"
+                className="btn-secondary btn-compact"
+                onClick={() => handleStepPeriod(-1)}
+                aria-label={`Previous ${periodUnitLabel}`}
+              >
+                Prev
+              </button>
+              <button type="button" className="btn-secondary btn-compact" onClick={handleToday}>
+                Today
+              </button>
+              <button
+                type="button"
+                className="btn-secondary btn-compact"
+                onClick={() => handleStepPeriod(1)}
+                aria-label={`Next ${periodUnitLabel}`}
+              >
+                Next
+              </button>
+            </div>
           </div>
         </div>
 
         <div className="calendar-month-bar">
-          <h3 className="calendar-month-title">{formatMonthYearLabel(viewYear, viewMonth)}</h3>
-          <div className="calendar-legend" aria-hidden="true">
-            <span className="legend-item">
-              <span className="legend-dot legend-dot-session" />
-              Recorded Session
-            </span>
-            <span className="legend-item">
-              <span className="legend-dot legend-dot-today" />
-              Today
-            </span>
+          <div className="calendar-period-summary">
+            <h3 className="calendar-month-title">{periodTitle}</h3>
+            {periodAggregate.sessionCount > 0 && (
+              <span
+                className="calendar-period-rate-pill"
+                title={`${periodAggregate.presentCount} present out of ${periodAggregate.totalAssignments} assigned marks`}
+              >
+                {periodAggregate.rate !== null
+                  ? `${periodAggregate.rate}% attendance (${periodAggregate.presentCount}/${periodAggregate.totalAssignments})`
+                  : `${periodAggregate.sessionCount} ${
+                      periodAggregate.sessionCount === 1 ? 'session' : 'sessions'
+                    }`}
+              </span>
+            )}
+          </div>
+
+          <div className="calendar-bar-tools">
+            <form className="calendar-jump-form" onSubmit={handleJumpSubmit} noValidate>
+              <label className="calendar-jump-label" htmlFor={jumpInputId}>
+                Jump to Date
+              </label>
+              <div className="calendar-jump-input-row">
+                <input
+                  id={jumpInputId}
+                  type="text"
+                  className={`form-control calendar-jump-input ${jumpError ? 'has-error' : ''}`}
+                  placeholder="YYYY-MM-DD"
+                  value={jumpInput}
+                  onFocus={() => setIsJumpFocused(true)}
+                  onBlur={() => setIsJumpFocused(false)}
+                  onChange={(event) => handleJumpInputChange(event.target.value)}
+                  aria-invalid={jumpError ? true : undefined}
+                  aria-describedby={jumpError ? jumpErrorId : undefined}
+                />
+                <button type="submit" className="btn-secondary btn-compact calendar-jump-btn">
+                  Go
+                </button>
+              </div>
+              {jumpError && (
+                <span id={jumpErrorId} className="calendar-jump-error" role="alert">
+                  {jumpError}
+                </span>
+              )}
+            </form>
+
+            <div className="calendar-legend" aria-hidden="true">
+              <span className="legend-item">
+                <span className="legend-dot legend-dot-session" />
+                Session
+              </span>
+              <span className="legend-item">
+                <span className="legend-dot legend-dot-today" />
+                Today
+              </span>
+            </div>
           </div>
         </div>
 
-        <div className="calendar-weekdays" role="row">
-          {WEEKDAY_HEADERS.map((day) => (
-            <div key={day} className="calendar-weekday" role="columnheader">
-              {day}
-            </div>
-          ))}
-        </div>
-
-        <div className="calendar-grid" role="grid" aria-label={formatMonthYearLabel(viewYear, viewMonth)}>
-          {monthCells.map((cell) => {
-            const daySessions = sessionsByDate.get(cell.dateKey) ?? [];
-            const hasSessions = daySessions.length > 0;
-            const isSelected = cell.dateKey === selectedDateKey;
-            const previewSessions = daySessions.slice(0, 2);
-            const overflowCount = daySessions.length - previewSessions.length;
-
-            const cellClasses = [
-              'calendar-day-cell',
-              !cell.inCurrentMonth ? 'is-outside' : '',
-              cell.isToday ? 'is-today' : '',
-              isSelected ? 'is-selected' : '',
-              hasSessions ? 'has-sessions' : '',
-            ]
-              .filter(Boolean)
-              .join(' ');
-
-            return (
-              <button
-                key={cell.dateKey}
-                type="button"
-                className={cellClasses}
-                aria-pressed={isSelected}
-                aria-label={`${formatSessionDate(cell.dateKey)}, ${daySessions.length} recorded ${
-                  daySessions.length === 1 ? 'session' : 'sessions'
-                }`}
-                onClick={() => handleCellClick(cell.dateKey, cell.inCurrentMonth)}
-              >
-                <div className="calendar-day-top">
-                  <span className="calendar-day-number">{cell.dayNumber}</span>
-                  {hasSessions && (
-                    <span className="calendar-session-count">{daySessions.length}</span>
+        {viewMode === 'day' && (
+          <div className="calendar-day-view">
+            <div className="calendar-day-hero">
+              <div className="calendar-day-hero-info">
+                <div className="calendar-day-hero-badges">
+                  <span className="modal-badge">
+                    <PixelCalendarIcon />
+                    <span>Day View</span>
+                  </span>
+                  {selectedDateKey === todayKey && (
+                    <span className="calendar-today-badge">Today</span>
                   )}
                 </div>
+                <p className="calendar-day-hero-sub">
+                  {selectedDaySessions.length === 0
+                    ? 'No sessions recorded for this date.'
+                    : `${selectedDaySessions.length} recorded ${
+                        selectedDaySessions.length === 1 ? 'session' : 'sessions'
+                      } ordered chronologically.`}
+                </p>
+              </div>
 
-                {hasSessions && (
-                  <div className="calendar-day-tags">
-                    {previewSessions.map((session) => (
-                      <span key={session.id} className="calendar-day-tag" title={session.name}>
-                        {session.name}
-                      </span>
-                    ))}
-                    {overflowCount > 0 && (
-                      <span className="calendar-day-more">+{overflowCount} more</span>
+              <button
+                type="button"
+                className="btn-primary btn-compact-primary"
+                onClick={() => onOpenCreateSessionForDate(selectedDateKey)}
+              >
+                <PixelPlusIcon />
+                <span>Record Session</span>
+              </button>
+            </div>
+
+            {selectedDaySessions.length > 0 && (
+              <div className="day-summary-metrics calendar-day-rollup">
+                <div className="day-metric" data-accent="cyan">
+                  <span className="day-metric-label">Sessions</span>
+                  <span className="day-metric-value">{selectedDayAggregate.sessionCount}</span>
+                </div>
+                <div className="day-metric" data-accent="green">
+                  <span className="day-metric-label">Present Marks</span>
+                  <span className="day-metric-value">{selectedDayAggregate.presentCount}</span>
+                </div>
+                <div className="day-metric" data-accent="gold">
+                  <span className="day-metric-label">Total Absences</span>
+                  <span className="day-metric-value">
+                    {selectedDayAggregate.absentWithReasonCount +
+                      selectedDayAggregate.absentWithoutReasonCount}
+                  </span>
+                </div>
+                <div className="day-metric" data-accent="cyan">
+                  <span className="day-metric-label">Day Rate</span>
+                  <span className="day-metric-value">
+                    {selectedDayAggregate.rate !== null ? `${selectedDayAggregate.rate}%` : '--%'}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {selectedDaySessions.length === 0 ? (
+              <div className="reserved-empty-state day-detail-empty">
+                <div className="empty-badge">
+                  <PixelTerminalIcon />
+                  <span>Day Clear</span>
+                </div>
+                <h3 className="empty-title">No sessions on {formatSessionDate(selectedDateKey)}</h3>
+                <p className="empty-description">
+                  Log a session for this day or use Prev / Next or Jump to Date to inspect other
+                  recorded sessions.
+                </p>
+                <button
+                  type="button"
+                  className="btn-primary"
+                  onClick={() => onOpenCreateSessionForDate(selectedDateKey)}
+                >
+                  <PixelPlusIcon />
+                  <span>Record Session for This Day</span>
+                </button>
+              </div>
+            ) : (
+              <ul className="calendar-day-agenda" aria-label="Chronological day sessions">
+                {selectedDaySessions.map((session) => {
+                  const summary =
+                    sessionSummariesById.get(session.id) ??
+                    summarizeSessionAttendance(session, members);
+                  const fillPercent = summary.rate ?? 0;
+
+                  return (
+                    <li key={session.id} className="calendar-agenda-card">
+                      <div className="calendar-agenda-time-col">
+                        <span className="calendar-agenda-time">
+                          <PixelClockIcon />
+                          <span>{formatSessionTime(session.time)}</span>
+                        </span>
+                        <span className="calendar-agenda-rate">
+                          {getRateBadgeText(summary)}
+                        </span>
+                      </div>
+
+                      <div className="calendar-agenda-main">
+                        <div className="calendar-agenda-head">
+                          <div className="session-banner-title-row">
+                            <h4 className="day-session-title">{session.name}</h4>
+                            {session.eventType && (
+                              <span className="session-type-tag">{session.eventType}</span>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            className="btn-secondary btn-compact"
+                            onClick={() => onOpenSessionInTracker(session.id)}
+                          >
+                            <span>Open in Tracker</span>
+                            <PixelChevronIcon width={11} height={11} />
+                          </button>
+                        </div>
+
+                        {session.location && (
+                          <div className="calendar-agenda-location">
+                            <PixelPinIcon />
+                            <span>{session.location}</span>
+                          </div>
+                        )}
+
+                        {session.description && (
+                          <p className="session-banner-description">{session.description}</p>
+                        )}
+
+                        <div className="calendar-agenda-summary">
+                          <div className="calendar-agenda-chips">
+                            <span className="agenda-stat-chip is-present">
+                              Present {summary.presentCount}
+                            </span>
+                            <span className="agenda-stat-chip is-reason">
+                              Excused {summary.absentWithReasonCount}
+                            </span>
+                            <span className="agenda-stat-chip is-absent">
+                              Unexcused {summary.absentWithoutReasonCount}
+                            </span>
+                            <span className="agenda-stat-chip is-unmarked">
+                              Unmarked {summary.unmarkedCount}
+                            </span>
+                          </div>
+
+                          <div
+                            className="calendar-mini-meter"
+                            aria-hidden="true"
+                            title={`${summary.presentCount}/${summary.totalMembers} present`}
+                          >
+                            <div
+                              className="calendar-mini-meter-fill"
+                              style={{ width: `${fillPercent}%` }}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+        )}
+
+        {viewMode === 'week' && (
+          <div className="calendar-week-grid" role="grid" aria-label={periodTitle}>
+            {weekDays.map((day, index) => {
+              const daySessions = sessionsByDate.get(day.dateKey) ?? [];
+              const isSelected = day.dateKey === selectedDateKey;
+              const weekdayLabel = WEEKDAY_HEADERS[index];
+              const showShortMonth =
+                index === 0 || day.dayNumber === 1 || !day.inCurrentMonth;
+              const dayDateLabel = showShortMonth
+                ? formatShortMonthDay(day.dateKey)
+                : String(day.dayNumber);
+
+              const colClasses = [
+                'calendar-week-col',
+                day.isToday ? 'is-today' : '',
+                isSelected ? 'is-selected' : '',
+                daySessions.length > 0 ? 'has-sessions' : '',
+              ]
+                .filter(Boolean)
+                .join(' ');
+
+              return (
+                <div key={day.dateKey} className={colClasses} role="gridcell">
+                  <div className="calendar-week-col-header">
+                    <button
+                      type="button"
+                      className="calendar-week-day-btn"
+                      onClick={() => onSelectDate(day.dateKey)}
+                      aria-pressed={isSelected}
+                      aria-label={`${formatSessionDate(day.dateKey)}, ${daySessions.length} recorded ${
+                        daySessions.length === 1 ? 'session' : 'sessions'
+                      }`}
+                    >
+                      <span className="calendar-week-weekday">{weekdayLabel}</span>
+                      <span className="calendar-week-date-num">{dayDateLabel}</span>
+                    </button>
+
+                    <div className="calendar-week-col-actions">
+                      {daySessions.length > 0 && (
+                        <span className="calendar-session-count">{daySessions.length}</span>
+                      )}
+                      <button
+                        type="button"
+                        className="calendar-week-add-btn"
+                        onClick={() => {
+                          onSelectDate(day.dateKey);
+                          onOpenCreateSessionForDate(day.dateKey);
+                        }}
+                        aria-label={`Record session on ${formatSessionDate(day.dateKey)}`}
+                        title="Record session on this day"
+                      >
+                        <PixelPlusIcon width={10} height={10} />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div
+                    className="calendar-week-col-body"
+                    onClick={() => onSelectDate(day.dateKey)}
+                  >
+                    {daySessions.length === 0 ? (
+                      <span className="calendar-week-empty">—</span>
+                    ) : (
+                      daySessions.map((session) => {
+                        const summary =
+                          sessionSummariesById.get(session.id) ??
+                          summarizeSessionAttendance(session, members);
+
+                        return (
+                          <button
+                            key={session.id}
+                            type="button"
+                            className="calendar-week-session-card"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              onSelectDate(day.dateKey);
+                            }}
+                            title={`${session.name} (${formatSessionTime(session.time)}) — ${getRateBadgeText(summary)}`}
+                          >
+                            <span className="calendar-week-session-time">
+                              {formatSessionTime(session.time)}
+                            </span>
+                            <span className="calendar-week-session-name">{session.name}</span>
+                            <div className="calendar-week-session-foot">
+                              <span className="calendar-week-session-stat">
+                                {summary.totalMembers > 0
+                                  ? `${summary.presentCount}/${summary.totalMembers}`
+                                  : '0 mem'}
+                              </span>
+                              <span className="calendar-tag-rate">
+                                {summary.rate !== null ? `${summary.rate}%` : '--%'}
+                              </span>
+                            </div>
+                          </button>
+                        );
+                      })
                     )}
                   </div>
-                )}
-              </button>
-            );
-          })}
-        </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {viewMode === 'month' && (
+          <>
+            <div className="calendar-weekdays" role="row">
+              {WEEKDAY_HEADERS.map((day) => (
+                <div key={day} className="calendar-weekday" role="columnheader">
+                  {day}
+                </div>
+              ))}
+            </div>
+
+            <div className="calendar-grid" role="grid" aria-label={formatMonthYearLabel(viewYear, viewMonth)}>
+              {monthCells.map((cell) => {
+                const daySessions = sessionsByDate.get(cell.dateKey) ?? [];
+                const hasSessions = daySessions.length > 0;
+                const isSelected = cell.dateKey === selectedDateKey;
+                const previewSessions = daySessions.slice(0, 2);
+                const overflowCount = daySessions.length - previewSessions.length;
+
+                const cellClasses = [
+                  'calendar-day-cell',
+                  !cell.inCurrentMonth ? 'is-outside' : '',
+                  cell.isToday ? 'is-today' : '',
+                  isSelected ? 'is-selected' : '',
+                  hasSessions ? 'has-sessions' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ');
+
+                return (
+                  <button
+                    key={cell.dateKey}
+                    type="button"
+                    className={cellClasses}
+                    aria-pressed={isSelected}
+                    aria-label={`${formatSessionDate(cell.dateKey)}, ${daySessions.length} recorded ${
+                      daySessions.length === 1 ? 'session' : 'sessions'
+                    }`}
+                    onClick={() => onSelectDate(cell.dateKey)}
+                  >
+                    <div className="calendar-day-top">
+                      <span className="calendar-day-number">{cell.dayNumber}</span>
+                      {hasSessions && (
+                        <span className="calendar-session-count">{daySessions.length}</span>
+                      )}
+                    </div>
+
+                    {hasSessions && (
+                      <div className="calendar-day-tags">
+                        {previewSessions.map((session) => {
+                          const summary =
+                            sessionSummariesById.get(session.id) ??
+                            summarizeSessionAttendance(session, members);
+                          const rateChip =
+                            summary.rate !== null
+                              ? `${summary.rate}%`
+                              : summary.totalMembers === 0
+                                ? '0'
+                                : '--%';
+
+                          return (
+                            <span
+                              key={session.id}
+                              className="calendar-day-tag"
+                              title={`${session.name} (${formatSessionTime(session.time)}) — ${summary.presentCount}/${summary.totalMembers} present`}
+                            >
+                              <span className="calendar-day-tag-name">{session.name}</span>
+                              <span className="calendar-tag-rate">{rateChip}</span>
+                            </span>
+                          );
+                        })}
+                        {overflowCount > 0 && (
+                          <span className="calendar-day-more">+{overflowCount} more</span>
+                        )}
+                      </div>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {viewMode === 'year' && (
+          <div className="calendar-year-grid" aria-label={`Year ${viewYear} overview`}>
+            {yearMonths.map((month) => {
+              const monthKeyPrefix = `${month.year}-${String(month.monthIndex + 1).padStart(2, '0')}-`;
+              const monthSessions = sessions.filter((session) =>
+                session.date.startsWith(monthKeyPrefix),
+              );
+              const monthAggregate = summarizeSessionsAggregate(monthSessions, members);
+              const isActiveMonth = month.monthIndex === viewMonth;
+
+              return (
+                <section
+                  key={month.monthIndex}
+                  className={`calendar-year-month-card ${isActiveMonth ? 'is-active-month' : ''} ${
+                    monthSessions.length > 0 ? 'has-sessions' : ''
+                  }`}
+                  aria-label={`${month.label} ${month.year}`}
+                >
+                  <div className="calendar-year-month-head">
+                    <button
+                      type="button"
+                      className="calendar-year-month-link"
+                      onClick={() => handleDrillToMonth(month.monthIndex)}
+                      title={`Open ${month.label} ${month.year} in Month view`}
+                    >
+                      <span>{month.label}</span>
+                      <PixelChevronIcon width={10} height={10} />
+                    </button>
+
+                    <div className="calendar-year-month-badges">
+                      {monthSessions.length > 0 ? (
+                        <>
+                          <span
+                            className="calendar-session-count"
+                            title={`${monthSessions.length} recorded ${
+                              monthSessions.length === 1 ? 'session' : 'sessions'
+                            }`}
+                          >
+                            {monthSessions.length}
+                          </span>
+                          {monthAggregate.rate !== null && (
+                            <span
+                              className="calendar-year-rate-pill"
+                              title={`${monthAggregate.presentCount}/${monthAggregate.totalAssignments} present`}
+                            >
+                              {monthAggregate.rate}%
+                            </span>
+                          )}
+                        </>
+                      ) : (
+                        <span className="calendar-year-empty-pill">0</span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="calendar-mini-weekdays" aria-hidden="true">
+                    {MINI_WEEKDAY_INITIALS.map((initial, idx) => (
+                      <span key={idx} className="calendar-mini-weekday">
+                        {initial}
+                      </span>
+                    ))}
+                  </div>
+
+                  <div className="calendar-mini-days">
+                    {month.cells.map((cell) => {
+                      if (!cell.inCurrentMonth) {
+                        return (
+                          <span
+                            key={cell.dateKey}
+                            className="calendar-mini-spacer"
+                            aria-hidden="true"
+                          />
+                        );
+                      }
+
+                      const daySessions = sessionsByDate.get(cell.dateKey) ?? [];
+                      const hasSessions = daySessions.length > 0;
+                      const isSelected = cell.dateKey === selectedDateKey;
+                      const dayAggregate = hasSessions
+                        ? summarizeSessionsAggregate(daySessions, members)
+                        : null;
+
+                      const miniClasses = [
+                        'calendar-mini-day',
+                        cell.isToday ? 'is-today' : '',
+                        isSelected ? 'is-selected' : '',
+                        hasSessions ? 'has-sessions' : '',
+                      ]
+                        .filter(Boolean)
+                        .join(' ');
+
+                      const tooltip = hasSessions
+                        ? `${formatSessionDate(cell.dateKey)}: ${daySessions.length} ${
+                            daySessions.length === 1 ? 'session' : 'sessions'
+                          }${
+                            dayAggregate && dayAggregate.rate !== null
+                              ? ` (${dayAggregate.rate}% present)`
+                              : ''
+                          }`
+                        : formatSessionDate(cell.dateKey);
+
+                      return (
+                        <button
+                          key={cell.dateKey}
+                          type="button"
+                          className={miniClasses}
+                          aria-pressed={isSelected}
+                          aria-label={tooltip}
+                          title={tooltip}
+                          onClick={() => onSelectDate(cell.dateKey)}
+                        >
+                          {cell.dayNumber}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       <aside className="tracker-panel day-detail-panel" aria-label="Selected day session details">
@@ -249,7 +851,10 @@ export function SessionCalendarWorkspace({
           ) : (
             <div className="day-session-list">
               {selectedDaySessions.map((session) => {
-                const summary = summarizeSessionAttendance(session, members);
+                const summary =
+                  sessionSummariesById.get(session.id) ??
+                  summarizeSessionAttendance(session, members);
+                const assignedMembers = getSessionAssignedMembers(session, members);
 
                 return (
                   <article key={session.id} className="day-session-card">
@@ -316,16 +921,17 @@ export function SessionCalendarWorkspace({
                     <div className="day-member-breakdown">
                       <div className="day-breakdown-header">
                         <span>Attendance Breakdown</span>
-                        <span className="mono-cell">{members.length} members</span>
+                        <span className="mono-cell">{assignedMembers.length} assigned</span>
                       </div>
 
-                      {members.length === 0 ? (
+                      {assignedMembers.length === 0 ? (
                         <p className="day-breakdown-empty">
-                          No members in roster yet. Open this session in the tracker to add members.
+                          No members assigned to this session yet. Open it in the tracker to add
+                          members.
                         </p>
                       ) : (
                         <ul className="day-member-list">
-                          {members.map((member) => {
+                          {assignedMembers.map((member) => {
                             const entry = session.attendance[member.id];
                             const status = entry?.status ?? 'unmarked';
                             const reason = entry?.reason?.trim();
@@ -333,7 +939,14 @@ export function SessionCalendarWorkspace({
                             return (
                               <li key={member.id} className="day-member-item">
                                 <div className="day-member-main">
-                                  <span className="day-member-name">{member.name}</span>
+                                  <button
+                                    type="button"
+                                    className="day-member-name roster-member-profile-btn"
+                                    onClick={() => onOpenMemberProfile(member.id)}
+                                    title={`View ${member.name}'s profile & stats`}
+                                  >
+                                    {member.name}
+                                  </button>
                                   <span className={`status-badge status-${status}`}>
                                     {STATUS_LABELS[status]}
                                   </span>

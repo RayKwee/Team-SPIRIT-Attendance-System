@@ -20,13 +20,15 @@ export function StatsStrip({ members, activeSession }: StatsStripProps) {
     <section className="stats-strip" aria-label="Attendance summary">
       <article className="stat-card" data-accent="cyan">
         <div className="stat-header">
-          <span className="stat-label">Roster Size</span>
+          <span className="stat-label">Session Roster</span>
           <span className="stat-icon">
             <PixelCalendarIcon />
           </span>
         </div>
         <div className="stat-value">{summary.totalMembers}</div>
-        <div className="stat-meta">Registered club members</div>
+        <div className="stat-meta">
+          {activeSession ? 'Assigned to active session' : 'No active session'}
+        </div>
       </article>
 
       <article className="stat-card" data-accent="green">

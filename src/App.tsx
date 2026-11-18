@@ -1,62 +1,88 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { AttendanceWorkspace } from './components/AttendanceWorkspace';
+import { CloudSyncModal } from './components/CloudSyncModal';
 import { CreateSessionModal } from './components/CreateSessionModal';
 import { Header } from './components/Header';
+import { MemberManagerSidebar } from './components/MemberManagerSidebar';
+import { Preloader } from './components/Preloader';
+import { SessionCalendarWorkspace } from './components/SessionCalendarWorkspace';
+import { SettingsModal } from './components/SettingsModal';
 import { StatsStrip } from './components/StatsStrip';
+import { useSupabaseAuth } from './hooks/useSupabaseAuth';
+import { useSyncedAttendanceData } from './hooks/useSyncedAttendanceData';
 import type {
-  AttendanceSession,
   AttendanceStatus,
   ClubMember,
+  MemberProfileInput,
   NewSessionInput,
-  SessionAttendanceEntry,
   UserPreferences,
 } from './types/attendance';
+import { getCurrentPeriodLabel, toIsoDateString } from './utils/date';
+import { usePreloaderPhase } from './utils/preloader';
+import { useAppRoute } from './utils/router';
 import {
-  MEMBERS_STORAGE_KEY,
   PREFS_STORAGE_KEY,
-  SESSIONS_STORAGE_KEY,
-  loadMembers,
   loadPreferences,
-  loadSessions,
-  saveMembers,
   savePreferences,
-  saveSessions,
 } from './utils/storage';
-import { generateId } from './utils/attendance';
-import { getCurrentPeriodLabel } from './utils/date';
 
+/**
+ * Unified Team SPIRIT SPA shell.
+ * Opens immediately in local-only mode without login barriers, with an optional
+ * header Cloud Sync toggle to connect/disconnect Supabase persistence across devices.
+ */
 export function App() {
-  const [sessions, setSessions] = useState<AttendanceSession[]>(() => loadSessions());
-  const [members, setMembers] = useState<ClubMember[]>(() => loadMembers());
+  const memberSidebarId = useId();
+  const [activePage, navigateTo] = useAppRoute();
+  const { authStatus, user, signIn, signOut } = useSupabaseAuth();
+  const isCloudConnected = authStatus === 'authenticated' && Boolean(user?.id);
+  const {
+    members,
+    sessions,
+    syncStatus,
+    syncError,
+    pendingCount,
+    createSession,
+    deleteSession,
+    addMember,
+    updateMember,
+    deleteMembers,
+    assignMemberToSession,
+    removeMemberFromSession,
+    toggleAttendanceStatus,
+    setAbsenceReason,
+    resetSessionMarks,
+    flushPendingChanges,
+    prepareForSignOut,
+    setMergeLocalOnNextConnect,
+  } = useSyncedAttendanceData(isCloudConnected ? user?.id ?? null : null);
+
   const [preferences, setPreferences] = useState<UserPreferences>(() => loadPreferences());
+  const [selectedDateKey, setSelectedDateKey] = useState<string>(() => toIsoDateString(new Date()));
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [isCloudSyncModalOpen, setIsCloudSyncModalOpen] = useState(false);
+  const {
+    preloaderPhase,
+    containerRevealClass,
+    handlePreloaderBeginExit,
+    handlePreloaderComplete,
+  } = usePreloaderPhase();
 
   const activeSession =
     sessions.find((session) => session.id === preferences.activeSessionId) ??
     sessions[0] ??
     null;
 
-  // Automatically persist sessions, member roster, and workspace preferences locally.
-  useEffect(() => {
-    saveSessions(sessions);
-  }, [sessions]);
-
-  useEffect(() => {
-    saveMembers(members);
-  }, [members]);
-
+  // Persist workspace UI preferences locally.
   useEffect(() => {
     savePreferences(preferences);
   }, [preferences]);
 
-  // Keep multiple open tabs synchronized via storage events.
+  // Keep UI preferences synchronized across open tabs.
   useEffect(() => {
     function handleStorageChange(event: StorageEvent) {
-      if (event.key === SESSIONS_STORAGE_KEY) {
-        setSessions(loadSessions());
-      } else if (event.key === MEMBERS_STORAGE_KEY) {
-        setMembers(loadMembers());
-      } else if (event.key === PREFS_STORAGE_KEY) {
+      if (event.key === PREFS_STORAGE_KEY) {
         setPreferences(loadPreferences());
       }
     }
@@ -65,35 +91,9 @@ export function App() {
     return () => window.removeEventListener('storage', handleStorageChange);
   }, []);
 
-  function updateSessionAttendance(
-    sessionId: string,
-    memberId: string,
-    updater: (current: SessionAttendanceEntry | undefined) => SessionAttendanceEntry | undefined,
-  ) {
-    setSessions((prev) =>
-      prev.map((session) => {
-        if (session.id !== sessionId) return session;
-        const nextEntry = updater(session.attendance[memberId]);
-        const nextAttendance = { ...session.attendance };
-        if (!nextEntry || nextEntry.status === 'unmarked') {
-          delete nextAttendance[memberId];
-        } else {
-          nextAttendance[memberId] = nextEntry;
-        }
-        return { ...session, attendance: nextAttendance };
-      }),
-    );
-  }
-
   function handleCreateSession(input: NewSessionInput) {
-    const newSession: AttendanceSession = {
-      ...input,
-      id: generateId('session'),
-      createdAt: new Date().toISOString(),
-      attendance: {},
-    };
-
-    setSessions((prev) => [newSession, ...prev]);
+    const newSession = createSession(input);
+    setSelectedDateKey(newSession.date);
     setPreferences((prev) => ({
       ...prev,
       activeSessionId: newSession.id,
@@ -107,53 +107,60 @@ export function App() {
   }
 
   function handleDeleteSession(sessionId: string) {
-    setSessions((prev) => {
-      const remaining = prev.filter((session) => session.id !== sessionId);
-      setPreferences((prefPrev) => ({
-        ...prefPrev,
-        activeSessionId:
-          prefPrev.activeSessionId === sessionId
-            ? remaining[0]?.id ?? null
-            : prefPrev.activeSessionId,
-      }));
-      return remaining;
-    });
+    const remaining = sessions.filter((session) => session.id !== sessionId);
+    deleteSession(sessionId);
+    setPreferences((prefPrev) => ({
+      ...prefPrev,
+      activeSessionId:
+        prefPrev.activeSessionId === sessionId
+          ? remaining[0]?.id ?? null
+          : prefPrev.activeSessionId,
+    }));
   }
 
-  function handleAddMember(name: string) {
-    const newMember: ClubMember = {
-      id: generateId('member'),
-      name,
-      createdAt: new Date().toISOString(),
-    };
-    setMembers((prev) => [newMember, ...prev]);
+  function handleAddMember(input: string | MemberProfileInput): ClubMember {
+    return addMember(input);
   }
 
-  function handleRenameMember(memberId: string, nextName: string) {
-    setMembers((prev) =>
-      prev.map((member) => (member.id === memberId ? { ...member, name: nextName } : member)),
-    );
+  function handleUpdateMember(memberId: string, input: MemberProfileInput) {
+    updateMember(memberId, input);
+  }
+
+  function handleAssignMemberToSession(memberId: string) {
+    if (!activeSession) return;
+    assignMemberToSession(activeSession.id, memberId);
+  }
+
+  function handleRemoveMemberFromSession(memberId: string) {
+    if (!activeSession) return;
+    removeMemberFromSession(activeSession.id, memberId);
   }
 
   function handleDeleteMembers(memberIds: string[]) {
     if (memberIds.length === 0) return;
     const idsToDelete = new Set(memberIds);
-    const nextMembers = members.filter((member) => !idsToDelete.has(member.id));
-    const nextSessions = sessions.map((session) => {
-      const hasDeletedMember = Object.keys(session.attendance).some((id) => idsToDelete.has(id));
-      if (!hasDeletedMember) return session;
-      const nextAttendance = { ...session.attendance };
-      for (const id of idsToDelete) {
-        delete nextAttendance[id];
-      }
-      return { ...session, attendance: nextAttendance };
-    });
+    deleteMembers(memberIds);
+    if (preferences.selectedMemberId && idsToDelete.has(preferences.selectedMemberId)) {
+      setPreferences((prev) => ({
+        ...prev,
+        selectedMemberId: null,
+      }));
+    }
+  }
 
-    // Persist immediately so deleted members never reappear on reload or mark reset.
-    saveMembers(nextMembers);
-    saveSessions(nextSessions);
-    setMembers(nextMembers);
-    setSessions(nextSessions);
+  function handleToggleMemberSidebar() {
+    setPreferences((prev) => ({
+      ...prev,
+      isMemberSidebarOpen: !prev.isMemberSidebarOpen,
+    }));
+  }
+
+  function handleOpenMemberProfile(memberId: string) {
+    setPreferences((prev) => ({
+      ...prev,
+      selectedMemberId: memberId,
+      isMemberSidebarOpen: true,
+    }));
   }
 
   function handleToggleAttendanceStatus(
@@ -161,82 +168,179 @@ export function App() {
     targetStatus: Exclude<AttendanceStatus, 'unmarked'>,
   ) {
     if (!activeSession) return;
-    const now = new Date().toISOString();
-    updateSessionAttendance(activeSession.id, memberId, (current) => {
-      if (current?.status === targetStatus) {
-        return undefined;
-      }
-      if (targetStatus === 'absent_with_reason') {
-        return {
-          status: targetStatus,
-          reason: current?.reason ?? '',
-          updatedAt: now,
-        };
-      }
-      return {
-        status: targetStatus,
-        updatedAt: now,
-      };
-    });
+    toggleAttendanceStatus(activeSession.id, memberId, targetStatus);
   }
 
   function handleSetAbsenceReason(memberId: string, reason: string) {
     if (!activeSession) return;
-    const now = new Date().toISOString();
-    updateSessionAttendance(activeSession.id, memberId, () => ({
-      status: 'absent_with_reason',
-      reason,
-      updatedAt: now,
-    }));
+    setAbsenceReason(activeSession.id, memberId, reason);
   }
 
   function handleResetSessionMarks() {
     if (!activeSession) return;
-    const nextSessions = sessions.map((session) =>
-      session.id === activeSession.id ? { ...session, attendance: {} } : session,
-    );
-    saveSessions(nextSessions);
-    setSessions(nextSessions);
+    resetSessionMarks(activeSession.id);
   }
 
   function handleUpdatePreferences(patch: Partial<UserPreferences>) {
     setPreferences((prev) => ({ ...prev, ...patch }));
   }
 
+  function handleOpenSessionInTracker(sessionId: string) {
+    setPreferences((prev) => ({
+      ...prev,
+      activeSessionId: sessionId,
+    }));
+    navigateTo('tracker');
+  }
+
+  async function handleConnectCloudSync(
+    email: string,
+    password: string,
+    mergeLocalRecords: boolean,
+  ) {
+    setMergeLocalOnNextConnect(mergeLocalRecords);
+    const result = await signIn(email, password);
+    if (result.error) {
+      setMergeLocalOnNextConnect(false);
+    }
+    return result;
+  }
+
+  async function handleDisconnectCloudSync() {
+    setIsCreateModalOpen(false);
+    setIsSettingsModalOpen(false);
+    setIsCloudSyncModalOpen(false);
+    setPreferences((prev) => ({
+      ...prev,
+      activeSessionId: null,
+      selectedMemberId: null,
+    }));
+    await prepareForSignOut();
+    await signOut();
+  }
+
+  const hasLocalRecords = !isCloudConnected && (members.length > 0 || sessions.length > 0);
+
   return (
-    <div className="app-shell">
-      <div className="app-container">
+    <div className={`app-shell ${preferences.isMemberSidebarOpen ? 'is-sidebar-open' : ''}`}>
+      {preloaderPhase !== 'done' && (
+        <Preloader
+          ariaLabel={
+            activePage === 'calendar'
+              ? 'Loading Team SPIRIT Session Calendar'
+              : 'Loading Team SPIRIT Attendance Dashboard'
+          }
+          onBeginExit={handlePreloaderBeginExit}
+          onComplete={handlePreloaderComplete}
+        />
+      )}
+
+      <div className={`app-container ${containerRevealClass}`}>
         <Header
-          activePage="tracker"
+          activePage={activePage}
           periodLabel={getCurrentPeriodLabel()}
+          memberCount={members.length}
+          isMemberSidebarOpen={preferences.isMemberSidebarOpen}
+          sidebarId={memberSidebarId}
+          isCloudConnected={isCloudConnected}
+          userEmail={user?.email}
+          syncStatus={syncStatus}
+          pendingSyncCount={pendingCount}
+          syncError={syncError}
+          onNavigate={navigateTo}
+          onRetrySync={() => void flushPendingChanges()}
+          onOpenCloudSync={() => setIsCloudSyncModalOpen(true)}
+          onDisconnectCloudSync={() => void handleDisconnectCloudSync()}
+          onToggleMemberSidebar={handleToggleMemberSidebar}
+          onOpenSettings={() => setIsSettingsModalOpen(true)}
           onOpenCreateSession={() => setIsCreateModalOpen(true)}
         />
 
         <main className="workspace-main">
-          <StatsStrip members={members} activeSession={activeSession} />
-          <AttendanceWorkspace
-            sessions={sessions}
-            activeSession={activeSession}
-            members={members}
-            preferences={preferences}
-            onOpenCreateSession={() => setIsCreateModalOpen(true)}
-            onSelectSession={handleSelectSession}
-            onDeleteSession={handleDeleteSession}
-            onAddMember={handleAddMember}
-            onRenameMember={handleRenameMember}
-            onDeleteMembers={handleDeleteMembers}
-            onToggleAttendanceStatus={handleToggleAttendanceStatus}
-            onSetAbsenceReason={handleSetAbsenceReason}
-            onResetSessionMarks={handleResetSessionMarks}
-            onUpdatePreferences={handleUpdatePreferences}
-          />
+          <div key={activePage} className="workspace-view-stage">
+            {activePage === 'tracker' ? (
+              <>
+                <StatsStrip members={members} activeSession={activeSession} />
+                <AttendanceWorkspace
+                  sessions={sessions}
+                  activeSession={activeSession}
+                  members={members}
+                  preferences={preferences}
+                  onOpenCreateSession={() => setIsCreateModalOpen(true)}
+                  onOpenMemberManager={() =>
+                    handleUpdatePreferences({
+                      isMemberSidebarOpen: true,
+                      selectedMemberId: null,
+                    })
+                  }
+                  onOpenMemberProfile={handleOpenMemberProfile}
+                  onSelectSession={handleSelectSession}
+                  onDeleteSession={handleDeleteSession}
+                  onAssignMemberToSession={handleAssignMemberToSession}
+                  onRemoveMemberFromSession={handleRemoveMemberFromSession}
+                  onToggleAttendanceStatus={handleToggleAttendanceStatus}
+                  onSetAbsenceReason={handleSetAbsenceReason}
+                  onResetSessionMarks={handleResetSessionMarks}
+                  onUpdatePreferences={handleUpdatePreferences}
+                />
+              </>
+            ) : (
+              <SessionCalendarWorkspace
+                sessions={sessions}
+                members={members}
+                selectedDateKey={selectedDateKey}
+                viewMode={preferences.calendarViewMode}
+                onChangeViewMode={(mode) =>
+                  handleUpdatePreferences({ calendarViewMode: mode })
+                }
+                onSelectDate={setSelectedDateKey}
+                onOpenCreateSessionForDate={(dateKey) => {
+                  setSelectedDateKey(dateKey);
+                  setIsCreateModalOpen(true);
+                }}
+                onOpenSessionInTracker={handleOpenSessionInTracker}
+                onOpenMemberProfile={handleOpenMemberProfile}
+              />
+            )}
+          </div>
         </main>
       </div>
 
+      <MemberManagerSidebar
+        id={memberSidebarId}
+        isOpen={preferences.isMemberSidebarOpen}
+        members={members}
+        sessions={sessions}
+        selectedMemberId={preferences.selectedMemberId}
+        confirmDeleteMember={preferences.confirmDirectoryMemberDeletion}
+        onSelectMember={(memberId) => handleUpdatePreferences({ selectedMemberId: memberId })}
+        onClose={() => handleUpdatePreferences({ isMemberSidebarOpen: false })}
+        onAddMember={handleAddMember}
+        onUpdateMember={handleUpdateMember}
+        onDeleteMember={(memberId) => handleDeleteMembers([memberId])}
+      />
+
+      <SettingsModal
+        isOpen={isSettingsModalOpen}
+        preferences={preferences}
+        onUpdatePreferences={handleUpdatePreferences}
+        onClose={() => setIsSettingsModalOpen(false)}
+      />
+
       <CreateSessionModal
         isOpen={isCreateModalOpen}
+        defaultDate={activePage === 'calendar' ? selectedDateKey : undefined}
         onClose={() => setIsCreateModalOpen(false)}
         onCreateSession={handleCreateSession}
+      />
+
+      <CloudSyncModal
+        isOpen={isCloudSyncModalOpen}
+        hasLocalRecords={hasLocalRecords}
+        localMemberCount={members.length}
+        localSessionCount={sessions.length}
+        onClose={() => setIsCloudSyncModalOpen(false)}
+        onConnect={handleConnectCloudSync}
       />
     </div>
   );

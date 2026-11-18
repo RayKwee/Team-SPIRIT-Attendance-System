@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+
+# Environment variables (contains Supabase keys)
+.env
+.env.*
+!.env.example
+
+# macOS / Editor
+.DS_Store
+*.local
