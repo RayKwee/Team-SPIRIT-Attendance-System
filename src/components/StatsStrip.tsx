@@ -1,5 +1,6 @@
 import type { AttendanceSession, ClubMember } from '../types/attendance';
 import {
+  isLegacyMember,
   summarizeSessionAttendance,
   summarizeSessionsAggregate,
 } from '../utils/attendance';
@@ -21,6 +22,8 @@ interface StatsStripProps {
 export function StatsStrip({ members, sessions, activeSession }: StatsStripProps) {
   if (!activeSession) {
     const aggregate = summarizeSessionsAggregate(sessions, members);
+    const activeMemberCount = members.filter((member) => !isLegacyMember(member)).length;
+    const legacyMemberCount = members.length - activeMemberCount;
 
     return (
       <section className="stats-strip" aria-label="Sessions overview summary">
@@ -41,14 +44,18 @@ export function StatsStrip({ members, sessions, activeSession }: StatsStripProps
 
         <article className="stat-card" data-accent="green">
           <div className="stat-header">
-            <span className="stat-label">Club Directory</span>
+            <span className="stat-label">Active Roster</span>
             <span className="stat-icon">
               <PixelUsersIcon />
             </span>
           </div>
-          <div className="stat-value">{members.length}</div>
+          <div className="stat-value">{activeMemberCount}</div>
           <div className="stat-meta">
-            {members.length === 1 ? 'Registered club member' : 'Registered club members'}
+            {legacyMemberCount > 0
+              ? `${activeMemberCount === 1 ? 'Active member' : 'Active members'} • ${legacyMemberCount} legacy`
+              : activeMemberCount === 1
+                ? 'Registered club member'
+                : 'Registered club members'}
           </div>
         </article>
 

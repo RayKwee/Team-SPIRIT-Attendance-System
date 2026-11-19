@@ -5,9 +5,9 @@ import {
   PixelCalendarIcon,
   PixelChevronIcon,
   PixelListIcon,
-  PixelLogOutIcon,
   PixelPlusIcon,
   PixelSettingsIcon,
+  PixelUserIcon,
   PixelUsersIcon,
 } from './PixelIcons';
 import { TeamSpiritWordmark } from './TeamSpiritWordmark';
@@ -28,7 +28,6 @@ interface HeaderProps {
   onNavigate: (page: ActivePage) => void;
   onRetrySync?: () => void;
   onOpenCloudSync: () => void;
-  onDisconnectCloudSync: () => void;
   onToggleMemberSidebar: () => void;
   onOpenSettings: () => void;
   onOpenCreateSession: () => void;
@@ -93,7 +92,6 @@ export function Header({
   onNavigate,
   onRetrySync,
   onOpenCloudSync,
-  onDisconnectCloudSync,
   onToggleMemberSidebar,
   onOpenSettings,
   onOpenCreateSession,
@@ -172,22 +170,22 @@ export function Header({
 
             <button
               type="button"
-              className="cloud-sync-toggle is-connected"
-              onClick={onDisconnectCloudSync}
-              aria-pressed={true}
+              className="account-status-badge"
+              onClick={onOpenSettings}
               title={
                 userEmail
-                  ? `Cloud sync active (${userEmail}) — Click to sign out and return to local-only mode`
-                  : 'Cloud sync active — Click to sign out and return to local-only mode'
+                  ? `Signed in to Supabase as ${userEmail} — Click to open Account & Settings`
+                  : 'Signed in to Supabase Cloud Sync — Click to open Account & Settings'
               }
-              aria-label="Disconnect Supabase Cloud Sync"
+              aria-label={
+                userEmail
+                  ? `Signed in as ${userEmail}. Open account settings`
+                  : 'Signed in to Supabase. Open account settings'
+              }
             >
-              <span className="cloud-sync-dot" aria-hidden="true" />
-              <span className="cloud-sync-label">Cloud Sync</span>
-              <span className="cloud-sync-switch" aria-hidden="true">
-                <span className="cloud-sync-knob" />
-              </span>
-              <PixelLogOutIcon />
+              <span className="account-status-dot" aria-hidden="true" />
+              <PixelUserIcon className="account-status-icon" />
+              <span className="account-status-email">{userEmail || 'Signed In'}</span>
             </button>
           </>
         ) : (

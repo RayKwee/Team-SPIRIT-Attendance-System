@@ -12,12 +12,22 @@ export type CalendarViewMode = 'day' | 'week' | 'month' | 'year';
 
 export type MemberType = 'student' | 'teacher' | 'visitor';
 
+export type ClassYear = 7 | 8 | 9 | 10 | 11;
+
+export type ClassLetter = 'T' | 'E' | 'N' | 'B';
+
 /** Individual club member record keyed by a unique primary key (`id`). */
 export interface ClubMember {
   id: string;
   name: string;
   memberType?: MemberType;
+  classYear?: ClassYear;
+  classLetter?: ClassLetter;
   className?: string;
+  isLegacy?: boolean;
+  retiredAt?: string;
+  lastPromotedYear?: number;
+  graduationYear?: number;
   role?: string;
   email?: string;
   phone?: string;
@@ -32,7 +42,13 @@ export interface ClubMember {
 export interface MemberProfileInput {
   name: string;
   memberType?: MemberType;
+  classYear?: ClassYear;
+  classLetter?: ClassLetter;
   className?: string;
+  isLegacy?: boolean;
+  retiredAt?: string;
+  lastPromotedYear?: number;
+  graduationYear?: number;
   role?: string;
   email?: string;
   phone?: string;
@@ -105,6 +121,12 @@ export interface LocalSyncStore {
 
 export type SyncStatus = 'local' | 'idle' | 'loading' | 'synced' | 'syncing' | 'pending' | 'error';
 
+export type ThemeAccent = 'cyan' | 'gold' | 'green' | 'red';
+
+export type RosterDensity = 'comfortable' | 'compact';
+
+export type DefaultAssignmentStatus = 'unmarked' | 'present';
+
 /** Locally persisted workspace UI preferences. */
 export interface UserPreferences {
   activeSessionId: string | null;
@@ -117,4 +139,18 @@ export interface UserPreferences {
   isMemberSidebarOpen: boolean;
   confirmSessionMemberRemoval: boolean;
   confirmDirectoryMemberDeletion: boolean;
+  themeAccent: ThemeAccent;
+  rosterDensity: RosterDensity;
+  defaultAssignmentStatus: DefaultAssignmentStatus;
+}
+
+/** Portable JSON backup payload for exporting and restoring local attendance data. */
+export interface WorkspaceBackupPayload {
+  version: 1;
+  app: 'team-spirit-attendance';
+  exportedAt: string;
+  sourceMode: 'local' | 'cloud';
+  members: ClubMember[];
+  sessions: AttendanceSession[];
+  preferences?: Partial<UserPreferences>;
 }

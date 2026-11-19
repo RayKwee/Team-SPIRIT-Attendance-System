@@ -3,12 +3,20 @@ import type {
   AttendanceStatus,
   CalendarViewMode,
   ClubMember,
+  DefaultAssignmentStatus,
   FilterStatus,
+  RosterDensity,
   SessionAttendanceEntry,
+  ThemeAccent,
   UserPreferences,
   ViewMode,
+  WorkspaceBackupPayload,
 } from '../types/attendance';
-import { normalizeMemberType } from './attendance';
+import {
+  normalizeAcademicYear,
+  normalizeMemberType,
+  resolveStudentClassFields,
+} from './attendance';
 
 export const SESSIONS_STORAGE_KEY = 'team-spirit:sessions:v1';
 export const MEMBERS_STORAGE_KEY = 'team-spirit:members:v1';
@@ -39,6 +47,23 @@ const VALID_CALENDAR_VIEWS: ReadonlySet<CalendarViewMode> = new Set([
   'year',
 ]);
 
+const VALID_THEME_ACCENTS: ReadonlySet<ThemeAccent> = new Set([
+  'cyan',
+  'gold',
+  'green',
+  'red',
+]);
+
+const VALID_ROSTER_DENSITIES: ReadonlySet<RosterDensity> = new Set([
+  'comfortable',
+  'compact',
+]);
+
+const VALID_DEFAULT_ASSIGNMENT_STATUSES: ReadonlySet<DefaultAssignmentStatus> = new Set([
+  'unmarked',
+  'present',
+]);
+
 export const DEFAULT_PREFERENCES: UserPreferences = {
   activeSessionId: null,
   selectedMemberId: null,
@@ -50,6 +75,9 @@ export const DEFAULT_PREFERENCES: UserPreferences = {
   isMemberSidebarOpen: false,
   confirmSessionMemberRemoval: false,
   confirmDirectoryMemberDeletion: true,
+  themeAccent: 'cyan',
+  rosterDensity: 'comfortable',
+  defaultAssignmentStatus: 'unmarked',
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -75,11 +103,22 @@ function isValidMember(value: unknown): value is ClubMember {
 
 function normalizeMember(raw: ClubMember): ClubMember {
   const memberType = normalizeMemberType(raw.memberType);
+  const classFields = resolveStudentClassFields({
+    memberType,
+    classYear: raw.classYear,
+    classLetter: raw.classLetter,
+    className: cleanOptionalString(raw.className),
+  });
+  const isLegacy = Boolean(raw.isLegacy);
   return {
     id: raw.id,
     name: raw.name.trim(),
     memberType,
-    className: memberType === 'student' ? cleanOptionalString(raw.className) : undefined,
+    ...classFields,
+    isLegacy,
+    retiredAt: isLegacy ? cleanOptionalString(raw.retiredAt) : undefined,
+    lastPromotedYear: normalizeAcademicYear(raw.lastPromotedYear),
+    graduationYear: isLegacy ? normalizeAcademicYear(raw.graduationYear) : undefined,
     role: cleanOptionalString(raw.role),
     email: cleanOptionalString(raw.email),
     phone: cleanOptionalString(raw.phone),
@@ -307,6 +346,26 @@ export function loadPreferences(): UserPreferences {
         ? parsed.confirmDirectoryMemberDeletion
         : DEFAULT_PREFERENCES.confirmDirectoryMemberDeletion;
 
+    const themeAccent =
+      typeof parsed.themeAccent === 'string' &&
+      VALID_THEME_ACCENTS.has(parsed.themeAccent as ThemeAccent)
+        ? (parsed.themeAccent as ThemeAccent)
+        : DEFAULT_PREFERENCES.themeAccent;
+
+    const rosterDensity =
+      typeof parsed.rosterDensity === 'string' &&
+      VALID_ROSTER_DENSITIES.has(parsed.rosterDensity as RosterDensity)
+        ? (parsed.rosterDensity as RosterDensity)
+        : DEFAULT_PREFERENCES.rosterDensity;
+
+    const defaultAssignmentStatus =
+      typeof parsed.defaultAssignmentStatus === 'string' &&
+      VALID_DEFAULT_ASSIGNMENT_STATUSES.has(
+        parsed.defaultAssignmentStatus as DefaultAssignmentStatus,
+      )
+        ? (parsed.defaultAssignmentStatus as DefaultAssignmentStatus)
+        : DEFAULT_PREFERENCES.defaultAssignmentStatus;
+
     return {
       activeSessionId,
       selectedMemberId,
@@ -318,6 +377,9 @@ export function loadPreferences(): UserPreferences {
       isMemberSidebarOpen,
       confirmSessionMemberRemoval,
       confirmDirectoryMemberDeletion,
+      themeAccent,
+      rosterDensity,
+      defaultAssignmentStatus,
     };
   } catch {
     return DEFAULT_PREFERENCES;
@@ -342,4 +404,108 @@ export function clearLegacyWorkspaceStorage(): void {
   } catch {
     // Ignore storage removal errors.
   }
+}
+
+/** Builds a portable JSON backup snapshot of club members, sessions, and UI preferences. */
+export function buildWorkspaceBackupPayload(
+  members: ClubMember[],
+  sessions: AttendanceSession[],
+  preferences: UserPreferences,
+  sourceMode: 'local' | 'cloud',
+): WorkspaceBackupPayload {
+  return {
+    version: 1,
+    app: 'team-spirit-attendance',
+    exportedAt: new Date().toISOString(),
+    sourceMode,
+    members,
+    sessions,
+    preferences: {
+      viewMode: preferences.viewMode,
+      sessionHubViewMode: preferences.sessionHubViewMode,
+      calendarViewMode: preferences.calendarViewMode,
+      confirmSessionMemberRemoval: preferences.confirmSessionMemberRemoval,
+      confirmDirectoryMemberDeletion: preferences.confirmDirectoryMemberDeletion,
+      themeAccent: preferences.themeAccent,
+      rosterDensity: preferences.rosterDensity,
+      defaultAssignmentStatus: preferences.defaultAssignmentStatus,
+    },
+  };
+}
+
+/** Validates and normalizes an imported JSON backup file payload. */
+export function parseWorkspaceBackupPayload(rawText: string): {
+  members: ClubMember[];
+  sessions: AttendanceSession[];
+  preferencesPatch: Partial<UserPreferences>;
+} {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    throw new Error('The selected file is not valid JSON.');
+  }
+
+  if (!isRecord(parsed) || !Array.isArray(parsed.members) || !Array.isArray(parsed.sessions)) {
+    throw new Error('Backup file must contain "members" and "sessions" arrays.');
+  }
+
+  const members = parsed.members.filter(isValidMember).map(normalizeMember);
+  const sessions = parsed.sessions.filter(isValidSession).map(normalizeSession);
+
+  if (parsed.members.length > 0 && members.length === 0) {
+    throw new Error('No valid member records were found in the backup file.');
+  }
+  if (parsed.sessions.length > 0 && sessions.length === 0) {
+    throw new Error('No valid session records were found in the backup file.');
+  }
+
+  const preferencesPatch: Partial<UserPreferences> = {};
+  if (isRecord(parsed.preferences)) {
+    const rawPrefs = parsed.preferences;
+    if (typeof rawPrefs.viewMode === 'string' && VALID_VIEWS.has(rawPrefs.viewMode as ViewMode)) {
+      preferencesPatch.viewMode = rawPrefs.viewMode as ViewMode;
+    }
+    if (
+      typeof rawPrefs.sessionHubViewMode === 'string' &&
+      VALID_VIEWS.has(rawPrefs.sessionHubViewMode as ViewMode)
+    ) {
+      preferencesPatch.sessionHubViewMode = rawPrefs.sessionHubViewMode as ViewMode;
+    }
+    if (
+      typeof rawPrefs.calendarViewMode === 'string' &&
+      VALID_CALENDAR_VIEWS.has(rawPrefs.calendarViewMode as CalendarViewMode)
+    ) {
+      preferencesPatch.calendarViewMode = rawPrefs.calendarViewMode as CalendarViewMode;
+    }
+    if (typeof rawPrefs.confirmSessionMemberRemoval === 'boolean') {
+      preferencesPatch.confirmSessionMemberRemoval = rawPrefs.confirmSessionMemberRemoval;
+    }
+    if (typeof rawPrefs.confirmDirectoryMemberDeletion === 'boolean') {
+      preferencesPatch.confirmDirectoryMemberDeletion = rawPrefs.confirmDirectoryMemberDeletion;
+    }
+    if (
+      typeof rawPrefs.themeAccent === 'string' &&
+      VALID_THEME_ACCENTS.has(rawPrefs.themeAccent as ThemeAccent)
+    ) {
+      preferencesPatch.themeAccent = rawPrefs.themeAccent as ThemeAccent;
+    }
+    if (
+      typeof rawPrefs.rosterDensity === 'string' &&
+      VALID_ROSTER_DENSITIES.has(rawPrefs.rosterDensity as RosterDensity)
+    ) {
+      preferencesPatch.rosterDensity = rawPrefs.rosterDensity as RosterDensity;
+    }
+    if (
+      typeof rawPrefs.defaultAssignmentStatus === 'string' &&
+      VALID_DEFAULT_ASSIGNMENT_STATUSES.has(
+        rawPrefs.defaultAssignmentStatus as DefaultAssignmentStatus,
+      )
+    ) {
+      preferencesPatch.defaultAssignmentStatus =
+        rawPrefs.defaultAssignmentStatus as DefaultAssignmentStatus;
+    }
+  }
+
+  return { members, sessions, preferencesPatch };
 }

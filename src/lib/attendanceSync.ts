@@ -8,7 +8,11 @@ import type {
   SyncedMemberRecord,
   SyncedSessionRecord,
 } from '../types/attendance';
-import { normalizeMemberType } from '../utils/attendance';
+import {
+  normalizeAcademicYear,
+  normalizeMemberType,
+  resolveStudentClassFields,
+} from '../utils/attendance';
 import {
   clearLegacyWorkspaceStorage,
   loadMembers as loadLegacyMembers,
@@ -24,6 +28,12 @@ interface DbMemberRow {
   name: string;
   member_type?: string | null;
   class_name: string | null;
+  class_year?: number | null;
+  class_letter?: string | null;
+  is_legacy?: boolean | null;
+  retired_at?: string | null;
+  last_promoted_year?: number | null;
+  graduation_year?: number | null;
   role: string | null;
   email: string | null;
   phone: string | null;
@@ -68,7 +78,7 @@ const MISSING_TABLE_USER_MESSAGE =
   'Supabase tables (club_members, attendance_sessions, session_attendance) were not found. Run supabase/schema.sql in your Supabase SQL Editor, then click to retry.';
 
 const MISSING_COLUMN_USER_MESSAGE =
-  'Supabase club_members columns (member_type, class_name) are missing. Run the updated supabase/schema.sql in your Supabase SQL Editor, then click to retry.';
+  'Supabase club_members columns (member_type, class_name, class_year, class_letter, is_legacy, retired_at, last_promoted_year, graduation_year) are missing. Run the updated supabase/schema.sql in your Supabase SQL Editor, then click to retry.';
 
 const PERMISSION_DENIED_USER_MESSAGE =
   'Supabase denied access (403 Forbidden). Run the updated GRANT & RLS script in supabase/schema.sql in your Supabase SQL Editor, then click to retry.';
@@ -265,11 +275,22 @@ function cleanOptionalText(value: string | null | undefined): string | undefined
 
 export function memberFromDbRow(row: DbMemberRow): SyncedMemberRecord {
   const memberType = normalizeMemberType(row.member_type);
+  const classFields = resolveStudentClassFields({
+    memberType,
+    classYear: row.class_year,
+    classLetter: row.class_letter,
+    className: cleanOptionalText(row.class_name),
+  });
+  const isLegacy = Boolean(row.is_legacy);
   return {
     id: row.id,
     name: row.name,
     memberType,
-    className: memberType === 'student' ? cleanOptionalText(row.class_name) : undefined,
+    ...classFields,
+    isLegacy,
+    retiredAt: isLegacy ? cleanOptionalText(row.retired_at) : undefined,
+    lastPromotedYear: normalizeAcademicYear(row.last_promoted_year),
+    graduationYear: isLegacy ? normalizeAcademicYear(row.graduation_year) : undefined,
     role: cleanOptionalText(row.role),
     email: cleanOptionalText(row.email),
     phone: cleanOptionalText(row.phone),
@@ -284,11 +305,24 @@ export function memberFromDbRow(row: DbMemberRow): SyncedMemberRecord {
 
 export function memberToDbRow(member: SyncedMemberRecord): DbMemberRow {
   const memberType: MemberType = normalizeMemberType(member.memberType);
+  const classFields = resolveStudentClassFields({
+    memberType,
+    classYear: member.classYear,
+    classLetter: member.classLetter,
+    className: member.className,
+  });
+  const isLegacy = Boolean(member.isLegacy);
   return {
     id: member.id,
     name: member.name,
     member_type: memberType,
-    class_name: memberType === 'student' ? (member.className ?? null) : null,
+    class_name: classFields.className ?? null,
+    class_year: classFields.classYear ?? null,
+    class_letter: classFields.classLetter ?? null,
+    is_legacy: isLegacy,
+    retired_at: isLegacy ? (member.retiredAt ?? null) : null,
+    last_promoted_year: normalizeAcademicYear(member.lastPromotedYear) ?? null,
+    graduation_year: isLegacy ? (normalizeAcademicYear(member.graduationYear) ?? null) : null,
     role: member.role ?? null,
     email: member.email ?? null,
     phone: member.phone ?? null,
@@ -374,10 +408,21 @@ function loadStoreByKey(storageKey: string): LocalSyncStore {
         for (const [id, rec] of Object.entries(parsed.members)) {
           if (!rec || typeof rec !== 'object') continue;
           const memberType = normalizeMemberType(rec.memberType);
+          const classFields = resolveStudentClassFields({
+            memberType,
+            classYear: rec.classYear,
+            classLetter: rec.classLetter,
+            className: cleanOptionalText(rec.className),
+          });
+          const isLegacy = Boolean(rec.isLegacy);
           normalizedMembers[id] = {
             ...rec,
             memberType,
-            className: memberType === 'student' ? cleanOptionalText(rec.className) : undefined,
+            ...classFields,
+            isLegacy,
+            retiredAt: isLegacy ? cleanOptionalText(rec.retiredAt) : undefined,
+            lastPromotedYear: normalizeAcademicYear(rec.lastPromotedYear),
+            graduationYear: isLegacy ? normalizeAcademicYear(rec.graduationYear) : undefined,
           };
         }
       }

@@ -12,6 +12,7 @@ import {
   PixelChevronIcon,
   PixelClockIcon,
   PixelCloseIcon,
+  PixelCopyIcon,
   PixelGridIcon,
   PixelListIcon,
   PixelPinIcon,
@@ -27,6 +28,7 @@ interface SessionHubProps {
   viewMode: ViewMode;
   onChangeViewMode: (mode: ViewMode) => void;
   onSelectSession: (sessionId: string) => void;
+  onDuplicateSession: (session: AttendanceSession) => void;
   onDeleteSession: (sessionId: string) => void;
   onOpenCreateSession: () => void;
 }
@@ -38,6 +40,7 @@ export function SessionHub({
   viewMode,
   onChangeViewMode,
   onSelectSession,
+  onDuplicateSession,
   onDeleteSession,
   onOpenCreateSession,
 }: SessionHubProps) {
@@ -286,6 +289,15 @@ export function SessionHub({
                       >
                         <button
                           type="button"
+                          className="icon-btn session-hub-duplicate-btn"
+                          onClick={() => onDuplicateSession(session)}
+                          aria-label={`Duplicate session ${session.name}`}
+                          title="Duplicate session for a new date"
+                        >
+                          <PixelCopyIcon width={12} height={12} />
+                        </button>
+                        <button
+                          type="button"
                           className="icon-btn icon-btn-danger session-hub-delete-btn"
                           onClick={() => setPendingDeleteSession(session)}
                           aria-label={`Delete session ${session.name}`}
@@ -437,6 +449,15 @@ export function SessionHub({
                         onClick={(event) => event.stopPropagation()}
                         onKeyDown={(event) => event.stopPropagation()}
                       >
+                        <button
+                          type="button"
+                          className="icon-btn session-hub-duplicate-btn"
+                          onClick={() => onDuplicateSession(session)}
+                          aria-label={`Duplicate session ${session.name}`}
+                          title="Duplicate session for a new date"
+                        >
+                          <PixelCopyIcon width={12} height={12} />
+                        </button>
                         <button
                           type="button"
                           className="icon-btn icon-btn-danger session-hub-delete-btn"

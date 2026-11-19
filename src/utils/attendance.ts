@@ -1,6 +1,8 @@
 import type {
   AttendanceSession,
   AttendanceStatus,
+  ClassLetter,
+  ClassYear,
   ClubMember,
   MemberProfileInput,
   MemberType,
@@ -21,12 +23,321 @@ export const MEMBER_TYPE_LABELS: Record<MemberType, string> = {
 
 export const MEMBER_TYPES: readonly MemberType[] = ['student', 'teacher', 'visitor'];
 
+export const CLASS_YEARS: readonly ClassYear[] = [7, 8, 9, 10, 11];
+
+export const CLASS_LETTERS: readonly ClassLetter[] = ['T', 'E', 'N', 'B'];
+
+export const STREAK_HIGHLIGHT_THRESHOLD = 3;
+export const CONSECUTIVE_ABSENCE_ALERT_THRESHOLD = 2;
+
 /** Normalizes any unknown or legacy memberType value to a valid MemberType. */
 export function normalizeMemberType(value: unknown): MemberType {
   if (value === 'teacher' || value === 'visitor' || value === 'student') {
     return value;
   }
   return 'student';
+}
+
+/** Normalizes a year value to a valid ClassYear (7..11) or undefined. */
+export function normalizeClassYear(value: unknown): ClassYear | undefined {
+  const num =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string' && value.trim().length > 0
+        ? Number(value.trim())
+        : Number.NaN;
+  if (num === 7 || num === 8 || num === 9 || num === 10 || num === 11) {
+    return num;
+  }
+  return undefined;
+}
+
+/** Normalizes a class letter to T, E, N, or B (case-insensitive) or undefined. */
+export function normalizeClassLetter(value: unknown): ClassLetter | undefined {
+  if (typeof value !== 'string') return undefined;
+  const upper = value.trim().toUpperCase();
+  if (upper === 'T' || upper === 'E' || upper === 'N' || upper === 'B') {
+    return upper;
+  }
+  return undefined;
+}
+
+/** Formats a structured student Year + Class letter into the canonical display label (e.g. "Year 7 T"). */
+export function formatStudentClassName(year: ClassYear, letter: ClassLetter): string {
+  return `Year ${year} ${letter}`;
+}
+
+const STRUCTURED_CLASS_RE = /^(?:year\s*|yr\s*|y)?(7|8|9|10|11)\s*[-/]?\s*([tenb])$/i;
+
+/** Parses a formatted class string (e.g. "Year 7 T" or "11B") into structured Year & Class fields. */
+export function parseStudentClassName(
+  value?: string | null,
+): { year: ClassYear; letter: ClassLetter } | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const match = STRUCTURED_CLASS_RE.exec(trimmed);
+  if (!match) return null;
+  const year = normalizeClassYear(match[1]);
+  const letter = normalizeClassLetter(match[2]);
+  if (!year || !letter) return null;
+  return { year, letter };
+}
+
+/** Resolves normalized structured class fields and canonical display label for a student member. */
+export function resolveStudentClassFields(input: {
+  memberType: MemberType;
+  classYear?: unknown;
+  classLetter?: unknown;
+  className?: string | null;
+}): {
+  classYear?: ClassYear;
+  classLetter?: ClassLetter;
+  className?: string;
+} {
+  if (input.memberType !== 'student') {
+    return { classYear: undefined, classLetter: undefined, className: undefined };
+  }
+
+  const explicitYear = normalizeClassYear(input.classYear);
+  const explicitLetter = normalizeClassLetter(input.classLetter);
+  if (explicitYear && explicitLetter) {
+    return {
+      classYear: explicitYear,
+      classLetter: explicitLetter,
+      className: formatStudentClassName(explicitYear, explicitLetter),
+    };
+  }
+
+  const parsed = parseStudentClassName(input.className);
+  if (parsed) {
+    return {
+      classYear: parsed.year,
+      classLetter: parsed.letter,
+      className: formatStudentClassName(parsed.year, parsed.letter),
+    };
+  }
+
+  const fallbackClassName =
+    typeof input.className === 'string' && input.className.trim().length > 0
+      ? input.className.trim()
+      : undefined;
+
+  return {
+    classYear: undefined,
+    classLetter: undefined,
+    className: fallbackClassName,
+  };
+}
+
+/** Sorts class labels numerically by Year (7..11) and then T, E, N, B order, with legacy names last. */
+export function compareStudentClassNames(a: string, b: string): number {
+  const parsedA = parseStudentClassName(a);
+  const parsedB = parseStudentClassName(b);
+  if (parsedA && parsedB) {
+    if (parsedA.year !== parsedB.year) {
+      return parsedA.year - parsedB.year;
+    }
+    return CLASS_LETTERS.indexOf(parsedA.letter) - CLASS_LETTERS.indexOf(parsedB.letter);
+  }
+  if (parsedA) return -1;
+  if (parsedB) return 1;
+  return a.localeCompare(b);
+}
+
+/** Returns true when a club member belongs to the Legacy / Retired archive. */
+export function isLegacyMember(member: Pick<ClubMember, 'isLegacy'> | null | undefined): boolean {
+  return Boolean(member?.isLegacy);
+}
+
+/** Normalizes an academic year integer (e.g. 2026) or returns undefined. */
+export function normalizeAcademicYear(value: unknown): number | undefined {
+  const num =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string' && value.trim().length > 0
+        ? Number(value.trim())
+        : Number.NaN;
+  if (Number.isInteger(num) && num >= 2000 && num <= 2200) {
+    return num;
+  }
+  return undefined;
+}
+
+/**
+ * Returns the active September 1st academic cycle year for `referenceDate`.
+ * Dates from Sep 1 – Dec 31 of year Y return Y; dates from Jan 1 – Aug 31 of year Y return Y - 1.
+ */
+export function getPromotionCycleYear(referenceDate: Date = new Date()): number {
+  const year = referenceDate.getFullYear();
+  const monthIndex = referenceDate.getMonth();
+  return monthIndex >= 8 ? year : year - 1;
+}
+
+/** Returns a formatted academic cycle span label such as "2026–2027". */
+export function getAcademicCycleLabel(referenceDate: Date = new Date()): string {
+  const cycleYear = getPromotionCycleYear(referenceDate);
+  return `${cycleYear}–${cycleYear + 1}`;
+}
+
+/** Returns the formatted date label for the upcoming September 1st promotion boundary. */
+export function getNextPromotionDateLabel(referenceDate: Date = new Date()): string {
+  const nextCycleYear = getPromotionCycleYear(referenceDate) + 1;
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  }).format(new Date(nextCycleYear, 8, 1));
+}
+
+function resolveMemberAnchorYear(
+  member: Pick<ClubMember, 'lastPromotedYear' | 'updatedAt' | 'createdAt'>,
+  fallbackDate: Date,
+): number {
+  const explicit = normalizeAcademicYear(member.lastPromotedYear);
+  if (explicit !== undefined) return explicit;
+
+  const rawStamp = member.updatedAt || member.createdAt;
+  if (rawStamp) {
+    const parsedMs = Date.parse(rawStamp);
+    if (Number.isFinite(parsedMs)) {
+      return getPromotionCycleYear(new Date(parsedMs));
+    }
+  }
+
+  return getPromotionCycleYear(fallbackDate);
+}
+
+export interface AnnualProgressionSummary {
+  cycleYear: number;
+  promotedCount: number;
+  graduatedCount: number;
+  changedIds: string[];
+}
+
+/**
+ * Advances a single active student member by one year per elapsed September 1st cycle,
+ * keeping class letter (T, E, N, B) intact and graduating Year 11 students into Legacy.
+ */
+export function applyAnnualProgressionToMember<T extends ClubMember>(
+  member: T,
+  referenceDate: Date = new Date(),
+): { member: T; outcome: 'none' | 'promoted' | 'graduated' } {
+  if (isLegacyMember(member)) {
+    return { member, outcome: 'none' };
+  }
+
+  const memberType = normalizeMemberType(member.memberType);
+  if (memberType !== 'student') {
+    return { member, outcome: 'none' };
+  }
+
+  const resolvedClass = resolveStudentClassFields({
+    memberType,
+    classYear: member.classYear,
+    classLetter: member.classLetter,
+    className: member.className,
+  });
+
+  if (!resolvedClass.classYear || !resolvedClass.classLetter) {
+    return { member, outcome: 'none' };
+  }
+
+  const currentCycleYear = getPromotionCycleYear(referenceDate);
+  const anchorYear = resolveMemberAnchorYear(member, referenceDate);
+
+  if (anchorYear >= currentCycleYear) {
+    return { member, outcome: 'none' };
+  }
+
+  let currentYear: ClassYear = resolvedClass.classYear;
+  const classLetter = resolvedClass.classLetter;
+  let graduatedYear: number | undefined;
+
+  for (let cycle = anchorYear + 1; cycle <= currentCycleYear; cycle += 1) {
+    if (currentYear < 11) {
+      currentYear = (currentYear + 1) as ClassYear;
+    } else {
+      graduatedYear = cycle;
+      break;
+    }
+  }
+
+  const nowIso = referenceDate.toISOString();
+
+  if (graduatedYear !== undefined) {
+    return {
+      member: {
+        ...member,
+        classYear: 11,
+        classLetter,
+        className: formatStudentClassName(11, classLetter),
+        isLegacy: true,
+        graduationYear: graduatedYear,
+        retiredAt: member.retiredAt || nowIso,
+        lastPromotedYear: currentCycleYear,
+        updatedAt: nowIso,
+      },
+      outcome: 'graduated',
+    };
+  }
+
+  return {
+    member: {
+      ...member,
+      classYear: currentYear,
+      classLetter,
+      className: formatStudentClassName(currentYear, classLetter),
+      lastPromotedYear: currentCycleYear,
+      updatedAt: nowIso,
+    },
+    outcome: 'promoted',
+  };
+}
+
+/**
+ * Evaluates a map of member records and applies idempotent September 1st annual progression
+ * across all active, non-deleted students who have not yet been promoted in the current cycle.
+ */
+export function runAnnualClassProgression<T extends ClubMember & { deletedAt?: string | null }>(
+  members: Record<string, T>,
+  referenceDate: Date = new Date(),
+): {
+  nextMembers: Record<string, T>;
+  summary: AnnualProgressionSummary;
+} {
+  const currentCycleYear = getPromotionCycleYear(referenceDate);
+  const changedIds: string[] = [];
+  let promotedCount = 0;
+  let graduatedCount = 0;
+  let nextMembers: Record<string, T> | null = null;
+
+  for (const [id, member] of Object.entries(members)) {
+    if (!member || member.deletedAt) continue;
+    const result = applyAnnualProgressionToMember(member, referenceDate);
+    if (result.outcome === 'none') continue;
+
+    if (!nextMembers) {
+      nextMembers = { ...members };
+    }
+    nextMembers[id] = result.member;
+    changedIds.push(id);
+    if (result.outcome === 'graduated') {
+      graduatedCount += 1;
+    } else {
+      promotedCount += 1;
+    }
+  }
+
+  return {
+    nextMembers: nextMembers ?? members,
+    summary: {
+      cycleYear: currentCycleYear,
+      promotedCount,
+      graduatedCount,
+      changedIds,
+    },
+  };
 }
 
 export interface SessionAttendanceSummary {
@@ -61,12 +372,27 @@ export function buildClubMember(input: string | MemberProfileInput): ClubMember 
   const normalized: MemberProfileInput =
     typeof input === 'string' ? { name: input } : input;
   const memberType = normalizeMemberType(normalized.memberType);
-  const now = new Date().toISOString();
+  const classFields = resolveStudentClassFields({
+    memberType,
+    classYear: normalized.classYear,
+    classLetter: normalized.classLetter,
+    className: normalized.className,
+  });
+  const isLegacy = Boolean(normalized.isLegacy);
+  const nowDate = new Date();
+  const now = nowDate.toISOString();
+  const lastPromotedYear =
+    normalizeAcademicYear(normalized.lastPromotedYear) ?? getPromotionCycleYear(nowDate);
+  const graduationYear = isLegacy ? normalizeAcademicYear(normalized.graduationYear) : undefined;
   return {
     id: generateId('member'),
     name: normalized.name.trim(),
     memberType,
-    className: memberType === 'student' ? normalized.className?.trim() || undefined : undefined,
+    ...classFields,
+    isLegacy,
+    retiredAt: isLegacy ? (normalized.retiredAt?.trim() || now) : undefined,
+    lastPromotedYear,
+    graduationYear,
     role: normalized.role?.trim() || undefined,
     email: normalized.email?.trim() || undefined,
     phone: normalized.phone?.trim() || undefined,
@@ -83,19 +409,48 @@ export function applyMemberProfileUpdate(
   member: ClubMember,
   input: MemberProfileInput,
 ): ClubMember {
+  const prevMemberType = normalizeMemberType(member.memberType);
   const memberType = normalizeMemberType(input.memberType ?? member.memberType);
+  const classFields = resolveStudentClassFields({
+    memberType,
+    classYear: input.classYear,
+    classLetter: input.classLetter,
+    className: input.className,
+  });
+  const nextIsLegacy = input.isLegacy !== undefined ? Boolean(input.isLegacy) : Boolean(member.isLegacy);
+  const nowDate = new Date();
+  const now = nowDate.toISOString();
+  const nextRetiredAt = nextIsLegacy
+    ? (input.retiredAt?.trim() || member.retiredAt || now)
+    : undefined;
+  const nextGraduationYear = nextIsLegacy
+    ? (normalizeAcademicYear(input.graduationYear) ?? normalizeAcademicYear(member.graduationYear))
+    : undefined;
+  const classYearChanged = classFields.classYear !== member.classYear;
+  const restoredToActive = Boolean(member.isLegacy) && !nextIsLegacy;
+  const switchedToStudent = prevMemberType !== 'student' && memberType === 'student';
+  const nextLastPromotedYear =
+    normalizeAcademicYear(input.lastPromotedYear) ??
+    (classYearChanged || restoredToActive || switchedToStudent
+      ? getPromotionCycleYear(nowDate)
+      : normalizeAcademicYear(member.lastPromotedYear));
+
   return {
     ...member,
     name: input.name.trim(),
     memberType,
-    className: memberType === 'student' ? input.className?.trim() || undefined : undefined,
+    ...classFields,
+    isLegacy: nextIsLegacy,
+    retiredAt: nextRetiredAt,
+    lastPromotedYear: nextLastPromotedYear,
+    graduationYear: nextGraduationYear,
     role: input.role?.trim() || undefined,
     email: input.email?.trim() || undefined,
     phone: input.phone?.trim() || undefined,
     handle: input.handle?.trim() || undefined,
     joinedDate: input.joinedDate?.trim() || undefined,
     notes: input.notes?.trim() || undefined,
-    updatedAt: new Date().toISOString(),
+    updatedAt: now,
   };
 }
 
@@ -254,6 +609,8 @@ export interface MemberAttendanceStats {
   totalAbsentCount: number;
   overallRate: number | null;
   markedRate: number | null;
+  currentPresentStreak: number;
+  consecutiveUnexcusedAbsences: number;
   absenceRecords: MemberAbsenceRecord[];
   recentAbsenceReasons: MemberAbsenceRecord[];
 }
@@ -341,6 +698,37 @@ export function summarizeMemberAttendance(
   const markedRate =
     markedSessionsCount > 0 ? Math.round((presentCount / markedSessionsCount) * 100) : null;
 
+  // Evaluate current streak / consecutive unexcused absences starting from the newest marked session.
+  let currentPresentStreak = 0;
+  let consecutiveUnexcusedAbsences = 0;
+  const firstMarkedIndex = assignedSessions.findIndex(
+    (session) => (session.attendance[memberId]?.status ?? 'unmarked') !== 'unmarked',
+  );
+
+  if (firstMarkedIndex !== -1) {
+    const newestMarkedStatus = assignedSessions[firstMarkedIndex].attendance[memberId]?.status;
+    if (newestMarkedStatus === 'present') {
+      for (let index = firstMarkedIndex; index < assignedSessions.length; index += 1) {
+        if ((assignedSessions[index].attendance[memberId]?.status ?? 'unmarked') === 'present') {
+          currentPresentStreak += 1;
+        } else {
+          break;
+        }
+      }
+    } else if (newestMarkedStatus === 'absent_without_reason') {
+      for (let index = firstMarkedIndex; index < assignedSessions.length; index += 1) {
+        if (
+          (assignedSessions[index].attendance[memberId]?.status ?? 'unmarked') ===
+          'absent_without_reason'
+        ) {
+          consecutiveUnexcusedAbsences += 1;
+        } else {
+          break;
+        }
+      }
+    }
+  }
+
   return {
     totalSessions,
     presentCount,
@@ -351,6 +739,8 @@ export function summarizeMemberAttendance(
     totalAbsentCount,
     overallRate,
     markedRate,
+    currentPresentStreak,
+    consecutiveUnexcusedAbsences,
     absenceRecords,
     recentAbsenceReasons,
   };

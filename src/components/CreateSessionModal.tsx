@@ -1,13 +1,23 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
-import type { NewSessionInput } from '../types/attendance';
-import { toIsoDateString } from '../utils/date';
-import { PixelCalendarIcon, PixelCloseIcon, PixelPlusIcon } from './PixelIcons';
+import type { AttendanceSession, NewSessionInput } from '../types/attendance';
+import { addDaysToDateKey, toIsoDateString } from '../utils/date';
+import {
+  PixelCalendarIcon,
+  PixelCloseIcon,
+  PixelCopyIcon,
+  PixelPlusIcon,
+} from './PixelIcons';
 
 interface CreateSessionModalProps {
   isOpen: boolean;
   defaultDate?: string;
+  duplicateSource?: AttendanceSession | null;
+  duplicateMemberCount?: number;
   onClose: () => void;
-  onCreateSession: (input: NewSessionInput) => void;
+  onCreateSession: (
+    input: NewSessionInput,
+    options?: { includeSourceMembers?: boolean },
+  ) => void;
 }
 
 const EVENT_TYPE_OPTIONS = [
@@ -26,10 +36,12 @@ function getDefaultTimeValue(): string {
   return `${hours}:${minutes}`;
 }
 
-/** Compact voxel-styled pop-up dialog for creating a new attendance session. */
+/** Compact voxel-styled pop-up dialog for creating or duplicating an attendance session. */
 export function CreateSessionModal({
   isOpen,
   defaultDate,
+  duplicateSource = null,
+  duplicateMemberCount = 0,
   onClose,
   onCreateSession,
 }: CreateSessionModalProps) {
@@ -40,8 +52,10 @@ export function CreateSessionModal({
   const locationInputId = useId();
   const eventTypeInputId = useId();
   const descriptionInputId = useId();
+  const includeMembersId = useId();
 
   const nameInputRef = useRef<HTMLInputElement | null>(null);
+  const isDuplicateMode = Boolean(duplicateSource);
 
   const [name, setName] = useState('');
   const [date, setDate] = useState(() => defaultDate || toIsoDateString(new Date()));
@@ -49,17 +63,29 @@ export function CreateSessionModal({
   const [location, setLocation] = useState('');
   const [eventType, setEventType] = useState('');
   const [description, setDescription] = useState('');
+  const [includeSourceMembers, setIncludeSourceMembers] = useState(true);
   const [errorMessage, setErrorMessage] = useState('');
 
   useEffect(() => {
     if (!isOpen) return;
 
-    setName('');
-    setDate(defaultDate || toIsoDateString(new Date()));
-    setTime(getDefaultTimeValue());
-    setLocation('');
-    setEventType('');
-    setDescription('');
+    if (duplicateSource) {
+      setName(duplicateSource.name);
+      setDate(addDaysToDateKey(duplicateSource.date, 7));
+      setTime(duplicateSource.time);
+      setLocation(duplicateSource.location ?? '');
+      setEventType(duplicateSource.eventType ?? '');
+      setDescription(duplicateSource.description ?? '');
+      setIncludeSourceMembers(true);
+    } else {
+      setName('');
+      setDate(defaultDate || toIsoDateString(new Date()));
+      setTime(getDefaultTimeValue());
+      setLocation('');
+      setEventType('');
+      setDescription('');
+      setIncludeSourceMembers(false);
+    }
     setErrorMessage('');
 
     const focusTimer = window.setTimeout(() => {
@@ -77,7 +103,7 @@ export function CreateSessionModal({
       window.clearTimeout(focusTimer);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [isOpen, defaultDate, onClose]);
+  }, [isOpen, defaultDate, duplicateSource, onClose]);
 
   if (!isOpen) {
     return null;
@@ -100,14 +126,17 @@ export function CreateSessionModal({
       return;
     }
 
-    onCreateSession({
-      name: cleanedName,
-      date,
-      time,
-      location: location.trim() || undefined,
-      eventType: eventType.trim() || undefined,
-      description: description.trim() || undefined,
-    });
+    onCreateSession(
+      {
+        name: cleanedName,
+        date,
+        time,
+        location: location.trim() || undefined,
+        eventType: eventType.trim() || undefined,
+        description: description.trim() || undefined,
+      },
+      isDuplicateMode ? { includeSourceMembers } : undefined,
+    );
     onClose();
   }
 
@@ -130,11 +159,11 @@ export function CreateSessionModal({
         <div className="modal-header">
           <div className="modal-title-group">
             <span className="modal-badge">
-              <PixelCalendarIcon />
-              <span>New Session</span>
+              {isDuplicateMode ? <PixelCopyIcon /> : <PixelCalendarIcon />}
+              <span>{isDuplicateMode ? 'Duplicate Session' : 'New Session'}</span>
             </span>
             <h2 id={titleId} className="modal-title">
-              Record Attendance Session
+              {isDuplicateMode ? 'Clone Recurring Session' : 'Record Attendance Session'}
             </h2>
           </div>
 
@@ -260,13 +289,29 @@ export function CreateSessionModal({
             />
           </div>
 
+          {isDuplicateMode && duplicateMemberCount > 0 && (
+            <label className="cloud-sync-merge-option" htmlFor={includeMembersId}>
+              <input
+                id={includeMembersId}
+                type="checkbox"
+                checked={includeSourceMembers}
+                onChange={(event) => setIncludeSourceMembers(event.target.checked)}
+              />
+              <span>
+                Pre-assign {duplicateMemberCount}{' '}
+                {duplicateMemberCount === 1 ? 'member' : 'members'} from the original session
+                with fresh attendance marks
+              </span>
+            </label>
+          )}
+
           <div className="modal-footer">
             <button type="button" className="btn-secondary" onClick={onClose}>
               Cancel
             </button>
             <button type="submit" className="btn-primary">
-              <PixelPlusIcon />
-              <span>Create Session</span>
+              {isDuplicateMode ? <PixelCopyIcon /> : <PixelPlusIcon />}
+              <span>{isDuplicateMode ? 'Create Duplicate' : 'Create Session'}</span>
             </button>
           </div>
         </form>

@@ -8,6 +8,7 @@ import {
   MEMBER_TYPE_LABELS,
   STATUS_LABELS,
   getSessionAssignedMembers,
+  isLegacyMember,
   normalizeMemberType,
   summarizeSessionAttendance,
   summarizeSessionsAggregate,
@@ -951,6 +952,11 @@ export function SessionCalendarWorkspace({
                                     >
                                       {member.name}
                                     </button>
+                                    {isLegacyMember(member) && (
+                                      <span className="member-legacy-pill" title="Legacy / Retired member">
+                                        Legacy
+                                      </span>
+                                    )}
                                     {memberType === 'student'
                                       ? member.className && (
                                           <span

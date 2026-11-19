@@ -25,6 +25,7 @@ import type {
   AttendanceSession,
   AttendanceStatus,
   ClubMember,
+  DefaultAssignmentStatus,
   LocalSyncStore,
   MemberProfileInput,
   NewSessionInput,
@@ -34,9 +35,13 @@ import type {
   SyncedSessionRecord,
 } from '../types/attendance';
 import {
+  applyAnnualProgressionToMember,
   applyMemberProfileUpdate,
   buildClubMember,
   generateId,
+  getPromotionCycleYear,
+  runAnnualClassProgression,
+  type AnnualProgressionSummary,
 } from '../utils/attendance';
 
 const REASON_DEBOUNCE_MS = 450;
@@ -59,12 +64,28 @@ export interface UseSyncedAttendanceDataResult {
   syncError: string | null;
   pendingCount: number;
   hasUnsavedChanges: boolean;
-  createSession: (input: NewSessionInput) => AttendanceSession;
+  createSession: (
+    input: NewSessionInput,
+    options?: {
+      initialMemberIds?: string[];
+      defaultStatus?: DefaultAssignmentStatus;
+    },
+  ) => AttendanceSession;
   deleteSession: (sessionId: string) => void;
   addMember: (input: string | MemberProfileInput) => ClubMember;
   updateMember: (memberId: string, input: MemberProfileInput) => void;
+  setMemberLegacyStatus: (memberId: string, isLegacy: boolean) => void;
   deleteMembers: (memberIds: string[]) => void;
-  assignMemberToSession: (sessionId: string, memberId: string) => void;
+  assignMemberToSession: (
+    sessionId: string,
+    memberId: string,
+    defaultStatus?: DefaultAssignmentStatus,
+  ) => void;
+  assignMembersToSession: (
+    sessionId: string,
+    memberIds: string[],
+    defaultStatus?: DefaultAssignmentStatus,
+  ) => void;
   removeMemberFromSession: (sessionId: string, memberId: string) => void;
   toggleAttendanceStatus: (
     sessionId: string,
@@ -73,6 +94,12 @@ export interface UseSyncedAttendanceDataResult {
   ) => void;
   setAbsenceReason: (sessionId: string, memberId: string, reason: string) => void;
   resetSessionMarks: (sessionId: string) => void;
+  importBackupData: (
+    members: ClubMember[],
+    sessions: AttendanceSession[],
+  ) => { importedMembers: number; importedSessions: number };
+  getLastUndoToken: () => string | null;
+  undoByToken: (token: string) => boolean;
   flushPendingChanges: () => Promise<boolean>;
   prepareForSignOut: () => Promise<void>;
   setMergeLocalOnNextConnect: (shouldMerge: boolean) => void;
@@ -82,7 +109,10 @@ export interface UseSyncedAttendanceDataResult {
  * Coordinates optimistic local mutations, timestamped delete tombstones, Supabase
  * two-way conflict resolution, Realtime updates, and Google-Docs-style beforeunload safety.
  */
-export function useSyncedAttendanceData(userId: string | null): UseSyncedAttendanceDataResult {
+export function useSyncedAttendanceData(
+  userId: string | null,
+  options?: { onAnnualProgression?: (summary: AnnualProgressionSummary) => void },
+): UseSyncedAttendanceDataResult {
   const [members, setMembers] = useState<ClubMember[]>([]);
   const [sessions, setSessions] = useState<AttendanceSession[]>([]);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>(() => (userId ? 'loading' : 'local'));
@@ -92,6 +122,10 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
 
   const storeRef = useRef<LocalSyncStore>(createEmptySyncStore());
   const userIdRef = useRef<string | null>(userId);
+  const onAnnualProgressionRef = useRef(options?.onAnnualProgression);
+  onAnnualProgressionRef.current = options?.onAnnualProgression;
+  const undoStackRef = useRef<{ token: string; snapshot: LocalSyncStore }[]>([]);
+  const lastUndoTokenRef = useRef<string | null>(null);
   const syncInFlightRef = useRef(false);
   const needsFollowUpFlushRef = useRef(false);
   const mergeLocalOnNextConnectRef = useRef(false);
@@ -107,6 +141,30 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
 
   const setMergeLocalOnNextConnect = useCallback((shouldMerge: boolean) => {
     mergeLocalOnNextConnectRef.current = shouldMerge;
+  }, []);
+
+  const applyProgressionToCurrentStore = useCallback((activeUserId: string | null): boolean => {
+    const current = storeRef.current;
+    const { nextMembers, summary } = runAnnualClassProgression(current.members, new Date());
+    if (summary.changedIds.length === 0) {
+      return false;
+    }
+
+    const nextStore: LocalSyncStore = {
+      ...current,
+      members: nextMembers,
+      dirtyMemberIds: Array.from(new Set([...current.dirtyMemberIds, ...summary.changedIds])),
+    };
+    storeRef.current = nextStore;
+
+    if (activeUserId) {
+      saveLocalSyncStore(activeUserId, nextStore);
+    } else {
+      saveLocalOnlyStore(nextStore);
+    }
+
+    onAnnualProgressionRef.current?.(summary);
+    return true;
   }, []);
 
   const refreshDerivedState = useCallback(() => {
@@ -562,6 +620,10 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
 
         const hasActiveEditTimer =
           debounceTimerRef.current !== null || changeSyncTimerRef.current !== null;
+        if (!hasActiveEditTimer) {
+          applyProgressionToCurrentStore(activeUserId);
+        }
+
         if (!hasActiveEditTimer && (hasDirtySyncItems(storeRef.current) || needsFollowUpFlushRef.current)) {
           needsFollowUpFlushRef.current = false;
           return await flushDirtyQueue();
@@ -593,7 +655,7 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
         }
         return false;
       }
-  }, [ensureRealtimeSubscription, flushDirtyQueue, refreshDerivedState]);
+  }, [applyProgressionToCurrentStore, ensureRealtimeSubscription, flushDirtyQueue, refreshDerivedState]);
 
   const retrySync = useCallback(async (): Promise<boolean> => {
     if (!userIdRef.current) return true;
@@ -607,6 +669,8 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
   useEffect(() => {
     mountedRef.current = true;
     syncBlockedRef.current = false;
+    undoStackRef.current = [];
+    lastUndoTokenRef.current = null;
     cleanupRealtimeSubscription();
     clearBackgroundInterval();
 
@@ -617,6 +681,7 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
       syncInFlightRef.current = false;
       needsFollowUpFlushRef.current = false;
       storeRef.current = loadLocalOnlyStore();
+      applyProgressionToCurrentStore(null);
       setSyncStatus('local');
       setSyncError(null);
       refreshDerivedState();
@@ -624,18 +689,35 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
       function handleLocalStorageChange(event: StorageEvent) {
         if (event.key === LOCAL_ONLY_STORE_KEY && !userIdRef.current) {
           storeRef.current = loadLocalOnlyStore();
+          applyProgressionToCurrentStore(null);
           refreshDerivedState();
         }
       }
 
+      function handleLocalVisibilityOrInterval() {
+        if (userIdRef.current) return;
+        if (document.visibilityState === 'visible' && applyProgressionToCurrentStore(null)) {
+          refreshDerivedState();
+        }
+      }
+
+      const localProgressionInterval = window.setInterval(() => {
+        if (mountedRef.current && !userIdRef.current && applyProgressionToCurrentStore(null)) {
+          refreshDerivedState();
+        }
+      }, 60_000);
+
       window.addEventListener('storage', handleLocalStorageChange);
+      document.addEventListener('visibilitychange', handleLocalVisibilityOrInterval);
       return () => {
         mountedRef.current = false;
         syncBlockedRef.current = false;
+        window.clearInterval(localProgressionInterval);
         clearBackgroundInterval();
         clearChangeSyncTimer();
         clearDebounceTimer();
         window.removeEventListener('storage', handleLocalStorageChange);
+        document.removeEventListener('visibilitychange', handleLocalVisibilityOrInterval);
       };
     }
 
@@ -692,6 +774,7 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
       cleanupRealtimeSubscription();
     };
   }, [
+    applyProgressionToCurrentStore,
     cleanupRealtimeSubscription,
     clearBackgroundInterval,
     clearChangeSyncTimer,
@@ -717,11 +800,28 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
   const mutateStore = useCallback(
     (
       mutator: (prev: LocalSyncStore, now: string) => LocalSyncStore,
-      options?: { debounce?: boolean },
+      options?: { debounce?: boolean; recordUndo?: boolean },
     ) => {
       const activeUserId = userIdRef.current;
+      const prevStore = storeRef.current;
       const now = new Date().toISOString();
-      const nextStore = mutator(storeRef.current, now);
+      const nextStore = mutator(prevStore, now);
+      if (nextStore === prevStore) {
+        if (options?.recordUndo) {
+          lastUndoTokenRef.current = null;
+        }
+        return;
+      }
+
+      if (options?.recordUndo) {
+        const token = generateId('undo');
+        undoStackRef.current = [
+          ...undoStackRef.current.slice(-14),
+          { token, snapshot: prevStore },
+        ];
+        lastUndoTokenRef.current = token;
+      }
+
       storeRef.current = nextStore;
 
       if (!activeUserId) {
@@ -758,7 +858,13 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
   );
 
   const createSession = useCallback(
-    (input: NewSessionInput): AttendanceSession => {
+    (
+      input: NewSessionInput,
+      options?: {
+        initialMemberIds?: string[];
+        defaultStatus?: DefaultAssignmentStatus;
+      },
+    ): AttendanceSession => {
       const now = new Date().toISOString();
       const newSessionRecord: SyncedSessionRecord = {
         ...input,
@@ -767,17 +873,53 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
         updatedAt: now,
         deletedAt: null,
       };
+      const initialMemberIds = Array.from(new Set(options?.initialMemberIds ?? []));
+      const initialStatus: DefaultAssignmentStatus = options?.defaultStatus ?? 'unmarked';
+      const initialAttendance: AttendanceSession['attendance'] = {};
 
-      mutateStore((prev) => ({
-        ...prev,
-        sessions: { ...prev.sessions, [newSessionRecord.id]: newSessionRecord },
-        dirtySessionIds: Array.from(new Set([...prev.dirtySessionIds, newSessionRecord.id])),
-      }));
+      mutateStore(
+        (prev, stamp) => {
+          const nextAttendance = { ...prev.attendance };
+          const dirtyAttendance = new Set(prev.dirtyAttendanceKeys);
+          const validMemberIds: string[] = [];
+
+          initialMemberIds.forEach((memberId, index) => {
+            const member = prev.members[memberId];
+            if (!member || member.deletedAt || member.isLegacy) return;
+            validMemberIds.push(memberId);
+            const key = makeAttendanceKey(newSessionRecord.id, memberId);
+            nextAttendance[key] = {
+              sessionId: newSessionRecord.id,
+              memberId,
+              status: initialStatus,
+              sortOrder: index,
+              updatedAt: stamp,
+              deletedAt: null,
+            };
+            dirtyAttendance.add(key);
+          });
+
+          return {
+            ...prev,
+            sessions: { ...prev.sessions, [newSessionRecord.id]: newSessionRecord },
+            attendance: nextAttendance,
+            dirtySessionIds: Array.from(new Set([...prev.dirtySessionIds, newSessionRecord.id])),
+            dirtyAttendanceKeys: Array.from(dirtyAttendance),
+          };
+        },
+        { recordUndo: true },
+      );
+
+      if (initialStatus !== 'unmarked') {
+        for (const memberId of initialMemberIds) {
+          initialAttendance[memberId] = { status: initialStatus, updatedAt: now };
+        }
+      }
 
       return {
         ...newSessionRecord,
-        memberIds: [],
-        attendance: {},
+        memberIds: initialMemberIds,
+        attendance: initialAttendance,
       };
     },
     [mutateStore],
@@ -785,34 +927,37 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
 
   const deleteSession = useCallback(
     (sessionId: string) => {
-      mutateStore((prev, now) => {
-        const existing = prev.sessions[sessionId];
-        if (!existing) return prev;
+      mutateStore(
+        (prev, now) => {
+          const existing = prev.sessions[sessionId];
+          if (!existing) return prev;
 
-        const nextSession: SyncedSessionRecord = {
-          ...existing,
-          updatedAt: now,
-          deletedAt: now,
-        };
+          const nextSession: SyncedSessionRecord = {
+            ...existing,
+            updatedAt: now,
+            deletedAt: now,
+          };
 
-        const nextAttendance = { ...prev.attendance };
-        const dirtyAttendance = new Set(prev.dirtyAttendanceKeys);
+          const nextAttendance = { ...prev.attendance };
+          const dirtyAttendance = new Set(prev.dirtyAttendanceKeys);
 
-        for (const [key, rec] of Object.entries(prev.attendance)) {
-          if (rec.sessionId === sessionId && !rec.deletedAt) {
-            nextAttendance[key] = { ...rec, updatedAt: now, deletedAt: now };
-            dirtyAttendance.add(key);
+          for (const [key, rec] of Object.entries(prev.attendance)) {
+            if (rec.sessionId === sessionId && !rec.deletedAt) {
+              nextAttendance[key] = { ...rec, updatedAt: now, deletedAt: now };
+              dirtyAttendance.add(key);
+            }
           }
-        }
 
-        return {
-          ...prev,
-          sessions: { ...prev.sessions, [sessionId]: nextSession },
-          attendance: nextAttendance,
-          dirtySessionIds: Array.from(new Set([...prev.dirtySessionIds, sessionId])),
-          dirtyAttendanceKeys: Array.from(dirtyAttendance),
-        };
-      });
+          return {
+            ...prev,
+            sessions: { ...prev.sessions, [sessionId]: nextSession },
+            attendance: nextAttendance,
+            dirtySessionIds: Array.from(new Set([...prev.dirtySessionIds, sessionId])),
+            dirtyAttendanceKeys: Array.from(dirtyAttendance),
+          };
+        },
+        { recordUndo: true },
+      );
     },
     [mutateStore],
   );
@@ -826,11 +971,14 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
         deletedAt: null,
       };
 
-      mutateStore((prev) => ({
-        ...prev,
-        members: { ...prev.members, [record.id]: record },
-        dirtyMemberIds: Array.from(new Set([...prev.dirtyMemberIds, record.id])),
-      }));
+      mutateStore(
+        (prev) => ({
+          ...prev,
+          members: { ...prev.members, [record.id]: record },
+          dirtyMemberIds: Array.from(new Set([...prev.dirtyMemberIds, record.id])),
+        }),
+        { recordUndo: true },
+      );
 
       return created;
     },
@@ -839,22 +987,57 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
 
   const updateMember = useCallback(
     (memberId: string, input: MemberProfileInput) => {
-      mutateStore((prev, now) => {
-        const existing = prev.members[memberId];
-        if (!existing || existing.deletedAt) return prev;
-        const updated = applyMemberProfileUpdate(existing, input);
-        const record: SyncedMemberRecord = {
-          ...updated,
-          updatedAt: now,
-          deletedAt: null,
-        };
+      mutateStore(
+        (prev, now) => {
+          const existing = prev.members[memberId];
+          if (!existing || existing.deletedAt) return prev;
+          const updated = applyMemberProfileUpdate(existing, input);
+          const record: SyncedMemberRecord = {
+            ...updated,
+            updatedAt: now,
+            deletedAt: null,
+          };
 
-        return {
-          ...prev,
-          members: { ...prev.members, [memberId]: record },
-          dirtyMemberIds: Array.from(new Set([...prev.dirtyMemberIds, memberId])),
-        };
-      });
+          return {
+            ...prev,
+            members: { ...prev.members, [memberId]: record },
+            dirtyMemberIds: Array.from(new Set([...prev.dirtyMemberIds, memberId])),
+          };
+        },
+        { recordUndo: true },
+      );
+    },
+    [mutateStore],
+  );
+
+  const setMemberLegacyStatus = useCallback(
+    (memberId: string, isLegacy: boolean) => {
+      mutateStore(
+        (prev, now) => {
+          const existing = prev.members[memberId];
+          if (!existing || existing.deletedAt) return prev;
+          if (Boolean(existing.isLegacy) === isLegacy) return prev;
+
+          const record: SyncedMemberRecord = {
+            ...existing,
+            isLegacy,
+            retiredAt: isLegacy ? (existing.retiredAt ?? now) : undefined,
+            graduationYear: isLegacy ? existing.graduationYear : undefined,
+            lastPromotedYear: isLegacy
+              ? existing.lastPromotedYear
+              : getPromotionCycleYear(new Date()),
+            updatedAt: now,
+            deletedAt: null,
+          };
+
+          return {
+            ...prev,
+            members: { ...prev.members, [memberId]: record },
+            dirtyMemberIds: Array.from(new Set([...prev.dirtyMemberIds, memberId])),
+          };
+        },
+        { recordUndo: true },
+      );
     },
     [mutateStore],
   );
@@ -864,95 +1047,136 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
       if (memberIds.length === 0) return;
       const targetIds = new Set(memberIds);
 
-      mutateStore((prev, now) => {
-        const nextMembers = { ...prev.members };
-        const dirtyMembers = new Set(prev.dirtyMemberIds);
+      mutateStore(
+        (prev, now) => {
+          const nextMembers = { ...prev.members };
+          const dirtyMembers = new Set(prev.dirtyMemberIds);
 
-        for (const id of targetIds) {
-          const existing = nextMembers[id];
-          if (existing && !existing.deletedAt) {
-            nextMembers[id] = { ...existing, updatedAt: now, deletedAt: now };
-            dirtyMembers.add(id);
+          for (const id of targetIds) {
+            const existing = nextMembers[id];
+            if (existing && !existing.deletedAt) {
+              nextMembers[id] = { ...existing, updatedAt: now, deletedAt: now };
+              dirtyMembers.add(id);
+            }
           }
-        }
 
-        const nextAttendance = { ...prev.attendance };
-        const dirtyAttendance = new Set(prev.dirtyAttendanceKeys);
+          const nextAttendance = { ...prev.attendance };
+          const dirtyAttendance = new Set(prev.dirtyAttendanceKeys);
 
-        for (const [key, rec] of Object.entries(prev.attendance)) {
-          if (targetIds.has(rec.memberId) && !rec.deletedAt) {
-            nextAttendance[key] = { ...rec, updatedAt: now, deletedAt: now };
+          for (const [key, rec] of Object.entries(prev.attendance)) {
+            if (targetIds.has(rec.memberId) && !rec.deletedAt) {
+              nextAttendance[key] = { ...rec, updatedAt: now, deletedAt: now };
+              dirtyAttendance.add(key);
+            }
+          }
+
+          return {
+            ...prev,
+            members: nextMembers,
+            attendance: nextAttendance,
+            dirtyMemberIds: Array.from(dirtyMembers),
+            dirtyAttendanceKeys: Array.from(dirtyAttendance),
+          };
+        },
+        { recordUndo: true },
+      );
+    },
+    [mutateStore],
+  );
+
+  const assignMembersToSession = useCallback(
+    (
+      sessionId: string,
+      memberIds: string[],
+      defaultStatus: DefaultAssignmentStatus = 'unmarked',
+    ) => {
+      if (memberIds.length === 0) return;
+
+      mutateStore(
+        (prev, now) => {
+          let minSortOrder = 0;
+          for (const rec of Object.values(prev.attendance)) {
+            if (rec.sessionId === sessionId && !rec.deletedAt && rec.sortOrder <= minSortOrder) {
+              minSortOrder = rec.sortOrder - 1;
+            }
+          }
+
+          const nextAttendance = { ...prev.attendance };
+          const dirtyAttendance = new Set(prev.dirtyAttendanceKeys);
+          let changed = false;
+
+          // Iterate in reverse so the array's natural order is preserved at the top of the list.
+          for (let index = memberIds.length - 1; index >= 0; index -= 1) {
+            const memberId = memberIds[index];
+            const member = prev.members[memberId];
+            if (!member || member.deletedAt || member.isLegacy) continue;
+
+            const key = makeAttendanceKey(sessionId, memberId);
+            const existing = nextAttendance[key];
+            if (existing && !existing.deletedAt) continue;
+
+            nextAttendance[key] = {
+              sessionId,
+              memberId,
+              status: defaultStatus,
+              sortOrder: minSortOrder,
+              updatedAt: now,
+              deletedAt: null,
+            };
+            minSortOrder -= 1;
             dirtyAttendance.add(key);
+            changed = true;
           }
-        }
 
-        return {
-          ...prev,
-          members: nextMembers,
-          attendance: nextAttendance,
-          dirtyMemberIds: Array.from(dirtyMembers),
-          dirtyAttendanceKeys: Array.from(dirtyAttendance),
-        };
-      });
+          if (!changed) return prev;
+
+          return {
+            ...prev,
+            attendance: nextAttendance,
+            dirtyAttendanceKeys: Array.from(dirtyAttendance),
+          };
+        },
+        { recordUndo: true },
+      );
     },
     [mutateStore],
   );
 
   const assignMemberToSession = useCallback(
-    (sessionId: string, memberId: string) => {
-      mutateStore((prev, now) => {
-        const key = makeAttendanceKey(sessionId, memberId);
-        const existing = prev.attendance[key];
-        if (existing && !existing.deletedAt) return prev;
-
-        // Place newly assigned member at the front of the session list (lowest sortOrder).
-        let minSortOrder = 0;
-        for (const rec of Object.values(prev.attendance)) {
-          if (rec.sessionId === sessionId && !rec.deletedAt && rec.sortOrder <= minSortOrder) {
-            minSortOrder = rec.sortOrder - 1;
-          }
-        }
-
-        const nextRecord: SyncedAttendanceRecord = {
-          sessionId,
-          memberId,
-          status: 'unmarked',
-          sortOrder: minSortOrder,
-          updatedAt: now,
-          deletedAt: null,
-        };
-
-        return {
-          ...prev,
-          attendance: { ...prev.attendance, [key]: nextRecord },
-          dirtyAttendanceKeys: Array.from(new Set([...prev.dirtyAttendanceKeys, key])),
-        };
-      });
+    (
+      sessionId: string,
+      memberId: string,
+      defaultStatus: DefaultAssignmentStatus = 'unmarked',
+    ) => {
+      assignMembersToSession(sessionId, [memberId], defaultStatus);
     },
-    [mutateStore],
+    [assignMembersToSession],
   );
 
   const removeMemberFromSession = useCallback(
     (sessionId: string, memberId: string) => {
-      mutateStore((prev, now) => {
-        const key = makeAttendanceKey(sessionId, memberId);
-        const existing = prev.attendance[key];
-        if (!existing || existing.deletedAt) return prev;
+      mutateStore(
+        (prev, now) => {
+          const key = makeAttendanceKey(sessionId, memberId);
+          const existing = prev.attendance[key];
+          if (!existing || existing.deletedAt) return prev;
 
-        const nextRecord: SyncedAttendanceRecord = {
-          ...existing,
-          status: 'unmarked',
-          reason: undefined,
-          updatedAt: now,
-          deletedAt: now,
-        };
+          const nextRecord: SyncedAttendanceRecord = {
+            ...existing,
+            status: 'unmarked',
+            reason: undefined,
+            updatedAt: now,
+            deletedAt: now,
+          };
 
-        return {
-          ...prev,
-          attendance: { ...prev.attendance, [key]: nextRecord },
-          dirtyAttendanceKeys: Array.from(new Set([...prev.dirtyAttendanceKeys, key])),
-        };
-      });
+          return {
+            ...prev,
+            attendance: { ...prev.attendance, [key]: nextRecord },
+            dirtyAttendanceKeys: Array.from(new Set([...prev.dirtyAttendanceKeys, key])),
+          };
+        },
+        { recordUndo: true },
+      );
     },
     [mutateStore],
   );
@@ -1042,28 +1266,249 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
 
   const resetSessionMarks = useCallback(
     (sessionId: string) => {
-      mutateStore((prev, now) => {
-        const nextAttendance = { ...prev.attendance };
-        const dirtyAttendance = new Set(prev.dirtyAttendanceKeys);
+      mutateStore(
+        (prev, now) => {
+          const nextAttendance = { ...prev.attendance };
+          const dirtyAttendance = new Set(prev.dirtyAttendanceKeys);
+          let changed = false;
 
-        for (const [key, rec] of Object.entries(prev.attendance)) {
-          if (rec.sessionId === sessionId && !rec.deletedAt && rec.status !== 'unmarked') {
-            nextAttendance[key] = {
-              ...rec,
-              status: 'unmarked',
-              reason: undefined,
-              updatedAt: now,
-            };
+          for (const [key, rec] of Object.entries(prev.attendance)) {
+            if (rec.sessionId === sessionId && !rec.deletedAt && rec.status !== 'unmarked') {
+              nextAttendance[key] = {
+                ...rec,
+                status: 'unmarked',
+                reason: undefined,
+                updatedAt: now,
+              };
+              dirtyAttendance.add(key);
+              changed = true;
+            }
+          }
+
+          if (!changed) return prev;
+
+          return {
+            ...prev,
+            attendance: nextAttendance,
+            dirtyAttendanceKeys: Array.from(dirtyAttendance),
+          };
+        },
+        { recordUndo: true },
+      );
+    },
+    [mutateStore],
+  );
+
+  const importBackupData = useCallback(
+    (
+      importedMembers: ClubMember[],
+      importedSessions: AttendanceSession[],
+    ): { importedMembers: number; importedSessions: number } => {
+      let memberChanges = 0;
+      let sessionChanges = 0;
+
+      mutateStore(
+        (prev, now) => {
+          const nextMembers = { ...prev.members };
+          const dirtyMembers = new Set(prev.dirtyMemberIds);
+
+          for (const member of importedMembers) {
+            const existing = nextMembers[member.id];
+            const incomingTs = getEffectiveTimestamp(member.updatedAt ?? member.createdAt, null);
+            const existingTs = existing
+              ? getEffectiveTimestamp(existing.updatedAt, existing.deletedAt)
+              : -1;
+
+            if (!existing || existing.deletedAt || incomingTs > existingTs) {
+              const progressed = applyAnnualProgressionToMember(
+                {
+                  ...member,
+                  updatedAt: member.updatedAt ?? member.createdAt,
+                  deletedAt: null,
+                },
+                new Date(),
+              ).member;
+              nextMembers[member.id] = {
+                ...progressed,
+                updatedAt: now,
+                deletedAt: null,
+              };
+              dirtyMembers.add(member.id);
+              memberChanges += 1;
+            }
+          }
+
+          const nextSessions = { ...prev.sessions };
+          const dirtySessions = new Set(prev.dirtySessionIds);
+          const nextAttendance = { ...prev.attendance };
+          const dirtyAttendance = new Set(prev.dirtyAttendanceKeys);
+
+          for (const session of importedSessions) {
+            const existingSession = nextSessions[session.id];
+            const incomingSessionTs = getEffectiveTimestamp(
+              session.updatedAt ?? session.createdAt,
+              null,
+            );
+            const existingSessionTs = existingSession
+              ? getEffectiveTimestamp(existingSession.updatedAt, existingSession.deletedAt)
+              : -1;
+
+            if (
+              !existingSession ||
+              existingSession.deletedAt ||
+              incomingSessionTs > existingSessionTs
+            ) {
+              nextSessions[session.id] = {
+                id: session.id,
+                name: session.name,
+                date: session.date,
+                time: session.time,
+                location: session.location,
+                description: session.description,
+                eventType: session.eventType,
+                createdAt: session.createdAt,
+                updatedAt: now,
+                deletedAt: null,
+              };
+              dirtySessions.add(session.id);
+              sessionChanges += 1;
+            }
+
+            session.memberIds.forEach((memberId, index) => {
+              if (!nextMembers[memberId] || nextMembers[memberId].deletedAt) return;
+              const key = makeAttendanceKey(session.id, memberId);
+              const existingAtt = nextAttendance[key];
+              const entry = session.attendance[memberId];
+              const incomingAttTs = getEffectiveTimestamp(
+                entry?.updatedAt ?? session.updatedAt ?? session.createdAt,
+                null,
+              );
+              const existingAttTs = existingAtt
+                ? getEffectiveTimestamp(existingAtt.updatedAt, existingAtt.deletedAt)
+                : -1;
+
+              if (!existingAtt || existingAtt.deletedAt || incomingAttTs > existingAttTs) {
+                const status = entry?.status ?? 'unmarked';
+                nextAttendance[key] = {
+                  sessionId: session.id,
+                  memberId,
+                  status,
+                  reason: status === 'absent_with_reason' ? entry?.reason : undefined,
+                  sortOrder: existingAtt && !existingAtt.deletedAt ? existingAtt.sortOrder : index,
+                  updatedAt: now,
+                  deletedAt: null,
+                };
+                dirtyAttendance.add(key);
+              }
+            });
+          }
+
+          return {
+            ...prev,
+            members: nextMembers,
+            sessions: nextSessions,
+            attendance: nextAttendance,
+            dirtyMemberIds: Array.from(dirtyMembers),
+            dirtySessionIds: Array.from(dirtySessions),
+            dirtyAttendanceKeys: Array.from(dirtyAttendance),
+          };
+        },
+        { recordUndo: true },
+      );
+
+      return {
+        importedMembers: memberChanges,
+        importedSessions: sessionChanges,
+      };
+    },
+    [mutateStore],
+  );
+
+  const getLastUndoToken = useCallback((): string | null => {
+    const token = lastUndoTokenRef.current;
+    lastUndoTokenRef.current = null;
+    return token;
+  }, []);
+
+  const undoByToken = useCallback(
+    (token: string): boolean => {
+      const idx = undoStackRef.current.findIndex((item) => item.token === token);
+      if (idx === -1) return false;
+
+      const entry = undoStackRef.current[idx];
+      undoStackRef.current = undoStackRef.current.filter((item) => item.token !== token);
+      const target = entry.snapshot;
+
+      mutateStore((current, now) => {
+        const nextMembers = { ...current.members };
+        const dirtyMembers = new Set(current.dirtyMemberIds);
+        const allMemberIds = new Set([
+          ...Object.keys(current.members),
+          ...Object.keys(target.members),
+        ]);
+
+        for (const id of allMemberIds) {
+          const cur = current.members[id];
+          const prev = target.members[id];
+          if (prev && cur !== prev) {
+            nextMembers[id] = { ...prev, updatedAt: now };
+            dirtyMembers.add(id);
+          } else if (!prev && cur && !cur.deletedAt) {
+            nextMembers[id] = { ...cur, updatedAt: now, deletedAt: now };
+            dirtyMembers.add(id);
+          }
+        }
+
+        const nextSessions = { ...current.sessions };
+        const dirtySessions = new Set(current.dirtySessionIds);
+        const allSessionIds = new Set([
+          ...Object.keys(current.sessions),
+          ...Object.keys(target.sessions),
+        ]);
+
+        for (const id of allSessionIds) {
+          const cur = current.sessions[id];
+          const prev = target.sessions[id];
+          if (prev && cur !== prev) {
+            nextSessions[id] = { ...prev, updatedAt: now };
+            dirtySessions.add(id);
+          } else if (!prev && cur && !cur.deletedAt) {
+            nextSessions[id] = { ...cur, updatedAt: now, deletedAt: now };
+            dirtySessions.add(id);
+          }
+        }
+
+        const nextAttendance = { ...current.attendance };
+        const dirtyAttendance = new Set(current.dirtyAttendanceKeys);
+        const allAttendanceKeys = new Set([
+          ...Object.keys(current.attendance),
+          ...Object.keys(target.attendance),
+        ]);
+
+        for (const key of allAttendanceKeys) {
+          const cur = current.attendance[key];
+          const prev = target.attendance[key];
+          if (prev && cur !== prev) {
+            nextAttendance[key] = { ...prev, updatedAt: now };
+            dirtyAttendance.add(key);
+          } else if (!prev && cur && !cur.deletedAt) {
+            nextAttendance[key] = { ...cur, updatedAt: now, deletedAt: now };
             dirtyAttendance.add(key);
           }
         }
 
         return {
-          ...prev,
+          ...current,
+          members: nextMembers,
+          sessions: nextSessions,
           attendance: nextAttendance,
+          dirtyMemberIds: Array.from(dirtyMembers),
+          dirtySessionIds: Array.from(dirtySessions),
           dirtyAttendanceKeys: Array.from(dirtyAttendance),
         };
       });
+
+      return true;
     },
     [mutateStore],
   );
@@ -1090,12 +1535,17 @@ export function useSyncedAttendanceData(userId: string | null): UseSyncedAttenda
     deleteSession,
     addMember,
     updateMember,
+    setMemberLegacyStatus,
     deleteMembers,
     assignMemberToSession,
+    assignMembersToSession,
     removeMemberFromSession,
     toggleAttendanceStatus,
     setAbsenceReason,
     resetSessionMarks,
+    importBackupData,
+    getLastUndoToken,
+    undoByToken,
     flushPendingChanges: retrySync,
     prepareForSignOut,
     setMergeLocalOnNextConnect,

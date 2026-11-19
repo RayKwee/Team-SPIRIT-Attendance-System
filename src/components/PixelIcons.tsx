@@ -194,3 +194,51 @@ export function PixelAlertIcon(props: IconProps) {
     </svg>
   );
 }
+
+export function PixelDownloadIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M7 1h2v7h2v2H9v2H7v-2H5V8h2V1zM3 6h2v2H3V6zm8 0h2v2h-2V6zM2 13h12v2H2v-2z" />
+    </svg>
+  );
+}
+
+export function PixelUploadIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M7 2h2v2h2v2H9v6H7V6H5V4h2V2zM3 6h2v2H3V6zm8 0h2v2h-2V6zM2 13h12v2H2v-2z" />
+    </svg>
+  );
+}
+
+export function PixelCopyIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M2 2h8v2H4v6H2V2zm4 4h8v8H6V6zm2 2v4h4V8H8z" />
+    </svg>
+  );
+}
+
+export function PixelPrinterIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M4 1h8v3H4V1zM2 5h12v6h-2V9H4v2H2V5zm2 5h8v5H4v-5zm2 2v1h4v-1H6z" />
+    </svg>
+  );
+}
+
+export function PixelArchiveIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M1 2h14v3H1V2zm1 4h12v8H2V6zm4 2v2h4V8H6z" />
+    </svg>
+  );
+}
+
+export function PixelRestoreIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M6 2h6v2H6V2zm6 2h2v4h-2V4zM4 4h2v2H4V4zM2 6h2v6H2V6zm4 2h2v2H6V8zm-2 4h8v2H4v-2zm4-7h2v5H8V5z" />
+    </svg>
+  );
+}

@@ -10,27 +10,52 @@ import {
 import type {
   AttendanceSession,
   AttendanceStatus,
+  ClassLetter,
+  ClassYear,
   ClubMember,
   MemberProfileInput,
   MemberType,
 } from '../types/attendance';
 import {
+  CLASS_LETTERS,
+  CLASS_YEARS,
+  CONSECUTIVE_ABSENCE_ALERT_THRESHOLD,
   MEMBER_TYPES,
   MEMBER_TYPE_LABELS,
   STATUS_LABELS,
+  STREAK_HIGHLIGHT_THRESHOLD,
+  compareStudentClassNames,
+  formatStudentClassName,
+  getAcademicCycleLabel,
   getMemberInitials,
+  getNextPromotionDateLabel,
+  isLegacyMember,
   normalizeMemberType,
+  resolveStudentClassFields,
   summarizeMemberAttendance,
   type MemberAttendanceStats,
 } from '../utils/attendance';
 import { formatSessionDate, formatSessionTime, formatTimestamp } from '../utils/date';
+import {
+  exportMemberDirectoryCsv,
+  exportMemberProfileCsv,
+  printMemberDirectoryReport,
+  printMemberProfileReport,
+} from '../utils/export';
 import { ConfirmDialog } from './ConfirmDialog';
 import {
+  PixelAlertIcon,
+  PixelArchiveIcon,
   PixelArrowLeftIcon,
   PixelCalendarIcon,
+  PixelChevronIcon,
   PixelCloseIcon,
+  PixelDownloadIcon,
   PixelEditIcon,
+  PixelFlameIcon,
   PixelPlusIcon,
+  PixelPrinterIcon,
+  PixelRestoreIcon,
   PixelSearchIcon,
   PixelTerminalIcon,
   PixelTrashIcon,
@@ -49,10 +74,12 @@ interface MemberManagerSidebarProps {
   onClose: () => void;
   onAddMember: (input: MemberProfileInput) => ClubMember;
   onUpdateMember: (memberId: string, input: MemberProfileInput) => void;
+  onSetMemberLegacyStatus: (memberId: string, isLegacy: boolean) => void;
   onDeleteMember: (memberId: string) => void;
 }
 
 type SidebarViewMode = 'directory' | 'profile' | 'add' | 'edit';
+type DirectoryScope = 'active' | 'legacy';
 
 const ROLE_SUGGESTIONS = [
   'Captain',
@@ -104,7 +131,10 @@ const RING_CATEGORIES: {
 interface MemberFormValues {
   name: string;
   memberType: MemberType;
-  className: string;
+  classYear: ClassYear | '';
+  classLetter: ClassLetter | '';
+  legacyClassFallback: string;
+  isLegacy: boolean;
   role: string;
   joinedDate: string;
   email: string;
@@ -117,7 +147,10 @@ function emptyFormValues(): MemberFormValues {
   return {
     name: '',
     memberType: 'student',
-    className: '',
+    classYear: '',
+    classLetter: '',
+    legacyClassFallback: '',
+    isLegacy: false,
     role: '',
     joinedDate: '',
     email: '',
@@ -127,12 +160,24 @@ function emptyFormValues(): MemberFormValues {
   };
 }
 
-function memberToFormValues(member: ClubMember): MemberFormValues {
+function memberToFormValues(member: ClubMember, overrideIsLegacy?: boolean): MemberFormValues {
   const memberType = normalizeMemberType(member.memberType);
+  const resolvedClass = resolveStudentClassFields({
+    memberType,
+    classYear: member.classYear,
+    classLetter: member.classLetter,
+    className: member.className,
+  });
+  const hasStructuredClass = Boolean(resolvedClass.classYear && resolvedClass.classLetter);
+
   return {
     name: member.name,
     memberType,
-    className: memberType === 'student' ? (member.className ?? '') : '',
+    classYear: resolvedClass.classYear ?? '',
+    classLetter: resolvedClass.classLetter ?? '',
+    legacyClassFallback:
+      memberType === 'student' && !hasStructuredClass ? (resolvedClass.className ?? '') : '',
+    isLegacy: overrideIsLegacy !== undefined ? overrideIsLegacy : isLegacyMember(member),
     role: member.role ?? '',
     joinedDate: member.joinedDate ?? '',
     email: member.email ?? '',
@@ -356,14 +401,15 @@ export function MemberManagerSidebar({
   onClose,
   onAddMember,
   onUpdateMember,
+  onSetMemberLegacyStatus,
   onDeleteMember,
 }: MemberManagerSidebarProps) {
   const titleId = useId();
   const roleListId = useId();
-  const classListId = useId();
   const nameInputId = useId();
   const memberTypeLabelId = useId();
-  const classInputId = useId();
+  const classYearInputId = useId();
+  const classLetterLabelId = useId();
   const roleInputId = useId();
   const joinedInputId = useId();
   const emailInputId = useId();
@@ -372,14 +418,17 @@ export function MemberManagerSidebar({
   const notesInputId = useId();
 
   const nameInputRef = useRef<HTMLInputElement | null>(null);
-  const classInputRef = useRef<HTMLInputElement | null>(null);
+  const classYearSelectRef = useRef<HTMLSelectElement | null>(null);
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
 
   const [viewMode, setViewMode] = useState<SidebarViewMode>(() =>
     selectedMemberId && members.some((member) => member.id === selectedMemberId)
       ? 'profile'
       : 'directory',
   );
+  const [directoryScope, setDirectoryScope] = useState<DirectoryScope>('active');
   const [searchQuery, setSearchQuery] = useState('');
+  const [classFilter, setClassFilter] = useState('all');
   const [roleFilter, setRoleFilter] = useState('all');
   const [formValues, setFormValues] = useState<MemberFormValues>(emptyFormValues);
   const [editingTargetId, setEditingTargetId] = useState<string | null>(null);
@@ -387,6 +436,7 @@ export function MemberManagerSidebar({
   const [absenceFilter, setAbsenceFilter] = useState<'reasons_only' | 'all'>('reasons_only');
   const [showAllAbsences, setShowAllAbsences] = useState(false);
   const [pendingDeleteMember, setPendingDeleteMember] = useState<ClubMember | null>(null);
+  const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
 
   const selectedMember = useMemo(
     () => members.find((member) => member.id === selectedMemberId) ?? null,
@@ -417,30 +467,75 @@ export function MemberManagerSidebar({
     }
   }, [isOpen, viewMode]);
 
+  useEffect(() => {
+    if (!isExportMenuOpen) return;
+
+    function handleDocumentMouseDown(event: MouseEvent) {
+      if (
+        exportMenuRef.current &&
+        event.target instanceof Node &&
+        !exportMenuRef.current.contains(event.target)
+      ) {
+        setIsExportMenuOpen(false);
+      }
+    }
+
+    document.addEventListener('mousedown', handleDocumentMouseDown);
+    return () => document.removeEventListener('mousedown', handleDocumentMouseDown);
+  }, [isExportMenuOpen]);
+
   function handleSidebarKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
+    if (event.key === 'Escape' && isExportMenuOpen) {
+      event.stopPropagation();
+      setIsExportMenuOpen(false);
+      return;
+    }
     if (event.key === 'Escape' && isOpen && !pendingDeleteMember) {
       event.stopPropagation();
       onClose();
     }
   }
 
+  const activeMembers = useMemo(
+    () => members.filter((member) => !isLegacyMember(member)),
+    [members],
+  );
+
+  const legacyMembers = useMemo(
+    () => members.filter((member) => isLegacyMember(member)),
+    [members],
+  );
+
+  const scopedMembers = directoryScope === 'legacy' ? legacyMembers : activeMembers;
+
   const distinctRoles = useMemo(() => {
     const roles = new Set<string>();
-    for (const member of members) {
+    for (const member of scopedMembers) {
       if (member.role) roles.add(member.role);
     }
     return Array.from(roles).sort((a, b) => a.localeCompare(b));
-  }, [members]);
+  }, [scopedMembers]);
 
   const distinctClasses = useMemo(() => {
     const classes = new Set<string>();
-    for (const member of members) {
+    for (const member of scopedMembers) {
       if (normalizeMemberType(member.memberType) === 'student' && member.className) {
         classes.add(member.className);
       }
     }
-    return Array.from(classes).sort((a, b) => a.localeCompare(b));
-  }, [members]);
+    return Array.from(classes).sort(compareStudentClassNames);
+  }, [scopedMembers]);
+
+  const effectiveRoleFilter =
+    roleFilter === 'all' ||
+    (roleFilter === '__unassigned__'
+      ? scopedMembers.some((member) => !member.role)
+      : distinctRoles.includes(roleFilter))
+      ? roleFilter
+      : 'all';
+
+  const effectiveClassFilter =
+    classFilter === 'all' || distinctClasses.includes(classFilter) ? classFilter : 'all';
 
   const memberStatsMap = useMemo(() => {
     const map = new Map<string, MemberAttendanceStats>();
@@ -452,16 +547,26 @@ export function MemberManagerSidebar({
 
   const filteredMembers = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
-    return members.filter((member) => {
-      const matchesRole =
-        roleFilter === 'all' ||
-        (roleFilter === '__unassigned__' ? !member.role : member.role === roleFilter);
-      if (!matchesRole) return false;
-      if (!query) return true;
+    return scopedMembers.filter((member) => {
       const memberType = normalizeMemberType(member.memberType);
+      const matchesRole =
+        effectiveRoleFilter === 'all' ||
+        (effectiveRoleFilter === '__unassigned__'
+          ? !member.role
+          : member.role === effectiveRoleFilter);
+      if (!matchesRole) return false;
+
+      const matchesClass =
+        effectiveClassFilter === 'all' ||
+        (memberType === 'student' && member.className === effectiveClassFilter);
+      if (!matchesClass) return false;
+
+      if (!query) return true;
       return [
         member.name,
         memberType === 'student' ? member.className : undefined,
+        member.graduationYear ? String(member.graduationYear) : undefined,
+        member.graduationYear ? `Graduated ${member.graduationYear}` : undefined,
         MEMBER_TYPE_LABELS[memberType],
         member.role,
         member.email,
@@ -471,13 +576,18 @@ export function MemberManagerSidebar({
         .filter((value): value is string => Boolean(value))
         .some((value) => value.toLowerCase().includes(query));
     });
-  }, [members, roleFilter, searchQuery]);
+  }, [effectiveClassFilter, effectiveRoleFilter, scopedMembers, searchQuery]);
 
   const activeProfileStats = selectedMember
     ? memberStatsMap.get(selectedMember.id) ?? summarizeMemberAttendance(selectedMember.id, sessions)
     : null;
 
-  function openDirectory() {
+  function openDirectory(targetScope?: DirectoryScope) {
+    if (targetScope) {
+      setDirectoryScope(targetScope);
+    } else if (selectedMember) {
+      setDirectoryScope(isLegacyMember(selectedMember) ? 'legacy' : 'active');
+    }
     onSelectMember(null);
     setEditingTargetId(null);
     setFormError('');
@@ -499,12 +609,40 @@ export function MemberManagerSidebar({
     setViewMode('add');
   }
 
-  function openEditForm(member: ClubMember) {
+  function openEditForm(
+    member: ClubMember,
+    options?: { overrideIsLegacy?: boolean; noticeMessage?: string },
+  ) {
     onSelectMember(member.id);
     setEditingTargetId(member.id);
-    setFormValues(memberToFormValues(member));
-    setFormError('');
+    setFormValues(memberToFormValues(member, options?.overrideIsLegacy));
+    setFormError(options?.noticeMessage ?? '');
     setViewMode('edit');
+  }
+
+  function handleRestoreMember(member: ClubMember) {
+    const memberType = normalizeMemberType(member.memberType);
+    if (memberType === 'student') {
+      const resolved = resolveStudentClassFields({
+        memberType,
+        classYear: member.classYear,
+        classLetter: member.classLetter,
+        className: member.className,
+      });
+      if (!resolved.classYear || !resolved.classLetter) {
+        openEditForm(member, {
+          overrideIsLegacy: false,
+          noticeMessage:
+            'Select a Year (7–11) and Class (T, E, N, B) to restore this student to the Active Roster.',
+        });
+        return;
+      }
+    }
+    onSetMemberLegacyStatus(member.id, false);
+  }
+
+  function handleArchiveMember(member: ClubMember) {
+    onSetMemberLegacyStatus(member.id, true);
   }
 
   function handleFormCancel() {
@@ -526,17 +664,41 @@ export function MemberManagerSidebar({
     }
 
     const isStudent = formValues.memberType === 'student';
-    const cleanedClass = formValues.className.trim();
-    if (isStudent && !cleanedClass) {
-      setFormError('Class is required for students.');
-      classInputRef.current?.focus();
-      return;
+    const hasYear = formValues.classYear !== '';
+    const hasLetter = formValues.classLetter !== '';
+    let resolvedClassYear: ClassYear | undefined;
+    let resolvedClassLetter: ClassLetter | undefined;
+    let resolvedClassName: string | undefined;
+
+    if (isStudent) {
+      if (hasYear && hasLetter) {
+        resolvedClassYear = formValues.classYear as ClassYear;
+        resolvedClassLetter = formValues.classLetter as ClassLetter;
+        resolvedClassName = formatStudentClassName(resolvedClassYear, resolvedClassLetter);
+      } else if (!hasYear && !hasLetter && formValues.isLegacy && formValues.legacyClassFallback) {
+        resolvedClassName = formValues.legacyClassFallback;
+      } else {
+        setFormError(
+          !hasYear && !hasLetter
+            ? 'Select both Year (7–11) and Class (T, E, N, B) for student members.'
+            : !hasYear
+              ? 'Select a Year (Year 7 – Year 11) for this student.'
+              : 'Select a Class letter (T, E, N, or B) for this student.',
+        );
+        if (!hasYear) {
+          classYearSelectRef.current?.focus();
+        }
+        return;
+      }
     }
 
     const payload: MemberProfileInput = {
       name: cleanedName,
       memberType: formValues.memberType,
-      className: isStudent ? cleanedClass : undefined,
+      classYear: isStudent ? resolvedClassYear : undefined,
+      classLetter: isStudent ? resolvedClassLetter : undefined,
+      className: isStudent ? resolvedClassName : undefined,
+      isLegacy: formValues.isLegacy,
       role: formValues.role.trim() || undefined,
       joinedDate: formValues.joinedDate.trim() || undefined,
       email: formValues.email.trim() || undefined,
@@ -548,10 +710,12 @@ export function MemberManagerSidebar({
     if (viewMode === 'edit' && editingTargetId) {
       onUpdateMember(editingTargetId, payload);
       setEditingTargetId(null);
+      setDirectoryScope(payload.isLegacy ? 'legacy' : 'active');
       onSelectMember(editingTargetId);
       setViewMode('profile');
     } else {
       const created = onAddMember(payload);
+      setDirectoryScope('active');
       onSelectMember(created.id);
       setViewMode('profile');
     }
@@ -608,9 +772,16 @@ export function MemberManagerSidebar({
               <div className="member-drawer-title-row">
                 <span className="modal-badge">
                   <PixelUsersIcon />
-                  <span>Directory</span>
+                  <span>{directoryScope === 'legacy' && viewMode === 'directory' ? 'Legacy' : 'Directory'}</span>
                 </span>
-                <span className="panel-count">{members.length}</span>
+                <span
+                  className="panel-count"
+                  title={`${activeMembers.length} active • ${legacyMembers.length} legacy`}
+                >
+                  {directoryScope === 'legacy' && viewMode === 'directory'
+                    ? legacyMembers.length
+                    : activeMembers.length}
+                </span>
               </div>
               <h2 id={titleId} className="member-drawer-title">
                 {viewMode === 'directory' && 'Member Manager'}
@@ -621,6 +792,99 @@ export function MemberManagerSidebar({
             </div>
 
             <div className="member-drawer-header-actions">
+              {(viewMode === 'directory' || (viewMode === 'profile' && selectedMember)) && (
+                <div className="export-menu-wrap" ref={exportMenuRef}>
+                  <button
+                    type="button"
+                    className={`btn-secondary btn-compact ${isExportMenuOpen ? 'is-active' : ''}`}
+                    aria-expanded={isExportMenuOpen}
+                    aria-haspopup="menu"
+                    disabled={viewMode === 'directory' && filteredMembers.length === 0}
+                    onClick={() => setIsExportMenuOpen((prev) => !prev)}
+                    title={
+                      viewMode === 'profile' && selectedMember
+                        ? `Export attendance report for ${selectedMember.name}`
+                        : 'Export member directory stats as CSV or printable report'
+                    }
+                  >
+                    <PixelDownloadIcon />
+                    <span>Export</span>
+                    <PixelChevronIcon width={10} height={10} className="export-chevron-icon" />
+                  </button>
+
+                  {isExportMenuOpen && (
+                    <div
+                      className="export-menu-dropdown export-menu-dropdown-right"
+                      role="menu"
+                      aria-label="Export member report"
+                    >
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="export-menu-item"
+                        onClick={() => {
+                          if (viewMode === 'profile' && selectedMember && activeProfileStats) {
+                            exportMemberProfileCsv(selectedMember, activeProfileStats, sessions);
+                          } else {
+                            exportMemberDirectoryCsv(
+                              filteredMembers,
+                              memberStatsMap,
+                              sessions,
+                              directoryScope === 'legacy' ? 'legacy-members' : 'active-members',
+                            );
+                          }
+                          setIsExportMenuOpen(false);
+                        }}
+                      >
+                        <PixelDownloadIcon />
+                        <span>Download CSV (.csv)</span>
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="export-menu-item"
+                        onClick={() => {
+                          if (viewMode === 'profile' && selectedMember && activeProfileStats) {
+                            printMemberProfileReport(selectedMember, activeProfileStats, sessions);
+                          } else {
+                            const scopeLabel =
+                              directoryScope === 'legacy'
+                                ? 'Legacy / Retired Members'
+                                : 'Active Club Roster';
+                            const activeFilterParts: string[] = [];
+                            if (effectiveClassFilter !== 'all') {
+                              activeFilterParts.push(`Class: ${effectiveClassFilter}`);
+                            }
+                            if (effectiveRoleFilter !== 'all') {
+                              activeFilterParts.push(
+                                effectiveRoleFilter === '__unassigned__'
+                                  ? 'Role: Unassigned'
+                                  : `Role: ${effectiveRoleFilter}`,
+                              );
+                            }
+                            if (searchQuery.trim()) {
+                              activeFilterParts.push(`Search: "${searchQuery.trim()}"`);
+                            }
+                            printMemberDirectoryReport(
+                              filteredMembers,
+                              memberStatsMap,
+                              sessions,
+                              activeFilterParts.length > 0
+                                ? `${scopeLabel} (${activeFilterParts.join(' • ')})`
+                                : scopeLabel,
+                            );
+                          }
+                          setIsExportMenuOpen(false);
+                        }}
+                      >
+                        <PixelPrinterIcon />
+                        <span>Print / Save PDF Report</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {viewMode === 'directory' && (
                 <button type="button" className="btn-primary btn-compact-primary" onClick={openAddForm}>
                   <PixelPlusIcon />
@@ -642,6 +906,52 @@ export function MemberManagerSidebar({
           <div className="member-drawer-body">
             {viewMode === 'directory' && (
               <div className="member-directory-view">
+                <div
+                  className="member-directory-tabs"
+                  role="tablist"
+                  aria-label="Roster status sections"
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={directoryScope === 'active'}
+                    className={`member-directory-tab ${directoryScope === 'active' ? 'is-active' : ''}`}
+                    onClick={() => setDirectoryScope('active')}
+                  >
+                    <span>Active Roster</span>
+                    <span className="member-directory-tab-count">{activeMembers.length}</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={directoryScope === 'legacy'}
+                    className={`member-directory-tab is-legacy ${directoryScope === 'legacy' ? 'is-active' : ''}`}
+                    onClick={() => setDirectoryScope('legacy')}
+                  >
+                    <PixelArchiveIcon width={12} height={12} />
+                    <span>Legacy / Retired</span>
+                    <span className="member-directory-tab-count">{legacyMembers.length}</span>
+                  </button>
+                </div>
+
+                {directoryScope === 'legacy' ? (
+                  <div className="member-legacy-banner" role="note">
+                    <PixelArchiveIcon width={13} height={13} />
+                    <span>
+                      Graduated &amp; retired members are excluded from active session bulk-adds
+                      while preserving all historical attendance records and stats.
+                    </span>
+                  </div>
+                ) : (
+                  <div className="member-cycle-notice" role="note">
+                    <PixelCalendarIcon width={12} height={12} />
+                    <span>
+                      Academic Cycle <strong>{getAcademicCycleLabel()}</strong> • Auto-promotes{' '}
+                      <strong>{getNextPromotionDateLabel()}</strong> (Year 11 → Legacy)
+                    </span>
+                  </div>
+                )}
+
                 <div className="member-directory-controls">
                   <div className="search-box member-search-box">
                     <span className="search-icon">
@@ -657,23 +967,41 @@ export function MemberManagerSidebar({
                     />
                   </div>
 
-                  {members.length > 0 && (
-                    <select
-                      className="form-control member-role-filter"
-                      value={roleFilter}
-                      onChange={(event) => setRoleFilter(event.target.value)}
-                      aria-label="Filter members by role"
-                    >
-                      <option value="all">All Roles</option>
-                      {distinctRoles.map((role) => (
-                        <option key={role} value={role}>
-                          {role}
-                        </option>
-                      ))}
-                      {members.some((member) => !member.role) && (
-                        <option value="__unassigned__">No Role Set</option>
+                  {scopedMembers.length > 0 && (
+                    <div className="member-directory-filters">
+                      {distinctClasses.length > 0 && (
+                        <select
+                          className="form-control member-class-filter"
+                          value={effectiveClassFilter}
+                          onChange={(event) => setClassFilter(event.target.value)}
+                          aria-label="Filter members by class"
+                        >
+                          <option value="all">All Classes</option>
+                          {distinctClasses.map((cls) => (
+                            <option key={cls} value={cls}>
+                              {cls}
+                            </option>
+                          ))}
+                        </select>
                       )}
-                    </select>
+
+                      <select
+                        className="form-control member-role-filter"
+                        value={effectiveRoleFilter}
+                        onChange={(event) => setRoleFilter(event.target.value)}
+                        aria-label="Filter members by role"
+                      >
+                        <option value="all">All Roles</option>
+                        {distinctRoles.map((role) => (
+                          <option key={role} value={role}>
+                            {role}
+                          </option>
+                        ))}
+                        {scopedMembers.some((member) => !member.role) && (
+                          <option value="__unassigned__">No Role Set</option>
+                        )}
+                      </select>
+                    </div>
                   )}
                 </div>
 
@@ -681,19 +1009,29 @@ export function MemberManagerSidebar({
                   <div className="reserved-empty-state member-empty-state">
                     <div className="empty-badge">
                       <PixelTerminalIcon />
-                      <span>{members.length === 0 ? 'No Members' : 'No Matches'}</span>
+                      <span>
+                        {scopedMembers.length === 0
+                          ? directoryScope === 'legacy'
+                            ? 'No Legacy Members'
+                            : 'No Active Members'
+                          : 'No Matches'}
+                      </span>
                     </div>
                     <h3 className="empty-title">
-                      {members.length === 0
-                        ? 'Build your Team SPIRIT directory'
+                      {scopedMembers.length === 0
+                        ? directoryScope === 'legacy'
+                          ? 'No retired or graduated members yet'
+                          : 'Build your Team SPIRIT roster'
                         : 'No matching club members'}
                     </h3>
                     <p className="empty-description">
-                      {members.length === 0
-                        ? 'Add students (with class), teachers, or visitors with optional role and contact details.'
-                        : 'Try clearing your search term or switching the role filter.'}
+                      {scopedMembers.length === 0
+                        ? directoryScope === 'legacy'
+                          ? 'Use the Archive button on any active member to move them here while keeping their full attendance history.'
+                          : 'Add students (Year 7–11, Class T/E/N/B), teachers, or visitors with optional role and contact details.'
+                        : 'Try clearing your search term or switching the class/role filters.'}
                     </p>
-                    {members.length === 0 && (
+                    {scopedMembers.length === 0 && directoryScope === 'active' && (
                       <button type="button" className="btn-primary" onClick={openAddForm}>
                         <PixelPlusIcon />
                         <span>Add First Member</span>
@@ -701,17 +1039,43 @@ export function MemberManagerSidebar({
                     )}
                   </div>
                 ) : (
-                  <ul className="member-directory-list" aria-label="Club member directory">
+                  <ul
+                    className="member-directory-list"
+                    aria-label={
+                      directoryScope === 'legacy'
+                        ? 'Legacy and retired member archive'
+                        : 'Active club member directory'
+                    }
+                  >
                     {filteredMembers.map((member) => {
                       const stats = memberStatsMap.get(member.id);
                       const rateLabel =
                         stats && stats.markedRate !== null ? `${stats.markedRate}%` : '--%';
                       const memberType = normalizeMemberType(member.memberType);
+                      const memberIsLegacy = isLegacyMember(member);
+                      const hasStreakHighlight = Boolean(
+                        !memberIsLegacy &&
+                          stats &&
+                          stats.currentPresentStreak >= STREAK_HIGHLIGHT_THRESHOLD,
+                      );
+                      const hasAbsenceFlag = Boolean(
+                        !memberIsLegacy &&
+                          stats &&
+                          stats.consecutiveUnexcusedAbsences >= CONSECUTIVE_ABSENCE_ALERT_THRESHOLD,
+                      );
 
                       return (
                         <li key={member.id} className="member-directory-item">
                           <div
-                            className="member-directory-row"
+                            className={`member-directory-row ${
+                              memberIsLegacy
+                                ? 'is-legacy'
+                                : hasStreakHighlight
+                                  ? 'is-streak-highlight'
+                                  : hasAbsenceFlag
+                                    ? 'is-absence-flag'
+                                    : ''
+                            }`}
                             role="button"
                             tabIndex={0}
                             onClick={() => openMemberProfile(member.id)}
@@ -729,6 +1093,19 @@ export function MemberManagerSidebar({
                             <div className="member-directory-main">
                               <div className="member-directory-name-row">
                                 <span className="member-directory-name">{member.name}</span>
+                                {memberIsLegacy && (
+                                  <span className="member-legacy-pill" title="Legacy / Retired member">
+                                    Legacy
+                                  </span>
+                                )}
+                                {memberIsLegacy && member.graduationYear && (
+                                  <span
+                                    className="member-graduation-pill"
+                                    title={`Graduated in ${member.graduationYear}`}
+                                  >
+                                    Graduated {member.graduationYear}
+                                  </span>
+                                )}
                                 {memberType === 'student'
                                   ? member.className && (
                                       <span
@@ -755,6 +1132,24 @@ export function MemberManagerSidebar({
                                 <span className="member-rate-chip" title="Marked attendance rate">
                                   {rateLabel}
                                 </span>
+                                {hasStreakHighlight && stats && (
+                                  <span
+                                    className="member-streak-badge"
+                                    title={`Active attendance streak: ${stats.currentPresentStreak} consecutive sessions present`}
+                                  >
+                                    <PixelFlameIcon width={11} height={11} />
+                                    <span>{stats.currentPresentStreak} Streak</span>
+                                  </span>
+                                )}
+                                {hasAbsenceFlag && stats && (
+                                  <span
+                                    className="member-absence-alert-badge"
+                                    title={`Flagged: missed ${stats.consecutiveUnexcusedAbsences} consecutive sessions without a reason`}
+                                  >
+                                    <PixelAlertIcon width={11} height={11} />
+                                    <span>{stats.consecutiveUnexcusedAbsences} Unexcused</span>
+                                  </span>
+                                )}
                                 {member.handle && (
                                   <span className="member-contact-chip">{member.handle}</span>
                                 )}
@@ -766,6 +1161,27 @@ export function MemberManagerSidebar({
                               onClick={(event) => event.stopPropagation()}
                               onKeyDown={(event) => event.stopPropagation()}
                             >
+                              {memberIsLegacy ? (
+                                <button
+                                  type="button"
+                                  className="icon-btn icon-btn-restore"
+                                  onClick={() => handleRestoreMember(member)}
+                                  aria-label={`Restore ${member.name} to Active Roster`}
+                                  title="Restore to Active Roster"
+                                >
+                                  <PixelRestoreIcon />
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  className="icon-btn icon-btn-archive"
+                                  onClick={() => handleArchiveMember(member)}
+                                  aria-label={`Move ${member.name} to Legacy`}
+                                  title="Move to Legacy / Retired"
+                                >
+                                  <PixelArchiveIcon />
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 className="icon-btn"
@@ -800,13 +1216,34 @@ export function MemberManagerSidebar({
                   <button
                     type="button"
                     className="btn-secondary btn-compact"
-                    onClick={openDirectory}
+                    onClick={() => openDirectory(isLegacyMember(selectedMember) ? 'legacy' : 'active')}
                   >
                     <PixelArrowLeftIcon />
-                    <span>All Members</span>
+                    <span>{isLegacyMember(selectedMember) ? 'Legacy List' : 'Active Roster'}</span>
                   </button>
 
                   <div className="member-profile-topbar-actions">
+                    {isLegacyMember(selectedMember) ? (
+                      <button
+                        type="button"
+                        className="btn-secondary btn-compact btn-restore-inline"
+                        onClick={() => handleRestoreMember(selectedMember)}
+                        title="Restore this member to the active club roster"
+                      >
+                        <PixelRestoreIcon />
+                        <span>Restore</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn-secondary btn-compact btn-archive-inline"
+                        onClick={() => handleArchiveMember(selectedMember)}
+                        title="Move this graduated or retired member to the Legacy archive"
+                      >
+                        <PixelArchiveIcon />
+                        <span>Retire</span>
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="btn-secondary btn-compact"
@@ -828,7 +1265,10 @@ export function MemberManagerSidebar({
                   </div>
                 </div>
 
-                <section className="member-profile-card" aria-label="Member personal details">
+                <section
+                  className={`member-profile-card ${isLegacyMember(selectedMember) ? 'is-legacy' : ''}`}
+                  aria-label="Member personal details"
+                >
                   <div className="member-profile-identity">
                     <div className="member-avatar-badge member-avatar-lg" aria-hidden="true">
                       {getMemberInitials(selectedMember.name)}
@@ -836,6 +1276,21 @@ export function MemberManagerSidebar({
                     <div className="member-profile-heading">
                       <h3 className="member-profile-name">{selectedMember.name}</h3>
                       <div className="member-profile-badges">
+                        {isLegacyMember(selectedMember) && (
+                          <span className="member-legacy-pill">
+                            <PixelArchiveIcon width={10} height={10} />
+                            <span>
+                              {selectedMember.retiredAt
+                                ? `Legacy • ${formatTimestamp(selectedMember.retiredAt)}`
+                                : 'Legacy / Retired'}
+                            </span>
+                          </span>
+                        )}
+                        {isLegacyMember(selectedMember) && selectedMember.graduationYear && (
+                          <span className="member-graduation-pill">
+                            Graduated {selectedMember.graduationYear}
+                          </span>
+                        )}
                         {selectedMemberType === 'student' ? (
                           <>
                             {selectedMember.className ? (
@@ -870,9 +1325,52 @@ export function MemberManagerSidebar({
                               : `Added ${formatTimestamp(selectedMember.createdAt)}`}
                           </span>
                         </span>
+                        {activeProfileStats.currentPresentStreak >= STREAK_HIGHLIGHT_THRESHOLD && (
+                          <span
+                            className="member-streak-badge"
+                            title={`Active attendance streak: ${activeProfileStats.currentPresentStreak} consecutive sessions present`}
+                          >
+                            <PixelFlameIcon width={11} height={11} />
+                            <span>{activeProfileStats.currentPresentStreak} Session Streak</span>
+                          </span>
+                        )}
+                        {activeProfileStats.consecutiveUnexcusedAbsences >=
+                          CONSECUTIVE_ABSENCE_ALERT_THRESHOLD && (
+                          <span
+                            className="member-absence-alert-badge"
+                            title={`Flagged: missed ${activeProfileStats.consecutiveUnexcusedAbsences} consecutive sessions without a reason`}
+                          >
+                            <PixelAlertIcon width={11} height={11} />
+                            <span>
+                              {activeProfileStats.consecutiveUnexcusedAbsences} Consecutive Unexcused
+                            </span>
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
+
+                  {activeProfileStats.consecutiveUnexcusedAbsences >=
+                    CONSECUTIVE_ABSENCE_ALERT_THRESHOLD && (
+                    <div className="member-tracking-banner is-warning" role="status">
+                      <PixelAlertIcon width={14} height={14} />
+                      <span>
+                        Attention: {selectedMember.name} has missed{' '}
+                        {activeProfileStats.consecutiveUnexcusedAbsences} consecutive sessions
+                        without a recorded reason.
+                      </span>
+                    </div>
+                  )}
+
+                  {activeProfileStats.currentPresentStreak >= STREAK_HIGHLIGHT_THRESHOLD && (
+                    <div className="member-tracking-banner is-streak" role="status">
+                      <PixelFlameIcon width={14} height={14} />
+                      <span>
+                        High Attendance: {selectedMember.name} is on a{' '}
+                        {activeProfileStats.currentPresentStreak}-session attendance streak.
+                      </span>
+                    </div>
+                  )}
 
                   {(selectedMember.email ||
                     selectedMember.phone ||
@@ -1104,30 +1602,81 @@ export function MemberManagerSidebar({
 
                 {formValues.memberType === 'student' && (
                   <div className="form-field">
-                    <label htmlFor={classInputId}>
-                      Class <span className="required-mark">*</span>
-                    </label>
-                    <input
-                      ref={classInputRef}
-                      id={classInputId}
-                      type="text"
-                      list={classListId}
-                      className="form-control"
-                      placeholder="e.g. 4E1, 3A, CS101"
-                      value={formValues.className}
-                      onChange={(event) => {
-                        setFormValues((prev) => ({ ...prev, className: event.target.value }));
-                        if (formError) setFormError('');
-                      }}
-                      required
-                    />
-                    {distinctClasses.length > 0 && (
-                      <datalist id={classListId}>
-                        {distinctClasses.map((cls) => (
-                          <option key={cls} value={cls} />
+                    <div className="member-class-field-header">
+                      <label htmlFor={classYearInputId}>
+                        Year &amp; Class <span className="required-mark">*</span>
+                      </label>
+                      {formValues.classYear !== '' && formValues.classLetter !== '' && (
+                        <span className="member-class-pill member-class-preview" aria-live="polite">
+                          {formatStudentClassName(formValues.classYear, formValues.classLetter)}
+                        </span>
+                      )}
+                    </div>
+
+                    {formValues.legacyClassFallback &&
+                      formValues.classYear === '' &&
+                      formValues.classLetter === '' && (
+                        <p className="member-class-legacy-hint">
+                          Previous class: <strong>{formValues.legacyClassFallback}</strong> — choose
+                          a Year (7–11) and Class (T, E, N, B) below.
+                        </p>
+                      )}
+
+                    <div className="member-class-builder">
+                      <select
+                        ref={classYearSelectRef}
+                        id={classYearInputId}
+                        className="form-control member-class-year-select"
+                        value={formValues.classYear}
+                        aria-label="Student Year (Year 7 to Year 11)"
+                        onChange={(event) => {
+                          const raw = event.target.value;
+                          const nextYear = raw ? (Number(raw) as ClassYear) : '';
+                          setFormValues((prev) => ({
+                            ...prev,
+                            classYear: nextYear,
+                          }));
+                          if (formError) setFormError('');
+                        }}
+                        required={!formValues.isLegacy}
+                      >
+                        <option value="">Select Year...</option>
+                        {CLASS_YEARS.map((year) => (
+                          <option key={year} value={year}>
+                            Year {year}
+                          </option>
                         ))}
-                      </datalist>
-                    )}
+                      </select>
+
+                      <div
+                        className="member-class-letter-group"
+                        role="radiogroup"
+                        aria-labelledby={classLetterLabelId}
+                      >
+                        <span id={classLetterLabelId} className="sr-only">
+                          Class letter T, E, N, or B
+                        </span>
+                        {CLASS_LETTERS.map((letter) => {
+                          const isSelected = formValues.classLetter === letter;
+                          return (
+                            <button
+                              key={letter}
+                              type="button"
+                              role="radio"
+                              aria-checked={isSelected}
+                              className={`member-class-letter-btn ${isSelected ? 'is-selected' : ''}`}
+                              onClick={() => {
+                                setFormValues((prev) => ({ ...prev, classLetter: letter }));
+                                if (formError) setFormError('');
+                              }}
+                              title={`Class ${letter}`}
+                            >
+                              {letter}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
                   </div>
                 )}
 
@@ -1242,7 +1791,15 @@ export function MemberManagerSidebar({
                   </button>
                   <button type="submit" className="btn-primary">
                     <PixelPlusIcon />
-                    <span>{viewMode === 'edit' ? 'Save Changes' : 'Add Member'}</span>
+                    <span>
+                      {viewMode === 'edit'
+                        ? !formValues.isLegacy &&
+                          editingTargetId &&
+                          isLegacyMember(members.find((m) => m.id === editingTargetId))
+                          ? 'Restore & Save'
+                          : 'Save Changes'
+                        : 'Add Member'}
+                    </span>
                   </button>
                 </div>
               </form>

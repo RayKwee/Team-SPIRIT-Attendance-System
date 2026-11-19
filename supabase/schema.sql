@@ -9,6 +9,20 @@ create table if not exists public.club_members (
     constraint club_members_member_type_check
     check (member_type in ('student', 'teacher', 'visitor')),
   class_name text,
+  class_year smallint
+    constraint club_members_class_year_check
+    check (class_year is null or class_year between 7 and 11),
+  class_letter text
+    constraint club_members_class_letter_check
+    check (class_letter is null or class_letter in ('T', 'E', 'N', 'B')),
+  is_legacy boolean not null default false,
+  retired_at timestamptz,
+  last_promoted_year smallint
+    constraint club_members_last_promoted_year_check
+    check (last_promoted_year is null or last_promoted_year between 2000 and 2200),
+  graduation_year smallint
+    constraint club_members_graduation_year_check
+    check (graduation_year is null or graduation_year between 2000 and 2200),
   role text,
   email text,
   phone text,
@@ -25,6 +39,18 @@ alter table public.club_members
   add column if not exists member_type text not null default 'student';
 alter table public.club_members
   add column if not exists class_name text;
+alter table public.club_members
+  add column if not exists class_year smallint;
+alter table public.club_members
+  add column if not exists class_letter text;
+alter table public.club_members
+  add column if not exists is_legacy boolean not null default false;
+alter table public.club_members
+  add column if not exists retired_at timestamptz;
+alter table public.club_members
+  add column if not exists last_promoted_year smallint;
+alter table public.club_members
+  add column if not exists graduation_year smallint;
 do $$
 begin
   if not exists (
@@ -35,6 +61,46 @@ begin
     alter table public.club_members
       add constraint club_members_member_type_check
       check (member_type in ('student', 'teacher', 'visitor'));
+  end if;
+
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'club_members_class_year_check'
+      and conrelid = 'public.club_members'::regclass
+  ) then
+    alter table public.club_members
+      add constraint club_members_class_year_check
+      check (class_year is null or class_year between 7 and 11);
+  end if;
+
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'club_members_class_letter_check'
+      and conrelid = 'public.club_members'::regclass
+  ) then
+    alter table public.club_members
+      add constraint club_members_class_letter_check
+      check (class_letter is null or class_letter in ('T', 'E', 'N', 'B'));
+  end if;
+
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'club_members_last_promoted_year_check'
+      and conrelid = 'public.club_members'::regclass
+  ) then
+    alter table public.club_members
+      add constraint club_members_last_promoted_year_check
+      check (last_promoted_year is null or last_promoted_year between 2000 and 2200);
+  end if;
+
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'club_members_graduation_year_check'
+      and conrelid = 'public.club_members'::regclass
+  ) then
+    alter table public.club_members
+      add constraint club_members_graduation_year_check
+      check (graduation_year is null or graduation_year between 2000 and 2200);
   end if;
 end $$;
 
@@ -67,6 +133,7 @@ create table if not exists public.session_attendance (
 
 -- Helpful indexes for ordering and sync lookups
 create index if not exists idx_club_members_updated_at on public.club_members (updated_at desc);
+create index if not exists idx_club_members_is_legacy on public.club_members (is_legacy);
 create index if not exists idx_attendance_sessions_date on public.attendance_sessions (date desc, time desc);
 create index if not exists idx_session_attendance_updated_at on public.session_attendance (updated_at desc);
 

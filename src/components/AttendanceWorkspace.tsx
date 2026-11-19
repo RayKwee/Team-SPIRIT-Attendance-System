@@ -18,21 +18,30 @@ import type {
 import {
   MEMBER_TYPE_LABELS,
   STATUS_LABELS,
+  compareStudentClassNames,
   getMemberInitials,
   getSessionAssignedMembers,
+  isLegacyMember,
   normalizeMemberType,
 } from '../utils/attendance';
 import { formatSessionDate, formatSessionTime, formatTimestamp } from '../utils/date';
+import {
+  exportSessionAttendanceCsv,
+  printSessionAttendanceReport,
+} from '../utils/export';
 import { ConfirmDialog } from './ConfirmDialog';
 import {
   PixelArrowLeftIcon,
   PixelCalendarIcon,
+  PixelChevronIcon,
   PixelClockIcon,
   PixelCloseIcon,
+  PixelDownloadIcon,
   PixelGridIcon,
   PixelListIcon,
   PixelPinIcon,
   PixelPlusIcon,
+  PixelPrinterIcon,
   PixelRefreshIcon,
   PixelSearchIcon,
   PixelTerminalIcon,
@@ -49,6 +58,7 @@ interface AttendanceWorkspaceProps {
   onOpenMemberProfile: (memberId: string) => void;
   onDeleteSession: (sessionId: string) => void;
   onAssignMemberToSession: (memberId: string) => void;
+  onAssignMembersToSession: (memberIds: string[]) => void;
   onRemoveMemberFromSession: (memberId: string) => void;
   onToggleAttendanceStatus: (
     memberId: string,
@@ -154,6 +164,7 @@ export function AttendanceWorkspace({
   onOpenMemberProfile,
   onDeleteSession,
   onAssignMemberToSession,
+  onAssignMembersToSession,
   onRemoveMemberFromSession,
   onToggleAttendanceStatus,
   onSetAbsenceReason,
@@ -163,9 +174,13 @@ export function AttendanceWorkspace({
   const suggestListboxId = useId();
   const suggestWrapRef = useRef<HTMLDivElement | null>(null);
   const suggestInputRef = useRef<HTMLInputElement | null>(null);
+  const classMenuRef = useRef<HTMLDivElement | null>(null);
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
 
   const [suggestQuery, setSuggestQuery] = useState('');
   const [isSuggestOpen, setIsSuggestOpen] = useState(false);
+  const [isClassMenuOpen, setIsClassMenuOpen] = useState(false);
+  const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
   const [highlightedIndex, setHighlightedIndex] = useState(0);
   const [pendingAction, setPendingAction] = useState<
     | { kind: 'session'; session: AttendanceSession }
@@ -175,18 +190,37 @@ export function AttendanceWorkspace({
 
   useEffect(() => {
     function handleDocumentMouseDown(event: MouseEvent) {
-      if (
-        suggestWrapRef.current &&
-        event.target instanceof Node &&
-        !suggestWrapRef.current.contains(event.target)
-      ) {
+      if (!(event.target instanceof Node)) return;
+      if (suggestWrapRef.current && !suggestWrapRef.current.contains(event.target)) {
         setIsSuggestOpen(false);
+      }
+      if (classMenuRef.current && !classMenuRef.current.contains(event.target)) {
+        setIsClassMenuOpen(false);
+      }
+      if (exportMenuRef.current && !exportMenuRef.current.contains(event.target)) {
+        setIsExportMenuOpen(false);
+      }
+    }
+
+    function handleDocumentKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setIsClassMenuOpen(false);
+        setIsExportMenuOpen(false);
       }
     }
 
     document.addEventListener('mousedown', handleDocumentMouseDown);
-    return () => document.removeEventListener('mousedown', handleDocumentMouseDown);
+    document.addEventListener('keydown', handleDocumentKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleDocumentMouseDown);
+      document.removeEventListener('keydown', handleDocumentKeyDown);
+    };
   }, []);
+
+  const activeMembers = useMemo(
+    () => members.filter((member) => !isLegacyMember(member)),
+    [members],
+  );
 
   const assignedMembers = useMemo(
     () => getSessionAssignedMembers(activeSession, members),
@@ -198,9 +232,32 @@ export function AttendanceWorkspace({
     [assignedMembers],
   );
 
-  const { availableSuggestions, alreadyAssignedSuggestions } = useMemo(() => {
+  const unassignedMembers = useMemo(
+    () => activeMembers.filter((member) => !assignedMemberIdSet.has(member.id)),
+    [activeMembers, assignedMemberIdSet],
+  );
+
+  const unassignedClassGroups = useMemo(() => {
+    const groups = new Map<string, string[]>();
+    for (const member of unassignedMembers) {
+      if (normalizeMemberType(member.memberType) !== 'student') continue;
+      const cls = member.className?.trim();
+      if (!cls) continue;
+      const list = groups.get(cls);
+      if (list) {
+        list.push(member.id);
+      } else {
+        groups.set(cls, [member.id]);
+      }
+    }
+    return Array.from(groups.entries())
+      .sort(([a], [b]) => compareStudentClassNames(a, b))
+      .map(([className, memberIds]) => ({ className, memberIds }));
+  }, [unassignedMembers]);
+
+  const { availableSuggestions, alreadyAssignedSuggestions, legacyMatchCount } = useMemo(() => {
     const query = suggestQuery.trim().toLowerCase();
-    const matches = members.filter((member) => {
+    const matchesQuery = (member: ClubMember) => {
       if (!query) return true;
       const memberType = normalizeMemberType(member.memberType);
       return [
@@ -212,7 +269,12 @@ export function AttendanceWorkspace({
       ]
         .filter((value): value is string => Boolean(value))
         .some((value) => value.toLowerCase().includes(query));
-    });
+    };
+
+    const matches = activeMembers.filter(matchesQuery);
+    const legacyMatches = query
+      ? members.filter((member) => isLegacyMember(member) && matchesQuery(member)).length
+      : 0;
 
     const available: ClubMember[] = [];
     const alreadyAssigned: ClubMember[] = [];
@@ -227,8 +289,9 @@ export function AttendanceWorkspace({
     return {
       availableSuggestions: available.slice(0, 8),
       alreadyAssignedSuggestions: query ? alreadyAssigned.slice(0, 4) : [],
+      legacyMatchCount: legacyMatches,
     };
-  }, [assignedMemberIdSet, members, suggestQuery]);
+  }, [activeMembers, assignedMemberIdSet, members, suggestQuery]);
 
   useEffect(() => {
     setHighlightedIndex(0);
@@ -372,6 +435,50 @@ export function AttendanceWorkspace({
             </button>
           )}
 
+          <div className="export-menu-wrap" ref={exportMenuRef}>
+            <button
+              type="button"
+              className={`btn-secondary ${isExportMenuOpen ? 'is-active' : ''}`}
+              aria-expanded={isExportMenuOpen}
+              aria-haspopup="menu"
+              onClick={() => setIsExportMenuOpen((prev) => !prev)}
+              title="Export session attendance as CSV or printable report"
+            >
+              <PixelDownloadIcon />
+              <span>Export</span>
+              <PixelChevronIcon width={11} height={11} className="export-chevron-icon" />
+            </button>
+
+            {isExportMenuOpen && (
+              <div className="export-menu-dropdown" role="menu" aria-label="Export session report">
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="export-menu-item"
+                  onClick={() => {
+                    exportSessionAttendanceCsv(activeSession, members);
+                    setIsExportMenuOpen(false);
+                  }}
+                >
+                  <PixelDownloadIcon />
+                  <span>Download CSV (.csv)</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="export-menu-item"
+                  onClick={() => {
+                    printSessionAttendanceReport(activeSession, members);
+                    setIsExportMenuOpen(false);
+                  }}
+                >
+                  <PixelPrinterIcon />
+                  <span>Print / Save PDF Report</span>
+                </button>
+              </div>
+            )}
+          </div>
+
           <button
             type="button"
             className="icon-btn icon-btn-danger"
@@ -430,9 +537,9 @@ export function AttendanceWorkspace({
             aria-autocomplete="list"
             className="form-control session-suggest-input"
             placeholder={
-              members.length === 0
-                ? 'No members in Member Manager yet — open Members to create them...'
-                : 'Search by name, class, type, or role to add member...'
+              activeMembers.length === 0
+                ? 'No active members in Member Manager — open Members to add or restore...'
+                : 'Search active members by name, class, type, or role...'
             }
             value={suggestQuery}
             onFocus={() => setIsSuggestOpen(true)}
@@ -465,9 +572,13 @@ export function AttendanceWorkspace({
               role="listbox"
               aria-label="Member Manager suggestions"
             >
-              {members.length === 0 ? (
+              {activeMembers.length === 0 ? (
                 <div className="session-suggest-empty">
-                  <span>Your Member Manager directory is empty.</span>
+                  <span>
+                    {members.length === 0
+                      ? 'Your Member Manager directory is empty.'
+                      : 'No active members available (all members are in Legacy / Retired).'}
+                  </span>
                   <button
                     type="button"
                     className="btn-secondary btn-compact"
@@ -482,7 +593,11 @@ export function AttendanceWorkspace({
                 </div>
               ) : availableSuggestions.length === 0 && alreadyAssignedSuggestions.length === 0 ? (
                 <div className="session-suggest-empty">
-                  <span>No member matching &ldquo;{suggestQuery.trim()}&rdquo; in Member Manager.</span>
+                  <span>
+                    {legacyMatchCount > 0
+                      ? `No active match for “${suggestQuery.trim()}” (${legacyMatchCount} ${legacyMatchCount === 1 ? 'match' : 'matches'} in Legacy / Retired).`
+                      : `No active member matching “${suggestQuery.trim()}” in Member Manager.`}
+                  </span>
                   <button
                     type="button"
                     className="btn-secondary btn-compact"
@@ -576,15 +691,92 @@ export function AttendanceWorkspace({
           )}
         </div>
 
-        <button
-          type="button"
-          className="btn-secondary"
-          onClick={onOpenMemberManager}
-          title="Open central Member Manager directory"
-        >
-          <PixelUsersIcon />
-          <span>Member Directory</span>
-        </button>
+        <div className="session-bulk-assign-controls">
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={unassignedMembers.length === 0}
+            onClick={() => {
+              onAssignMembersToSession(unassignedMembers.map((member) => member.id));
+              setIsClassMenuOpen(false);
+            }}
+            title={
+              unassignedMembers.length === 0
+                ? 'All active members in the directory are already assigned'
+                : `Assign all ${unassignedMembers.length} remaining directory members to this session`
+            }
+          >
+            <PixelPlusIcon />
+            <span>
+              Add All Active Members
+              {unassignedMembers.length > 0 ? ` (${unassignedMembers.length})` : ''}
+            </span>
+          </button>
+
+          <div className="class-assign-wrap" ref={classMenuRef}>
+            <button
+              type="button"
+              className={`btn-secondary ${isClassMenuOpen ? 'is-active' : ''}`}
+              aria-expanded={isClassMenuOpen}
+              aria-haspopup="menu"
+              disabled={unassignedMembers.length === 0 || unassignedClassGroups.length === 0}
+              onClick={() => setIsClassMenuOpen((prev) => !prev)}
+              title={
+                unassignedClassGroups.length === 0
+                  ? 'No unassigned student members with a class assigned'
+                  : 'Assign all unassigned students in a specific class'
+              }
+            >
+              <PixelUsersIcon />
+              <span>Add by Class</span>
+              <PixelChevronIcon width={11} height={11} className="export-chevron-icon" />
+            </button>
+
+            {isClassMenuOpen && (
+              <div
+                className="class-assign-popover"
+                role="menu"
+                aria-label="Assign unassigned members by class"
+              >
+                <div className="class-assign-popover-header">
+                  <span>Select Class to Add</span>
+                </div>
+                {unassignedClassGroups.length === 0 ? (
+                  <div className="class-assign-empty">
+                    All students with classes are already assigned.
+                  </div>
+                ) : (
+                  <div className="class-assign-list">
+                    {unassignedClassGroups.map((group) => (
+                      <button
+                        key={group.className}
+                        type="button"
+                        role="menuitem"
+                        className="class-assign-item"
+                        onClick={() => {
+                          onAssignMembersToSession(group.memberIds);
+                        }}
+                      >
+                        <span className="class-assign-name">{group.className}</span>
+                        <span className="class-assign-count">+{group.memberIds.length}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={onOpenMemberManager}
+            title="Open central Member Manager directory"
+          >
+            <PixelUsersIcon />
+            <span>Member Directory</span>
+          </button>
+        </div>
       </div>
 
       <div className="tracker-toolbar">
@@ -653,12 +845,12 @@ export function AttendanceWorkspace({
             </h3>
             <p className="empty-description">
               {assignedMembers.length === 0
-                ? members.length === 0
-                  ? 'First add club members in the Member Manager, then search and click their names above to add them to this session.'
-                  : 'Type a member name in the search bar above and click a suggestion to add them to this session’s attendance checklist.'
+                ? activeMembers.length === 0
+                  ? 'First add or restore active club members in the Member Manager, then search and click their names above to add them to this session.'
+                  : 'Type an active member name in the search bar above and click a suggestion to add them to this session’s attendance checklist.'
                 : 'Try clearing your checklist filter or switching the status tab.'}
             </p>
-            {assignedMembers.length === 0 && members.length === 0 && (
+            {assignedMembers.length === 0 && activeMembers.length === 0 && (
               <button type="button" className="btn-primary" onClick={onOpenMemberManager}>
                 <PixelUsersIcon />
                 <span>Open Member Manager</span>
@@ -683,6 +875,11 @@ export function AttendanceWorkspace({
                       >
                         {member.name}
                       </button>
+                      {isLegacyMember(member) && (
+                        <span className="member-legacy-pill" title="Legacy / Retired member">
+                          Legacy
+                        </span>
+                      )}
                       {memberType === 'student'
                         ? member.className && (
                             <span
@@ -770,6 +967,11 @@ export function AttendanceWorkspace({
                         {member.name}
                       </button>
                     </h3>
+                    {isLegacyMember(member) && (
+                      <span className="member-legacy-pill" title="Legacy / Retired member">
+                        Legacy
+                      </span>
+                    )}
                     {memberType === 'student'
                       ? member.className && (
                           <span
