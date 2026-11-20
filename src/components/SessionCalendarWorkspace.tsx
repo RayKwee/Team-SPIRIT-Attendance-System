@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useState, type FormEvent } from 'react';
 import type {
+  AccessScope,
   AttendanceSession,
   CalendarViewMode,
   ClubMember,
@@ -44,6 +45,11 @@ interface SessionCalendarWorkspaceProps {
   members: ClubMember[];
   selectedDateKey: string;
   viewMode: CalendarViewMode;
+  accessScope?: AccessScope;
+  linkedMemberId?: string | null;
+  canViewAttendanceRates?: boolean;
+  canViewCalendarDetails?: boolean;
+  canBrowseFullRoster?: boolean;
   onChangeViewMode: (mode: CalendarViewMode) => void;
   onSelectDate: (dateKey: string) => void;
   onOpenCreateSessionForDate: (dateKey: string) => void;
@@ -72,6 +78,11 @@ export function SessionCalendarWorkspace({
   members,
   selectedDateKey,
   viewMode,
+  accessScope = 'local',
+  linkedMemberId = null,
+  canViewAttendanceRates = true,
+  canViewCalendarDetails = true,
+  canBrowseFullRoster = true,
   onChangeViewMode,
   onSelectDate,
   onOpenCreateSessionForDate,
@@ -207,6 +218,19 @@ export function SessionCalendarWorkspace({
     onChangeViewMode('month');
   }
 
+  const canCreateSessions = accessScope === 'local' || accessScope === 'admin';
+  const showClubRateDetails =
+    accessScope === 'local' ||
+    accessScope === 'admin' ||
+    accessScope === 'broad_viewer' ||
+    canViewAttendanceRates;
+  const canOpenPeerProfiles =
+    accessScope === 'local' ||
+    accessScope === 'admin' ||
+    accessScope === 'broad_viewer' ||
+    canBrowseFullRoster;
+  void canViewCalendarDetails;
+
   const periodTitle =
     viewMode === 'day'
       ? formatSessionDate(selectedDateKey)
@@ -218,7 +242,11 @@ export function SessionCalendarWorkspace({
 
   const periodCountLabel =
     viewMode === 'day'
-      ? `${visiblePeriodSessions.length} today`
+      ? selectedDateKey === todayKey
+        ? `${visiblePeriodSessions.length} today`
+        : `${visiblePeriodSessions.length} ${
+            visiblePeriodSessions.length === 1 ? 'session' : 'sessions'
+          }`
       : viewMode === 'week'
         ? `${visiblePeriodSessions.length} this week`
         : viewMode === 'month'
@@ -235,15 +263,22 @@ export function SessionCalendarWorkspace({
           : 'year';
 
   return (
-    <div className="calendar-layout">
+    <div className="calendar-layout" data-tutorial-target="calendar-workspace">
       <section className="tracker-panel calendar-panel" aria-label="Session calendar">
         <div className="tracker-panel-header">
           <div className="panel-title-group">
             <h2 className="panel-title">Session Calendar</h2>
             <span className="panel-count">{periodCountLabel}</span>
-            <span className="sync-pill" title="Reads directly from local browser storage">
+            <span
+              className="sync-pill"
+              title={
+                accessScope === 'local'
+                  ? 'Reads directly from local browser storage'
+                  : 'Synced live with Supabase Cloud Sync'
+              }
+            >
               <span className="sync-dot" aria-hidden="true" />
-              Saved Locally
+              {accessScope === 'local' ? 'Saved Locally' : 'Cloud Synced'}
             </span>
           </div>
 
@@ -293,9 +328,13 @@ export function SessionCalendarWorkspace({
             {periodAggregate.sessionCount > 0 && (
               <span
                 className="calendar-period-rate-pill"
-                title={`${periodAggregate.presentCount} present out of ${periodAggregate.totalAssignments} assigned marks`}
+                title={
+                  showClubRateDetails
+                    ? `${periodAggregate.presentCount} present out of ${periodAggregate.totalAssignments} assigned marks`
+                    : `${periodAggregate.sessionCount} scheduled sessions`
+                }
               >
-                {periodAggregate.rate !== null
+                {showClubRateDetails && periodAggregate.rate !== null
                   ? `${periodAggregate.rate}% attendance (${periodAggregate.presentCount}/${periodAggregate.totalAssignments})`
                   : `${periodAggregate.sessionCount} ${
                       periodAggregate.sessionCount === 1 ? 'session' : 'sessions'
@@ -368,17 +407,19 @@ export function SessionCalendarWorkspace({
                 </p>
               </div>
 
-              <button
-                type="button"
-                className="btn-primary btn-compact-primary"
-                onClick={() => onOpenCreateSessionForDate(selectedDateKey)}
-              >
-                <PixelPlusIcon />
-                <span>Record Session</span>
-              </button>
+              {canCreateSessions && (
+                <button
+                  type="button"
+                  className="btn-primary btn-compact-primary"
+                  onClick={() => onOpenCreateSessionForDate(selectedDateKey)}
+                >
+                  <PixelPlusIcon />
+                  <span>Record Session</span>
+                </button>
+              )}
             </div>
 
-            {selectedDaySessions.length > 0 && (
+            {selectedDaySessions.length > 0 && showClubRateDetails && (
               <div className="day-summary-metrics calendar-day-rollup">
                 <div className="day-metric" data-accent="cyan">
                   <span className="day-metric-label">Sessions</span>
@@ -412,17 +453,20 @@ export function SessionCalendarWorkspace({
                 </div>
                 <h3 className="empty-title">No sessions on {formatSessionDate(selectedDateKey)}</h3>
                 <p className="empty-description">
-                  Log a session for this day or use Prev / Next or Jump to Date to inspect other
-                  recorded sessions.
+                  {canCreateSessions
+                    ? 'Log a session for this day or use Prev / Next or Jump to Date to inspect other recorded sessions.'
+                    : 'Use Prev / Next or Jump to Date to inspect other scheduled sessions.'}
                 </p>
-                <button
-                  type="button"
-                  className="btn-primary"
-                  onClick={() => onOpenCreateSessionForDate(selectedDateKey)}
-                >
-                  <PixelPlusIcon />
-                  <span>Record Session for This Day</span>
-                </button>
+                {canCreateSessions && (
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    onClick={() => onOpenCreateSessionForDate(selectedDateKey)}
+                  >
+                    <PixelPlusIcon />
+                    <span>Record Session for This Day</span>
+                  </button>
+                )}
               </div>
             ) : (
               <ul className="calendar-day-agenda" aria-label="Chronological day sessions">
@@ -440,7 +484,16 @@ export function SessionCalendarWorkspace({
                           <span>{formatSessionTime(session.time)}</span>
                         </span>
                         <span className="calendar-agenda-rate">
-                          {getRateBadgeText(summary)}
+                          {!showClubRateDetails
+                            ? linkedMemberId
+                              ? session.memberIds.includes(linkedMemberId) ||
+                                Boolean(session.attendance[linkedMemberId])
+                                ? STATUS_LABELS[
+                                    session.attendance[linkedMemberId]?.status ?? 'unmarked'
+                                  ]
+                                : 'Not Assigned'
+                              : 'Scheduled'
+                            : getRateBadgeText(summary)}
                         </span>
                       </div>
 
@@ -473,33 +526,35 @@ export function SessionCalendarWorkspace({
                           <p className="session-banner-description">{session.description}</p>
                         )}
 
-                        <div className="calendar-agenda-summary">
-                          <div className="calendar-agenda-chips">
-                            <span className="agenda-stat-chip is-present">
-                              Present {summary.presentCount}
-                            </span>
-                            <span className="agenda-stat-chip is-reason">
-                              Excused {summary.absentWithReasonCount}
-                            </span>
-                            <span className="agenda-stat-chip is-absent">
-                              Unexcused {summary.absentWithoutReasonCount}
-                            </span>
-                            <span className="agenda-stat-chip is-unmarked">
-                              Unmarked {summary.unmarkedCount}
-                            </span>
-                          </div>
+                        {showClubRateDetails && (
+                          <div className="calendar-agenda-summary">
+                            <div className="calendar-agenda-chips">
+                              <span className="agenda-stat-chip is-present">
+                                Present {summary.presentCount}
+                              </span>
+                              <span className="agenda-stat-chip is-reason">
+                                Excused {summary.absentWithReasonCount}
+                              </span>
+                              <span className="agenda-stat-chip is-absent">
+                                Unexcused {summary.absentWithoutReasonCount}
+                              </span>
+                              <span className="agenda-stat-chip is-unmarked">
+                                Unmarked {summary.unmarkedCount}
+                              </span>
+                            </div>
 
-                          <div
-                            className="calendar-mini-meter"
-                            aria-hidden="true"
-                            title={`${summary.presentCount}/${summary.totalMembers} present`}
-                          >
                             <div
-                              className="calendar-mini-meter-fill"
-                              style={{ width: `${fillPercent}%` }}
-                            />
+                              className="calendar-mini-meter"
+                              aria-hidden="true"
+                              title={`${summary.presentCount}/${summary.totalMembers} present`}
+                            >
+                              <div
+                                className="calendar-mini-meter-fill"
+                                style={{ width: `${fillPercent}%` }}
+                              />
+                            </div>
                           </div>
-                        </div>
+                        )}
                       </div>
                     </li>
                   );
@@ -550,18 +605,20 @@ export function SessionCalendarWorkspace({
                       {daySessions.length > 0 && (
                         <span className="calendar-session-count">{daySessions.length}</span>
                       )}
-                      <button
-                        type="button"
-                        className="calendar-week-add-btn"
-                        onClick={() => {
-                          onSelectDate(day.dateKey);
-                          onOpenCreateSessionForDate(day.dateKey);
-                        }}
-                        aria-label={`Record session on ${formatSessionDate(day.dateKey)}`}
-                        title="Record session on this day"
-                      >
-                        <PixelPlusIcon width={10} height={10} />
-                      </button>
+                      {canCreateSessions && (
+                        <button
+                          type="button"
+                          className="calendar-week-add-btn"
+                          onClick={() => {
+                            onSelectDate(day.dateKey);
+                            onOpenCreateSessionForDate(day.dateKey);
+                          }}
+                          aria-label={`Record session on ${formatSessionDate(day.dateKey)}`}
+                          title="Record session on this day"
+                        >
+                          <PixelPlusIcon width={10} height={10} />
+                        </button>
+                      )}
                     </div>
                   </div>
 
@@ -586,21 +643,42 @@ export function SessionCalendarWorkspace({
                               event.stopPropagation();
                               onSelectDate(day.dateKey);
                             }}
-                            title={`${session.name} (${formatSessionTime(session.time)}) — ${getRateBadgeText(summary)}`}
+                            title={
+                              showClubRateDetails
+                                ? `${session.name} (${formatSessionTime(session.time)}) — ${getRateBadgeText(summary)}`
+                                : `${session.name} (${formatSessionTime(session.time)})`
+                            }
                           >
                             <span className="calendar-week-session-time">
                               {formatSessionTime(session.time)}
                             </span>
                             <span className="calendar-week-session-name">{session.name}</span>
                             <div className="calendar-week-session-foot">
-                              <span className="calendar-week-session-stat">
-                                {summary.totalMembers > 0
-                                  ? `${summary.presentCount}/${summary.totalMembers}`
-                                  : '0 mem'}
-                              </span>
-                              <span className="calendar-tag-rate">
-                                {summary.rate !== null ? `${summary.rate}%` : '--%'}
-                              </span>
+                              {showClubRateDetails ? (
+                                <>
+                                  <span className="calendar-week-session-stat">
+                                    {summary.totalMembers > 0
+                                      ? `${summary.presentCount}/${summary.totalMembers}`
+                                      : '0 mem'}
+                                  </span>
+                                  <span className="calendar-tag-rate">
+                                    {summary.rate !== null ? `${summary.rate}%` : '--%'}
+                                  </span>
+                                </>
+                              ) : linkedMemberId ? (
+                                <span className="calendar-week-session-stat">
+                                  {session.memberIds.includes(linkedMemberId) ||
+                                  Boolean(session.attendance[linkedMemberId])
+                                    ? STATUS_LABELS[
+                                        session.attendance[linkedMemberId]?.status ?? 'unmarked'
+                                      ]
+                                    : 'Not Assigned'}
+                                </span>
+                              ) : (
+                                <span className="calendar-week-session-stat">
+                                  {session.eventType || 'Scheduled'}
+                                </span>
+                              )}
                             </div>
                           </button>
                         );
@@ -676,10 +754,16 @@ export function SessionCalendarWorkspace({
                             <span
                               key={session.id}
                               className="calendar-day-tag"
-                              title={`${session.name} (${formatSessionTime(session.time)}) — ${summary.presentCount}/${summary.totalMembers} present`}
+                              title={
+                                showClubRateDetails
+                                  ? `${session.name} (${formatSessionTime(session.time)}) — ${summary.presentCount}/${summary.totalMembers} present`
+                                  : `${session.name} (${formatSessionTime(session.time)})`
+                              }
                             >
                               <span className="calendar-day-tag-name">{session.name}</span>
-                              <span className="calendar-tag-rate">{rateChip}</span>
+                              {showClubRateDetails && (
+                                <span className="calendar-tag-rate">{rateChip}</span>
+                              )}
                             </span>
                           );
                         })}
@@ -735,7 +819,7 @@ export function SessionCalendarWorkspace({
                           >
                             {monthSessions.length}
                           </span>
-                          {monthAggregate.rate !== null && (
+                          {showClubRateDetails && monthAggregate.rate !== null && (
                             <span
                               className="calendar-year-rate-pill"
                               title={`${monthAggregate.presentCount}/${monthAggregate.totalAssignments} present`}
@@ -790,7 +874,7 @@ export function SessionCalendarWorkspace({
                         ? `${formatSessionDate(cell.dateKey)}: ${daySessions.length} ${
                             daySessions.length === 1 ? 'session' : 'sessions'
                           }${
-                            dayAggregate && dayAggregate.rate !== null
+                            showClubRateDetails && dayAggregate && dayAggregate.rate !== null
                               ? ` (${dayAggregate.rate}% present)`
                               : ''
                           }`
@@ -839,17 +923,20 @@ export function SessionCalendarWorkspace({
               </div>
               <h3 className="empty-title">Nothing logged for this date</h3>
               <p className="empty-description">
-                Click any highlighted date on the calendar to inspect recorded sessions, or log a new
-                session for {formatSessionDate(selectedDateKey)}.
+                {canCreateSessions
+                  ? `Click any highlighted date on the calendar to inspect recorded sessions, or log a new session for ${formatSessionDate(selectedDateKey)}.`
+                  : 'Click any highlighted date on the calendar to inspect scheduled sessions.'}
               </p>
-              <button
-                type="button"
-                className="btn-primary"
-                onClick={() => onOpenCreateSessionForDate(selectedDateKey)}
-              >
-                <PixelPlusIcon />
-                <span>Record Session</span>
-              </button>
+              {canCreateSessions && (
+                <button
+                  type="button"
+                  className="btn-primary"
+                  onClick={() => onOpenCreateSessionForDate(selectedDateKey)}
+                >
+                  <PixelPlusIcon />
+                  <span>Record Session</span>
+                </button>
+              )}
             </div>
           ) : (
             <div className="day-session-list">
@@ -900,91 +987,136 @@ export function SessionCalendarWorkspace({
                       <p className="session-banner-description">{session.description}</p>
                     )}
 
-                    <div className="day-summary-metrics">
-                      <div className="day-metric" data-accent="green">
-                        <span className="day-metric-label">Present</span>
-                        <span className="day-metric-value">{summary.presentCount}</span>
-                      </div>
-                      <div className="day-metric" data-accent="gold">
-                        <span className="day-metric-label">Absent (Reason)</span>
-                        <span className="day-metric-value">{summary.absentWithReasonCount}</span>
-                      </div>
-                      <div className="day-metric" data-accent="red">
-                        <span className="day-metric-label">Absent (No Reason)</span>
-                        <span className="day-metric-value">{summary.absentWithoutReasonCount}</span>
-                      </div>
-                      <div className="day-metric" data-accent="cyan">
-                        <span className="day-metric-label">Rate</span>
-                        <span className="day-metric-value">
-                          {summary.rate !== null ? `${summary.rate}%` : '--%'}
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="day-member-breakdown">
-                      <div className="day-breakdown-header">
-                        <span>Attendance Breakdown</span>
-                        <span className="mono-cell">{assignedMembers.length} assigned</span>
-                      </div>
-
-                      {assignedMembers.length === 0 ? (
-                        <p className="day-breakdown-empty">
-                          No members assigned to this session yet. Open it in the tracker to add
-                          members.
-                        </p>
+                    {!showClubRateDetails ? (
+                      linkedMemberId ? (
+                        (() => {
+                          const myEntry = session.attendance[linkedMemberId];
+                          const isAssignedToSession =
+                            session.memberIds.includes(linkedMemberId) || Boolean(myEntry);
+                          const myStatus = myEntry?.status ?? 'unmarked';
+                          const myReason = myEntry?.reason?.trim();
+                          return (
+                            <div className="day-member-breakdown">
+                              <div className="day-member-main">
+                                <span className="day-breakdown-header">My Attendance Status</span>
+                                {isAssignedToSession ? (
+                                  <span className={`status-badge status-${myStatus}`}>
+                                    {STATUS_LABELS[myStatus]}
+                                  </span>
+                                ) : (
+                                  <span className="session-type-tag">Not Assigned</span>
+                                )}
+                              </div>
+                              {isAssignedToSession && myStatus === 'absent_with_reason' && myReason && (
+                                <p className="day-member-reason">Reason: {myReason}</p>
+                              )}
+                            </div>
+                          );
+                        })()
                       ) : (
-                        <ul className="day-member-list">
-                          {assignedMembers.map((member) => {
-                            const entry = session.attendance[member.id];
-                            const status = entry?.status ?? 'unmarked';
-                            const reason = entry?.reason?.trim();
-                            const memberType = normalizeMemberType(member.memberType);
+                        <div className="day-member-breakdown">
+                          <span className="day-breakdown-header">
+                            Club Attendance Rates Restricted
+                          </span>
+                          <p className="day-breakdown-empty">
+                            Session schedule details are visible; peer attendance breakdowns are
+                            hidden by club admins.
+                          </p>
+                        </div>
+                      )
+                    ) : (
+                      <>
+                        <div className="day-summary-metrics">
+                          <div className="day-metric" data-accent="green">
+                            <span className="day-metric-label">Present</span>
+                            <span className="day-metric-value">{summary.presentCount}</span>
+                          </div>
+                          <div className="day-metric" data-accent="gold">
+                            <span className="day-metric-label">Absent (Reason)</span>
+                            <span className="day-metric-value">{summary.absentWithReasonCount}</span>
+                          </div>
+                          <div className="day-metric" data-accent="red">
+                            <span className="day-metric-label">Absent (No Reason)</span>
+                            <span className="day-metric-value">{summary.absentWithoutReasonCount}</span>
+                          </div>
+                          <div className="day-metric" data-accent="cyan">
+                            <span className="day-metric-label">Rate</span>
+                            <span className="day-metric-value">
+                              {summary.rate !== null ? `${summary.rate}%` : '--%'}
+                            </span>
+                          </div>
+                        </div>
 
-                            return (
-                              <li key={member.id} className="day-member-item">
-                                <div className="day-member-main">
-                                  <div className="day-member-identity">
-                                    <button
-                                      type="button"
-                                      className="day-member-name roster-member-profile-btn"
-                                      onClick={() => onOpenMemberProfile(member.id)}
-                                      title={`View ${member.name}'s profile & stats`}
-                                    >
-                                      {member.name}
-                                    </button>
-                                    {isLegacyMember(member) && (
-                                      <span className="member-legacy-pill" title="Legacy / Retired member">
-                                        Legacy
-                                      </span>
-                                    )}
-                                    {memberType === 'student'
-                                      ? member.className && (
+                        <div className="day-member-breakdown">
+                          <div className="day-breakdown-header">
+                            <span>Attendance Breakdown</span>
+                            <span className="mono-cell">{assignedMembers.length} assigned</span>
+                          </div>
+
+                          {assignedMembers.length === 0 ? (
+                            <p className="day-breakdown-empty">
+                              {canCreateSessions
+                                ? 'No members assigned to this session yet. Open it in the tracker to add members.'
+                                : 'No members assigned to this session yet.'}
+                            </p>
+                          ) : (
+                            <ul className="day-member-list">
+                              {assignedMembers.map((member) => {
+                                const entry = session.attendance[member.id];
+                                const status = entry?.status ?? 'unmarked';
+                                const reason = entry?.reason?.trim();
+                                const memberType = normalizeMemberType(member.memberType);
+
+                                return (
+                                  <li key={member.id} className="day-member-item">
+                                    <div className="day-member-main">
+                                      <div className="day-member-identity">
+                                        {canOpenPeerProfiles || member.id === linkedMemberId ? (
+                                          <button
+                                            type="button"
+                                            className="day-member-name roster-member-profile-btn"
+                                            onClick={() => onOpenMemberProfile(member.id)}
+                                            title={`View ${member.name}'s profile & stats`}
+                                          >
+                                            {member.name}
+                                          </button>
+                                        ) : (
+                                          <span className="day-member-name">{member.name}</span>
+                                        )}
+                                        {isLegacyMember(member) && (
+                                          <span className="member-legacy-pill" title="Legacy / Retired member">
+                                            Legacy
+                                          </span>
+                                        )}
+                                        {memberType !== 'student' && (
+                                          <span className={`member-type-pill is-${memberType}`}>
+                                            {MEMBER_TYPE_LABELS[memberType]}
+                                          </span>
+                                        )}
+                                        {member.className && (
                                           <span
                                             className="member-class-pill"
                                             title={`Class: ${member.className}`}
                                           >
                                             {member.className}
                                           </span>
-                                        )
-                                      : (
-                                          <span className={`member-type-pill is-${memberType}`}>
-                                            {MEMBER_TYPE_LABELS[memberType]}
-                                          </span>
                                         )}
-                                  </div>
-                                  <span className={`status-badge status-${status}`}>
-                                    {STATUS_LABELS[status]}
-                                  </span>
-                                </div>
-                                {status === 'absent_with_reason' && reason && (
-                                  <p className="day-member-reason">Reason: {reason}</p>
-                                )}
-                              </li>
-                            );
-                          })}
-                        </ul>
-                      )}
-                    </div>
+                                      </div>
+                                      <span className={`status-badge status-${status}`}>
+                                        {STATUS_LABELS[status]}
+                                      </span>
+                                    </div>
+                                    {status === 'absent_with_reason' && reason && (
+                                      <p className="day-member-reason">Reason: {reason}</p>
+                                    )}
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          )}
+                        </div>
+                      </>
+                    )}
                   </article>
                 );
               })}

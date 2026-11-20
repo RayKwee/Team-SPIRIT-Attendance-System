@@ -25,7 +25,9 @@ export const MEMBER_TYPES: readonly MemberType[] = ['student', 'teacher', 'visit
 
 export const CLASS_YEARS: readonly ClassYear[] = [7, 8, 9, 10, 11];
 
-export const CLASS_LETTERS: readonly ClassLetter[] = ['T', 'E', 'N', 'B'];
+export const STANDARD_CLASS_LETTERS: readonly Exclude<ClassLetter, 'N/A'>[] = ['T', 'E', 'N', 'B'];
+
+export const CLASS_LETTERS: readonly ClassLetter[] = ['T', 'E', 'N', 'B', 'N/A'];
 
 export const STREAK_HIGHLIGHT_THRESHOLD = 3;
 export const CONSECUTIVE_ABSENCE_ALERT_THRESHOLD = 2;
@@ -52,18 +54,36 @@ export function normalizeClassYear(value: unknown): ClassYear | undefined {
   return undefined;
 }
 
-/** Normalizes a class letter to T, E, N, or B (case-insensitive) or undefined. */
+/** Normalizes a class letter to T, E, N, B, or N/A (case-insensitive) or undefined. */
 export function normalizeClassLetter(value: unknown): ClassLetter | undefined {
   if (typeof value !== 'string') return undefined;
   const upper = value.trim().toUpperCase();
   if (upper === 'T' || upper === 'E' || upper === 'N' || upper === 'B') {
     return upper;
   }
+  if (upper === 'N/A' || upper === 'NA') {
+    return 'N/A';
+  }
   return undefined;
 }
 
-/** Formats a structured student Year + Class letter into the canonical display label (e.g. "Year 7 T"). */
+/** Normalizes and validates a mandatory club role string, throwing if blank. */
+export function normalizeRequiredRole(value: unknown): string {
+  if (typeof value !== 'string') {
+    throw new Error('Club role is required.');
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error('Club role is required.');
+  }
+  return trimmed;
+}
+
+/** Formats a structured student Year + Class letter into the canonical display label (e.g. "Year 7 T" or "N/A"). */
 export function formatStudentClassName(year: ClassYear, letter: ClassLetter): string {
+  if (letter === 'N/A') {
+    return 'N/A';
+  }
   return `Year ${year} ${letter}`;
 }
 
@@ -84,7 +104,7 @@ export function parseStudentClassName(
   return { year, letter };
 }
 
-/** Resolves normalized structured class fields and canonical display label for a student member. */
+/** Resolves normalized structured class fields and canonical display label for a member. */
 export function resolveStudentClassFields(input: {
   memberType: MemberType;
   classYear?: unknown;
@@ -95,12 +115,19 @@ export function resolveStudentClassFields(input: {
   classLetter?: ClassLetter;
   className?: string;
 } {
-  if (input.memberType !== 'student') {
-    return { classYear: undefined, classLetter: undefined, className: undefined };
+  const explicitLetter = normalizeClassLetter(input.classLetter);
+  const rawClassNameUpper =
+    typeof input.className === 'string' ? input.className.trim().toUpperCase() : '';
+
+  if (explicitLetter === 'N/A' || rawClassNameUpper === 'N/A' || rawClassNameUpper === 'NA') {
+    return {
+      classYear: undefined,
+      classLetter: 'N/A',
+      className: 'N/A',
+    };
   }
 
   const explicitYear = normalizeClassYear(input.classYear);
-  const explicitLetter = normalizeClassLetter(input.classLetter);
   if (explicitYear && explicitLetter) {
     return {
       classYear: explicitYear,
@@ -119,7 +146,9 @@ export function resolveStudentClassFields(input: {
   }
 
   const fallbackClassName =
-    typeof input.className === 'string' && input.className.trim().length > 0
+    input.memberType === 'student' &&
+    typeof input.className === 'string' &&
+    input.className.trim().length > 0
       ? input.className.trim()
       : undefined;
 
@@ -130,7 +159,7 @@ export function resolveStudentClassFields(input: {
   };
 }
 
-/** Sorts class labels numerically by Year (7..11) and then T, E, N, B order, with legacy names last. */
+/** Sorts class labels numerically by Year (7..11) and then T, E, N, B order, with N/A and legacy names last. */
 export function compareStudentClassNames(a: string, b: string): number {
   const parsedA = parseStudentClassName(a);
   const parsedB = parseStudentClassName(b);
@@ -138,11 +167,66 @@ export function compareStudentClassNames(a: string, b: string): number {
     if (parsedA.year !== parsedB.year) {
       return parsedA.year - parsedB.year;
     }
-    return CLASS_LETTERS.indexOf(parsedA.letter) - CLASS_LETTERS.indexOf(parsedB.letter);
+    return STANDARD_CLASS_LETTERS.indexOf(parsedA.letter as Exclude<ClassLetter, 'N/A'>) -
+      STANDARD_CLASS_LETTERS.indexOf(parsedB.letter as Exclude<ClassLetter, 'N/A'>);
   }
   if (parsedA) return -1;
   if (parsedB) return 1;
+  if (a === 'N/A' && b !== 'N/A') return 1;
+  if (b === 'N/A' && a !== 'N/A') return -1;
   return a.localeCompare(b);
+}
+
+const LEAD_ROLE_WORD_RE = /\blead\b/;
+
+/**
+ * Returns the Club Role hierarchy tier for default sorting:
+ * 0 = President, 1 = Vice President, 2 = Secretary, 3 = any Lead role, 4 = Member & custom roles.
+ */
+export function getClubRoleSortTier(role?: string | null): number {
+  if (typeof role !== 'string') return 4;
+  const normalized = role
+    .trim()
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+
+  if (!normalized) return 4;
+  if (normalized === 'president') return 0;
+  if (normalized === 'vice president') return 1;
+  if (normalized === 'secretary') return 2;
+  if (LEAD_ROLE_WORD_RE.test(normalized)) return 3;
+  return 4;
+}
+
+/**
+ * Compares two club members by role hierarchy tier (President -> Vice President -> Secretary ->
+ * Lead roles -> Members/custom roles) and then strictly alphabetically (A-Z) by name.
+ */
+export function compareMembersByRoleAndName(
+  a: Pick<ClubMember, 'id' | 'name' | 'role'>,
+  b: Pick<ClubMember, 'id' | 'name' | 'role'>,
+): number {
+  const tierDiff = getClubRoleSortTier(a.role) - getClubRoleSortTier(b.role);
+  if (tierDiff !== 0) return tierDiff;
+
+  const nameA = a.name.trim().replace(/\s+/g, ' ');
+  const nameB = b.name.trim().replace(/\s+/g, ' ');
+
+  const caseInsensitiveCmp = nameA.localeCompare(nameB, undefined, { sensitivity: 'base' });
+  if (caseInsensitiveCmp !== 0) return caseInsensitiveCmp;
+
+  const exactNameCmp = nameA.localeCompare(nameB);
+  if (exactNameCmp !== 0) return exactNameCmp;
+
+  return a.id.localeCompare(b.id);
+}
+
+/** Returns a new array of members sorted by Club Role hierarchy and then alphabetically (A-Z). */
+export function sortMembersByRoleAndName<T extends Pick<ClubMember, 'id' | 'name' | 'role'>>(
+  members: readonly T[],
+): T[] {
+  return [...members].sort(compareMembersByRoleAndName);
 }
 
 /** Returns true when a club member belongs to the Legacy / Retired archive. */
@@ -239,7 +323,7 @@ export function applyAnnualProgressionToMember<T extends ClubMember>(
     className: member.className,
   });
 
-  if (!resolvedClass.classYear || !resolvedClass.classLetter) {
+  if (!resolvedClass.classYear || !resolvedClass.classLetter || resolvedClass.classLetter === 'N/A') {
     return { member, outcome: 'none' };
   }
 
@@ -340,6 +424,70 @@ export function runAnnualClassProgression<T extends ClubMember & { deletedAt?: s
   };
 }
 
+export interface BulkMemberParseResult {
+  namesToAdd: string[];
+  skippedActiveDuplicates: string[];
+  skippedBatchDuplicates: string[];
+  blankLineCount: number;
+}
+
+function normalizeBulkNameLine(value: string): string {
+  return value.trim().replace(/\s+/g, ' ');
+}
+
+/**
+ * Parses a multi-line member list (one full name per line, preserving spaces like "John Doe"),
+ * ignoring blank lines and filtering out duplicates already present in the active roster or batch.
+ */
+export function parseBulkMemberInput(
+  rawText: string,
+  members: readonly Pick<ClubMember, 'name' | 'isLegacy'>[],
+): BulkMemberParseResult {
+  const activeNameSet = new Set<string>();
+  for (const member of members) {
+    if (isLegacyMember(member)) continue;
+    const normalized = normalizeBulkNameLine(member.name).toLowerCase();
+    if (normalized) {
+      activeNameSet.add(normalized);
+    }
+  }
+
+  const seenBatchSet = new Set<string>();
+  const namesToAdd: string[] = [];
+  const skippedActiveDuplicates: string[] = [];
+  const skippedBatchDuplicates: string[] = [];
+  let blankLineCount = 0;
+
+  for (const rawLine of rawText.split(/\r?\n/)) {
+    const cleaned = normalizeBulkNameLine(rawLine);
+    if (!cleaned) {
+      blankLineCount += 1;
+      continue;
+    }
+
+    const key = cleaned.toLowerCase();
+    if (activeNameSet.has(key)) {
+      skippedActiveDuplicates.push(cleaned);
+      continue;
+    }
+
+    if (seenBatchSet.has(key)) {
+      skippedBatchDuplicates.push(cleaned);
+      continue;
+    }
+
+    seenBatchSet.add(key);
+    namesToAdd.push(cleaned);
+  }
+
+  return {
+    namesToAdd,
+    skippedActiveDuplicates,
+    skippedBatchDuplicates,
+    blankLineCount,
+  };
+}
+
 export interface SessionAttendanceSummary {
   totalMembers: number;
   presentCount: number;
@@ -370,7 +518,8 @@ export function generateId(prefix: string): string {
 /** Builds a normalized ClubMember record from a quick-add name or full profile payload. */
 export function buildClubMember(input: string | MemberProfileInput): ClubMember {
   const normalized: MemberProfileInput =
-    typeof input === 'string' ? { name: input } : input;
+    typeof input === 'string' ? { name: input, role: 'Member' } : input;
+  const role = normalizeRequiredRole(normalized.role);
   const memberType = normalizeMemberType(normalized.memberType);
   const classFields = resolveStudentClassFields({
     memberType,
@@ -393,7 +542,7 @@ export function buildClubMember(input: string | MemberProfileInput): ClubMember 
     retiredAt: isLegacy ? (normalized.retiredAt?.trim() || now) : undefined,
     lastPromotedYear,
     graduationYear,
-    role: normalized.role?.trim() || undefined,
+    role,
     email: normalized.email?.trim() || undefined,
     phone: normalized.phone?.trim() || undefined,
     handle: normalized.handle?.trim() || undefined,
@@ -409,6 +558,7 @@ export function applyMemberProfileUpdate(
   member: ClubMember,
   input: MemberProfileInput,
 ): ClubMember {
+  const role = normalizeRequiredRole(input.role);
   const prevMemberType = normalizeMemberType(member.memberType);
   const memberType = normalizeMemberType(input.memberType ?? member.memberType);
   const classFields = resolveStudentClassFields({
@@ -444,7 +594,7 @@ export function applyMemberProfileUpdate(
     retiredAt: nextRetiredAt,
     lastPromotedYear: nextLastPromotedYear,
     graduationYear: nextGraduationYear,
-    role: input.role?.trim() || undefined,
+    role,
     email: input.email?.trim() || undefined,
     phone: input.phone?.trim() || undefined,
     handle: input.handle?.trim() || undefined,
@@ -518,7 +668,7 @@ export function getSessionAssignedMembers(
     }
   }
 
-  return assigned;
+  return assigned.sort(compareMembersByRoleAndName);
 }
 
 /** Summarizes a session's attendance marks across the members assigned to that session. */

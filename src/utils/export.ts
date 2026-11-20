@@ -53,7 +53,9 @@ function downloadCsv(filename: string, rows: (string | number | null | undefined
   document.body.appendChild(anchor);
   anchor.click();
   document.body.removeChild(anchor);
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => {
+    URL.revokeObjectURL(url);
+  }, 1000);
 }
 
 function escapeHtml(value: string | number | null | undefined): string {
@@ -252,17 +254,24 @@ function openPrintableDocument(options: {
   iframe.setAttribute('aria-hidden', 'true');
   document.body.appendChild(iframe);
 
-  const cleanup = () => {
-    window.setTimeout(() => {
-      if (iframe.parentNode) {
-        iframe.parentNode.removeChild(iframe);
-      }
-    }, 1000);
+  let cleanedUp = false;
+  let fallbackTimer: number | null = null;
+  const removeIframe = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    if (fallbackTimer !== null) {
+      window.clearTimeout(fallbackTimer);
+      fallbackTimer = null;
+    }
+    if (iframe.parentNode) {
+      iframe.parentNode.removeChild(iframe);
+    }
   };
 
   const doc = iframe.contentDocument ?? iframe.contentWindow?.document;
-  if (!doc || !iframe.contentWindow) {
-    cleanup();
+  const frameWindow = iframe.contentWindow;
+  if (!doc || !frameWindow) {
+    removeIframe();
     return;
   }
 
@@ -272,10 +281,12 @@ function openPrintableDocument(options: {
 
   const triggerPrint = () => {
     try {
-      iframe.contentWindow?.focus();
-      iframe.contentWindow?.print();
-    } finally {
-      cleanup();
+      frameWindow.addEventListener('afterprint', removeIframe, { once: true });
+      fallbackTimer = window.setTimeout(removeIframe, 60_000);
+      frameWindow.focus();
+      frameWindow.print();
+    } catch {
+      removeIframe();
     }
   };
 
@@ -322,7 +333,7 @@ export function exportSessionAttendanceCsv(
     rows.push([
       member.name,
       MEMBER_TYPE_LABELS[memberType],
-      memberType === 'student' ? (member.className ?? '') : '',
+      member.className ?? '',
       member.role ?? '',
       STATUS_LABELS[status],
       status === 'absent_with_reason' ? (entry?.reason ?? '') : '',
@@ -361,7 +372,9 @@ export function printSessionAttendanceReport(
       member.name,
       memberType === 'student'
         ? member.className || 'Student'
-        : MEMBER_TYPE_LABELS[memberType],
+        : member.className
+          ? `${MEMBER_TYPE_LABELS[memberType]} (${member.className})`
+          : MEMBER_TYPE_LABELS[memberType],
       member.role || '—',
       STATUS_LABELS[status],
       status === 'absent_with_reason' ? entry?.reason || '—' : '—',
@@ -429,7 +442,7 @@ export function exportMemberDirectoryCsv(
       legacyStatus,
       isLegacyMember(member) && member.graduationYear ? member.graduationYear : '',
       MEMBER_TYPE_LABELS[memberType],
-      memberType === 'student' ? (member.className ?? '') : '',
+      member.className ?? '',
       member.role ?? '',
       stats.totalSessions,
       stats.presentCount,
@@ -467,7 +480,9 @@ export function printMemberDirectoryReport(
     const typeOrClass =
       memberType === 'student'
         ? member.className || 'Student'
-        : MEMBER_TYPE_LABELS[memberType];
+        : member.className
+          ? `${MEMBER_TYPE_LABELS[memberType]} (${member.className})`
+          : MEMBER_TYPE_LABELS[memberType];
 
     return [
       String(index + 1),
@@ -543,7 +558,7 @@ export function exportMemberProfileCsv(
       ? [['Graduation Year', member.graduationYear]]
       : []),
     ['Type', MEMBER_TYPE_LABELS[memberType]],
-    ['Class', memberType === 'student' ? (member.className ?? '') : ''],
+    ['Class', member.className ?? ''],
     ['Role', member.role ?? ''],
     ['Email', member.email ?? ''],
     ['Phone', member.phone ?? ''],
@@ -594,7 +609,7 @@ export function printMemberProfileReport(
     }`,
     `Type: ${MEMBER_TYPE_LABELS[memberType]}`,
   ];
-  if (memberType === 'student' && member.className) metaLines.push(`Class: ${member.className}`);
+  if (member.className) metaLines.push(`Class: ${member.className}`);
   if (member.role) metaLines.push(`Role: ${member.role}`);
   if (member.email) metaLines.push(`Email: ${member.email}`);
 

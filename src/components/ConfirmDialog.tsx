@@ -34,6 +34,14 @@ export function ConfirmDialog({
       cancelButtonRef.current?.focus();
     }, 0);
 
+    return () => {
+      window.clearTimeout(focusTimer);
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === 'Escape') {
         onCancel();
@@ -42,7 +50,6 @@ export function ConfirmDialog({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => {
-      window.clearTimeout(focusTimer);
       window.removeEventListener('keydown', handleKeyDown);
     };
   }, [isOpen, onCancel]);

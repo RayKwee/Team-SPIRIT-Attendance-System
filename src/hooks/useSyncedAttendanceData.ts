@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   LOCAL_ONLY_STORE_KEY,
+  applyConflictResolutionToStore,
   attendanceFromDbRow,
   clearLocalSyncStore,
   createEmptySyncStore,
   deriveWorkspaceState,
+  getClientTabId,
   getEffectiveTimestamp,
+  getSyncStoreKey,
   hasDirtySyncItems,
+  hasSyncConflicts,
   loadLocalOnlyStore,
   loadLocalSyncStore,
   makeAttendanceKey,
@@ -20,15 +24,32 @@ import {
   toSupabaseSyncError,
   type SupabaseSyncError,
 } from '../lib/attendanceSync';
+import {
+  ATTENDANCE_MERGE_FIELDS,
+  MEMBER_MERGE_FIELDS,
+  SESSION_MERGE_FIELDS,
+  buildAttendanceConflictItem,
+  buildMemberConflictItem,
+  buildSessionConflictItem,
+  normalizeMergedAttendance,
+  reconcileIncomingEntity,
+  removeConflictByEntity,
+  upsertConflictItem,
+} from '../lib/syncConflictEngine';
 import { supabase } from '../lib/supabase';
 import type {
   AttendanceSession,
   AttendanceStatus,
+  ClassLetter,
+  ClassYear,
   ClubMember,
   DefaultAssignmentStatus,
   LocalSyncStore,
   MemberProfileInput,
   NewSessionInput,
+  RealtimeStatus,
+  SyncConflictItem,
+  SyncConflictResolution,
   SyncStatus,
   SyncedAttendanceRecord,
   SyncedMemberRecord,
@@ -38,8 +59,11 @@ import {
   applyAnnualProgressionToMember,
   applyMemberProfileUpdate,
   buildClubMember,
+  formatStudentClassName,
   generateId,
   getPromotionCycleYear,
+  normalizeMemberType,
+  resolveStudentClassFields,
   runAnnualClassProgression,
   type AnnualProgressionSummary,
 } from '../utils/attendance';
@@ -47,6 +71,48 @@ import {
 const REASON_DEBOUNCE_MS = 450;
 const BACKGROUND_SYNC_INTERVAL_MS = 15_000;
 const CHANGE_SYNC_COOLDOWN_MS = 1_000;
+const PUSH_LEASE_TTL_MS = 8_000;
+
+async function withTabPushLease<T>(userId: string, work: () => Promise<T>): Promise<T> {
+  if (typeof navigator !== 'undefined' && 'locks' in navigator && navigator.locks) {
+    return await navigator.locks.request(`team-spirit-push:${userId}`, async () => await work());
+  }
+
+  const leaseKey = `team-spirit:push-lease:${userId}`;
+  const tabId = getClientTabId();
+  const waitUntil = Date.now() + 3_000;
+
+  while (Date.now() < waitUntil) {
+    try {
+      const raw = window.localStorage.getItem(leaseKey);
+      const parsed = raw ? (JSON.parse(raw) as { owner?: string; expiresAt?: number }) : null;
+      if (!parsed || !parsed.expiresAt || parsed.expiresAt < Date.now() || parsed.owner === tabId) {
+        window.localStorage.setItem(
+          leaseKey,
+          JSON.stringify({ owner: tabId, expiresAt: Date.now() + PUSH_LEASE_TTL_MS }),
+        );
+        break;
+      }
+    } catch {
+      break;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 60));
+  }
+
+  try {
+    return await work();
+  } finally {
+    try {
+      const raw = window.localStorage.getItem(leaseKey);
+      const parsed = raw ? (JSON.parse(raw) as { owner?: string }) : null;
+      if (parsed?.owner === tabId) {
+        window.localStorage.removeItem(leaseKey);
+      }
+    } catch {
+      // Ignore lease cleanup errors.
+    }
+  }
+}
 
 function isBlockingSyncError(error: SupabaseSyncError): boolean {
   return (
@@ -57,13 +123,66 @@ function isBlockingSyncError(error: SupabaseSyncError): boolean {
   );
 }
 
+interface UndoDelta {
+  members: Record<string, SyncedMemberRecord | undefined>;
+  sessions: Record<string, SyncedSessionRecord | undefined>;
+  attendance: Record<string, SyncedAttendanceRecord | undefined>;
+}
+
+function buildUndoDelta(prev: LocalSyncStore, next: LocalSyncStore): UndoDelta {
+  const members: Record<string, SyncedMemberRecord | undefined> = {};
+  const memberIds = new Set([...Object.keys(prev.members), ...Object.keys(next.members)]);
+  for (const id of memberIds) {
+    if (prev.members[id] !== next.members[id]) {
+      members[id] = prev.members[id];
+    }
+  }
+
+  const sessions: Record<string, SyncedSessionRecord | undefined> = {};
+  const sessionIds = new Set([...Object.keys(prev.sessions), ...Object.keys(next.sessions)]);
+  for (const id of sessionIds) {
+    if (prev.sessions[id] !== next.sessions[id]) {
+      sessions[id] = prev.sessions[id];
+    }
+  }
+
+  const attendance: Record<string, SyncedAttendanceRecord | undefined> = {};
+  const attendanceKeys = new Set([
+    ...Object.keys(prev.attendance),
+    ...Object.keys(next.attendance),
+  ]);
+  for (const key of attendanceKeys) {
+    if (prev.attendance[key] !== next.attendance[key]) {
+      attendance[key] = prev.attendance[key];
+    }
+  }
+
+  return { members, sessions, attendance };
+}
+
+function countDirtySyncItems(store: LocalSyncStore): number {
+  return (
+    store.dirtyMemberIds.length +
+    store.dirtySessionIds.length +
+    store.dirtyAttendanceKeys.length
+  );
+}
+
 export interface UseSyncedAttendanceDataResult {
   members: ClubMember[];
   sessions: AttendanceSession[];
   syncStatus: SyncStatus;
+  realtimeStatus: RealtimeStatus;
   syncError: string | null;
   pendingCount: number;
+  conflicts: SyncConflictItem[];
+  conflictCount: number;
+  isEditingActive: boolean;
   hasUnsavedChanges: boolean;
+  beginFieldEdit: (fieldKey: string) => void;
+  endFieldEdit: (fieldKey: string) => void;
+  resolveConflict: (conflictId: string, resolution: SyncConflictResolution) => Promise<void>;
+  resolveAllConflicts: (resolution: SyncConflictResolution) => Promise<void>;
   createSession: (
     input: NewSessionInput,
     options?: {
@@ -73,8 +192,18 @@ export interface UseSyncedAttendanceDataResult {
   ) => AttendanceSession;
   deleteSession: (sessionId: string) => void;
   addMember: (input: string | MemberProfileInput) => ClubMember;
+  addMembersBulk: (inputs: MemberProfileInput[]) => ClubMember[];
   updateMember: (memberId: string, input: MemberProfileInput) => void;
+  updateMembersClass: (
+    memberIds: string[],
+    patch: { classYear?: ClassYear; classLetter?: ClassLetter },
+  ) => number;
   setMemberLegacyStatus: (memberId: string, isLegacy: boolean) => void;
+  setMembersLegacyStatus: (
+    memberIds: string[],
+    isLegacy: boolean,
+    options?: { fallbackClassYear?: ClassYear; fallbackClassLetter?: ClassLetter },
+  ) => number;
   deleteMembers: (memberIds: string[]) => void;
   assignMemberToSession: (
     sessionId: string,
@@ -111,31 +240,54 @@ export interface UseSyncedAttendanceDataResult {
  */
 export function useSyncedAttendanceData(
   userId: string | null,
-  options?: { onAnnualProgression?: (summary: AnnualProgressionSummary) => void },
+  options?: {
+    onAnnualProgression?: (summary: AnnualProgressionSummary) => void;
+    isReadOnlyCloud?: boolean;
+    isAuthResolving?: boolean;
+    scopeVersionKey?: string;
+  },
 ): UseSyncedAttendanceDataResult {
   const [members, setMembers] = useState<ClubMember[]>([]);
   const [sessions, setSessions] = useState<AttendanceSession[]>([]);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>(() => (userId ? 'loading' : 'local'));
+  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus>('disconnected');
   const [syncError, setSyncError] = useState<string | null>(null);
   const [pendingCount, setPendingCount] = useState(0);
+  const [conflicts, setConflicts] = useState<SyncConflictItem[]>([]);
+  const [isEditingActive, setIsEditingActive] = useState(false);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
 
   const storeRef = useRef<LocalSyncStore>(createEmptySyncStore());
   const userIdRef = useRef<string | null>(userId);
+  const isReadOnlyCloud = Boolean(userId && options?.isReadOnlyCloud);
+  const isAuthResolving = Boolean(userId && options?.isAuthResolving);
+  const scopeVersionKey = options?.scopeVersionKey ?? '';
+  const isReadOnlyCloudRef = useRef(isReadOnlyCloud);
+  const isAuthResolvingRef = useRef(isAuthResolving);
+  isReadOnlyCloudRef.current = isReadOnlyCloud;
+  isAuthResolvingRef.current = isAuthResolving;
   const onAnnualProgressionRef = useRef(options?.onAnnualProgression);
   onAnnualProgressionRef.current = options?.onAnnualProgression;
-  const undoStackRef = useRef<{ token: string; snapshot: LocalSyncStore }[]>([]);
+  const undoStackRef = useRef<{ token: string; delta: UndoDelta }[]>([]);
   const lastUndoTokenRef = useRef<string | null>(null);
   const syncInFlightRef = useRef(false);
   const needsFollowUpFlushRef = useRef(false);
+  const needsFollowUpReconcileRef = useRef(false);
   const mergeLocalOnNextConnectRef = useRef(false);
   const debounceTimerRef = useRef<number | null>(null);
   const changeSyncTimerRef = useRef<number | null>(null);
   const backgroundIntervalRef = useRef<number | null>(null);
+  const realtimeReconnectTimerRef = useRef<number | null>(null);
+  const realtimeReconnectAttemptRef = useRef(0);
   const lastChangeSyncAtRef = useRef<number>(0);
   const mountedRef = useRef(true);
   const syncBlockedRef = useRef(false);
   const realtimeChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
+  const activeFieldEditsRef = useRef<Set<string>>(new Set());
+  const deferredMemberRealtimeRef = useRef<Map<string, SyncedMemberRecord>>(new Map());
+  const deferredAttendanceRealtimeRef = useRef<Map<string, SyncedAttendanceRecord>>(new Map());
+  const prevScopeVersionKeyRef = useRef<string>(scopeVersionKey);
 
   userIdRef.current = userId;
 
@@ -143,29 +295,57 @@ export function useSyncedAttendanceData(
     mergeLocalOnNextConnectRef.current = shouldMerge;
   }, []);
 
-  const applyProgressionToCurrentStore = useCallback((activeUserId: string | null): boolean => {
-    const current = storeRef.current;
-    const { nextMembers, summary } = runAnnualClassProgression(current.members, new Date());
-    if (summary.changedIds.length === 0) {
-      return false;
-    }
+  const persistStoreAndNotifyTabs = useCallback(
+    (activeUserId: string | null, nextStore: LocalSyncStore) => {
+      if (activeUserId) {
+        saveLocalSyncStore(activeUserId, nextStore);
+      } else {
+        saveLocalOnlyStore(nextStore);
+      }
+      try {
+        broadcastChannelRef.current?.postMessage({
+          type: 'store-updated',
+          senderTabId: getClientTabId(),
+        });
+      } catch {
+        // Ignore BroadcastChannel errors.
+      }
+    },
+    [],
+  );
 
-    const nextStore: LocalSyncStore = {
-      ...current,
-      members: nextMembers,
-      dirtyMemberIds: Array.from(new Set([...current.dirtyMemberIds, ...summary.changedIds])),
-    };
-    storeRef.current = nextStore;
+  const resolveStatusFromStore = useCallback(
+    (store: LocalSyncStore, fallback: SyncStatus): SyncStatus => {
+      if (!userIdRef.current) return 'local';
+      if (hasSyncConflicts(store)) return 'conflict';
+      if (syncBlockedRef.current) return hasDirtySyncItems(store) ? 'pending' : 'error';
+      if (syncInFlightRef.current) return 'syncing';
+      if (hasDirtySyncItems(store)) return 'pending';
+      return fallback;
+    },
+    [],
+  );
 
-    if (activeUserId) {
-      saveLocalSyncStore(activeUserId, nextStore);
-    } else {
-      saveLocalOnlyStore(nextStore);
-    }
+  const applyProgressionToCurrentStore = useCallback(
+    (activeUserId: string | null): boolean => {
+      const current = storeRef.current;
+      const { nextMembers, summary } = runAnnualClassProgression(current.members, new Date());
+      if (summary.changedIds.length === 0) {
+        return false;
+      }
 
-    onAnnualProgressionRef.current?.(summary);
-    return true;
-  }, []);
+      const nextStore: LocalSyncStore = {
+        ...current,
+        members: nextMembers,
+        dirtyMemberIds: Array.from(new Set([...current.dirtyMemberIds, ...summary.changedIds])),
+      };
+      storeRef.current = nextStore;
+      persistStoreAndNotifyTabs(activeUserId, nextStore);
+      onAnnualProgressionRef.current?.(summary);
+      return true;
+    },
+    [persistStoreAndNotifyTabs],
+  );
 
   const refreshDerivedState = useCallback(() => {
     const store = storeRef.current;
@@ -180,11 +360,24 @@ export function useSyncedAttendanceData(
     setMembers(derived.members);
     setSessions(derived.sessions);
     setPendingCount(userIdRef.current ? dirtyTotal : 0);
+    setConflicts(userIdRef.current ? store.conflicts : []);
     setHasUnsavedChanges(
       Boolean(userIdRef.current) &&
-        (dirtyTotal > 0 || syncInFlightRef.current || hasPendingSyncTimer),
+        (dirtyTotal > 0 ||
+          syncInFlightRef.current ||
+          hasPendingSyncTimer ||
+          activeFieldEditsRef.current.size > 0),
     );
   }, []);
+
+  const beginFieldEdit = useCallback(
+    (fieldKey: string) => {
+      activeFieldEditsRef.current.add(fieldKey);
+      setIsEditingActive(true);
+      refreshDerivedState();
+    },
+    [refreshDerivedState],
+  );
 
   const clearDebounceTimer = useCallback(() => {
     if (debounceTimerRef.current !== null) {
@@ -207,12 +400,126 @@ export function useSyncedAttendanceData(
     }
   }, []);
 
-  const cleanupRealtimeSubscription = useCallback(() => {
-    const channel = realtimeChannelRef.current;
-    if (!channel) return;
-    realtimeChannelRef.current = null;
-    void Promise.resolve(supabase.removeChannel(channel)).catch(() => {});
+  const clearRealtimeReconnectTimer = useCallback(() => {
+    if (realtimeReconnectTimerRef.current !== null) {
+      window.clearTimeout(realtimeReconnectTimerRef.current);
+      realtimeReconnectTimerRef.current = null;
+    }
   }, []);
+
+  const cleanupRealtimeSubscription = useCallback(() => {
+    clearRealtimeReconnectTimer();
+    const channel = realtimeChannelRef.current;
+    if (!channel) {
+      setRealtimeStatus('disconnected');
+      return;
+    }
+    realtimeChannelRef.current = null;
+    setRealtimeStatus('disconnected');
+    void Promise.resolve(supabase.removeChannel(channel)).catch(() => {});
+  }, [clearRealtimeReconnectTimer]);
+
+  const mergeSiblingStoreIntoCurrent = useCallback(
+    (activeUserId: string | null, siblingStore: LocalSyncStore) => {
+      const current = storeRef.current;
+      const currentDirtyMembers = new Set(current.dirtyMemberIds);
+      const currentDirtySessions = new Set(current.dirtySessionIds);
+      const currentDirtyAttendance = new Set(current.dirtyAttendanceKeys);
+      const siblingDirtyMembers = new Set(siblingStore.dirtyMemberIds);
+      const siblingDirtySessions = new Set(siblingStore.dirtySessionIds);
+      const siblingDirtyAttendance = new Set(siblingStore.dirtyAttendanceKeys);
+
+      const nextMembers = { ...siblingStore.members };
+      const nextDirtyMembers = new Set(siblingStore.dirtyMemberIds);
+      for (const id of currentDirtyMembers) {
+        const localRec = current.members[id];
+        const siblingRec = siblingStore.members[id];
+        const isEditingThis = activeFieldEditsRef.current.has(`member:${id}`);
+        if (
+          localRec &&
+          (isEditingThis ||
+            !siblingRec ||
+            (!siblingDirtyMembers.has(id) &&
+              getEffectiveTimestamp(localRec.updatedAt, localRec.deletedAt) >
+                getEffectiveTimestamp(siblingRec.updatedAt, siblingRec.deletedAt)))
+        ) {
+          nextMembers[id] = localRec;
+          nextDirtyMembers.add(id);
+        }
+      }
+
+      const nextSessions = { ...siblingStore.sessions };
+      const nextDirtySessions = new Set(siblingStore.dirtySessionIds);
+      for (const id of currentDirtySessions) {
+        const localRec = current.sessions[id];
+        const siblingRec = siblingStore.sessions[id];
+        if (
+          localRec &&
+          (!siblingRec ||
+            (!siblingDirtySessions.has(id) &&
+              getEffectiveTimestamp(localRec.updatedAt, localRec.deletedAt) >
+                getEffectiveTimestamp(siblingRec.updatedAt, siblingRec.deletedAt)))
+        ) {
+          nextSessions[id] = localRec;
+          nextDirtySessions.add(id);
+        }
+      }
+
+      const nextAttendance = { ...siblingStore.attendance };
+      const nextDirtyAttendance = new Set(siblingStore.dirtyAttendanceKeys);
+      for (const key of currentDirtyAttendance) {
+        const localRec = current.attendance[key];
+        const siblingRec = siblingStore.attendance[key];
+        const isEditingThis = activeFieldEditsRef.current.has(`attendance:${key}`);
+        if (
+          localRec &&
+          (isEditingThis ||
+            !siblingRec ||
+            (!siblingDirtyAttendance.has(key) &&
+              getEffectiveTimestamp(localRec.updatedAt, localRec.deletedAt) >
+                getEffectiveTimestamp(siblingRec.updatedAt, siblingRec.deletedAt)))
+        ) {
+          nextAttendance[key] = localRec;
+          nextDirtyAttendance.add(key);
+        }
+      }
+
+      // Preserve any actively edited field even if not yet queued dirty.
+      for (const editKey of activeFieldEditsRef.current) {
+        if (editKey.startsWith('attendance:')) {
+          const attKey = editKey.slice('attendance:'.length);
+          if (current.attendance[attKey]) {
+            nextAttendance[attKey] = current.attendance[attKey];
+          }
+        } else if (editKey.startsWith('member:')) {
+          const memberId = editKey.slice('member:'.length);
+          if (current.members[memberId]) {
+            nextMembers[memberId] = current.members[memberId];
+          }
+        }
+      }
+
+      storeRef.current = {
+        members: nextMembers,
+        sessions: nextSessions,
+        attendance: nextAttendance,
+        baseMembers: siblingStore.baseMembers,
+        baseSessions: siblingStore.baseSessions,
+        baseAttendance: siblingStore.baseAttendance,
+        dirtyMemberIds: Array.from(nextDirtyMembers),
+        dirtySessionIds: Array.from(nextDirtySessions),
+        dirtyAttendanceKeys: Array.from(nextDirtyAttendance),
+        conflicts: siblingStore.conflicts,
+        legacyImported: siblingStore.legacyImported,
+      };
+
+      if (activeUserId && !syncInFlightRef.current) {
+        setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
+      }
+      refreshDerivedState();
+    },
+    [refreshDerivedState, resolveStatusFromStore],
+  );
 
   const ensureRealtimeSubscription = useCallback(
     (activeUserId: string) => {
@@ -225,6 +532,8 @@ export function useSyncedAttendanceData(
         return;
       }
 
+      setRealtimeStatus((prev) => (prev === 'reconnecting' ? 'reconnecting' : 'connecting'));
+
       const channel = supabase
         .channel(`team-spirit-sync-${activeUserId}`)
         .on(
@@ -232,40 +541,129 @@ export function useSyncedAttendanceData(
           { event: '*', schema: 'public', table: 'club_members' },
           (payload) => {
             if (userIdRef.current !== activeUserId) return;
+            const current = storeRef.current;
+
             if (payload.eventType === 'DELETE') {
               const oldId = (payload.old as { id?: string } | null)?.id;
-              if (!oldId || !storeRef.current.members[oldId]) return;
-              const nextMembers = { ...storeRef.current.members };
+              if (!oldId || !current.members[oldId]) return;
+              const isDirty = current.dirtyMemberIds.includes(oldId);
+              const isEditingThis = activeFieldEditsRef.current.has(`member:${oldId}`);
+              if (isDirty || isEditingThis) {
+                const deletedRemote: SyncedMemberRecord = {
+                  ...(current.baseMembers[oldId] ?? current.members[oldId]),
+                  syncVersion: undefined,
+                  deletedAt: new Date().toISOString(),
+                };
+                const nextBaseMembers = { ...current.baseMembers };
+                delete nextBaseMembers[oldId];
+                storeRef.current = {
+                  ...current,
+                  baseMembers: nextBaseMembers,
+                  dirtyMemberIds: current.dirtyMemberIds.filter((id) => id !== oldId),
+                  conflicts: upsertConflictItem(
+                    current.conflicts,
+                    buildMemberConflictItem(
+                      oldId,
+                      current.baseMembers[oldId],
+                      current.members[oldId],
+                      deletedRemote,
+                      ['Deleted on Cloud'],
+                    ),
+                  ),
+                };
+                persistStoreAndNotifyTabs(activeUserId, storeRef.current);
+                setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
+                refreshDerivedState();
+                return;
+              }
+
+              const nextMembers = { ...current.members };
+              const nextBaseMembers = { ...current.baseMembers };
               delete nextMembers[oldId];
+              delete nextBaseMembers[oldId];
               storeRef.current = {
-                ...storeRef.current,
+                ...current,
                 members: nextMembers,
-                dirtyMemberIds: storeRef.current.dirtyMemberIds.filter((id) => id !== oldId),
+                baseMembers: nextBaseMembers,
+                conflicts: removeConflictByEntity(current.conflicts, 'member', oldId),
               };
-              saveLocalSyncStore(activeUserId, storeRef.current);
+              persistStoreAndNotifyTabs(activeUserId, storeRef.current);
               refreshDerivedState();
               return;
             }
 
             if (!payload.new) return;
             const incoming = memberFromDbRow(payload.new as Parameters<typeof memberFromDbRow>[0]);
-            const existing = storeRef.current.members[incoming.id];
-            const incomingTs = getEffectiveTimestamp(incoming.updatedAt, incoming.deletedAt);
-            const existingTs = existing
-              ? getEffectiveTimestamp(existing.updatedAt, existing.deletedAt)
-              : -1;
+            const existing = current.members[incoming.id];
+            const base = current.baseMembers[incoming.id];
+            const isDirty = current.dirtyMemberIds.includes(incoming.id);
+            const isEditingThis = activeFieldEditsRef.current.has(`member:${incoming.id}`);
 
-            if (incomingTs >= existingTs) {
+            // Ignore older or duplicate server versions already stored as base.
+            if (
+              base?.syncVersion !== undefined &&
+              incoming.syncVersion !== undefined &&
+              incoming.syncVersion <= base.syncVersion &&
+              !isDirty
+            ) {
+              return;
+            }
+
+            if (isEditingThis) {
+              // Defer remote update until blur/save without advancing `base`, so CAS still
+              // detects true concurrent edits against the ancestor version the editor loaded.
+              deferredMemberRealtimeRef.current.set(incoming.id, incoming);
+              return;
+            }
+
+            const outcome = reconcileIncomingEntity({
+              local: existing,
+              base,
+              remote: incoming,
+              isDirty,
+              fields: MEMBER_MERGE_FIELDS,
+            });
+
+            if (outcome.action === 'accept_remote') {
               storeRef.current = {
-                ...storeRef.current,
-                members: { ...storeRef.current.members, [incoming.id]: incoming },
-                dirtyMemberIds: storeRef.current.dirtyMemberIds.filter(
-                  (id) => id !== incoming.id,
+                ...current,
+                members: { ...current.members, [incoming.id]: outcome.record },
+                baseMembers: { ...current.baseMembers, [incoming.id]: outcome.base },
+                dirtyMemberIds: current.dirtyMemberIds.filter((id) => id !== incoming.id),
+                conflicts: removeConflictByEntity(current.conflicts, 'member', incoming.id),
+              };
+            } else if (outcome.action === 'keep_local' || outcome.action === 'merged') {
+              const nextDirty = outcome.needsPush
+                ? Array.from(new Set([...current.dirtyMemberIds, incoming.id]))
+                : current.dirtyMemberIds.filter((id) => id !== incoming.id);
+              storeRef.current = {
+                ...current,
+                members: { ...current.members, [incoming.id]: outcome.record },
+                baseMembers: { ...current.baseMembers, [incoming.id]: outcome.base },
+                dirtyMemberIds: nextDirty,
+                conflicts: removeConflictByEntity(current.conflicts, 'member', incoming.id),
+              };
+            } else {
+              storeRef.current = {
+                ...current,
+                baseMembers: { ...current.baseMembers, [incoming.id]: outcome.base },
+                dirtyMemberIds: current.dirtyMemberIds.filter((id) => id !== incoming.id),
+                conflicts: upsertConflictItem(
+                  current.conflicts,
+                  buildMemberConflictItem(
+                    incoming.id,
+                    base,
+                    existing!,
+                    incoming,
+                    outcome.conflictingFields,
+                  ),
                 ),
               };
-              saveLocalSyncStore(activeUserId, storeRef.current);
-              refreshDerivedState();
             }
+
+            persistStoreAndNotifyTabs(activeUserId, storeRef.current);
+            setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
+            refreshDerivedState();
           },
         )
         .on(
@@ -273,17 +671,52 @@ export function useSyncedAttendanceData(
           { event: '*', schema: 'public', table: 'attendance_sessions' },
           (payload) => {
             if (userIdRef.current !== activeUserId) return;
+            const current = storeRef.current;
+
             if (payload.eventType === 'DELETE') {
               const oldId = (payload.old as { id?: string } | null)?.id;
-              if (!oldId || !storeRef.current.sessions[oldId]) return;
-              const nextSessions = { ...storeRef.current.sessions };
+              if (!oldId || !current.sessions[oldId]) return;
+              const isDirty = current.dirtySessionIds.includes(oldId);
+              if (isDirty) {
+                const deletedRemote: SyncedSessionRecord = {
+                  ...(current.baseSessions[oldId] ?? current.sessions[oldId]),
+                  syncVersion: undefined,
+                  deletedAt: new Date().toISOString(),
+                };
+                const nextBaseSessions = { ...current.baseSessions };
+                delete nextBaseSessions[oldId];
+                storeRef.current = {
+                  ...current,
+                  baseSessions: nextBaseSessions,
+                  dirtySessionIds: current.dirtySessionIds.filter((id) => id !== oldId),
+                  conflicts: upsertConflictItem(
+                    current.conflicts,
+                    buildSessionConflictItem(
+                      oldId,
+                      current.baseSessions[oldId],
+                      current.sessions[oldId],
+                      deletedRemote,
+                      ['Deleted on Cloud'],
+                    ),
+                  ),
+                };
+                persistStoreAndNotifyTabs(activeUserId, storeRef.current);
+                setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
+                refreshDerivedState();
+                return;
+              }
+
+              const nextSessions = { ...current.sessions };
+              const nextBaseSessions = { ...current.baseSessions };
               delete nextSessions[oldId];
+              delete nextBaseSessions[oldId];
               storeRef.current = {
-                ...storeRef.current,
+                ...current,
                 sessions: nextSessions,
-                dirtySessionIds: storeRef.current.dirtySessionIds.filter((id) => id !== oldId),
+                baseSessions: nextBaseSessions,
+                conflicts: removeConflictByEntity(current.conflicts, 'session', oldId),
               };
-              saveLocalSyncStore(activeUserId, storeRef.current);
+              persistStoreAndNotifyTabs(activeUserId, storeRef.current);
               refreshDerivedState();
               return;
             }
@@ -292,23 +725,67 @@ export function useSyncedAttendanceData(
             const incoming = sessionFromDbRow(
               payload.new as Parameters<typeof sessionFromDbRow>[0],
             );
-            const existing = storeRef.current.sessions[incoming.id];
-            const incomingTs = getEffectiveTimestamp(incoming.updatedAt, incoming.deletedAt);
-            const existingTs = existing
-              ? getEffectiveTimestamp(existing.updatedAt, existing.deletedAt)
-              : -1;
+            const existing = current.sessions[incoming.id];
+            const base = current.baseSessions[incoming.id];
+            const isDirty = current.dirtySessionIds.includes(incoming.id);
 
-            if (incomingTs >= existingTs) {
+            if (
+              base?.syncVersion !== undefined &&
+              incoming.syncVersion !== undefined &&
+              incoming.syncVersion <= base.syncVersion &&
+              !isDirty
+            ) {
+              return;
+            }
+
+            const outcome = reconcileIncomingEntity({
+              local: existing,
+              base,
+              remote: incoming,
+              isDirty,
+              fields: SESSION_MERGE_FIELDS,
+            });
+
+            if (outcome.action === 'accept_remote') {
               storeRef.current = {
-                ...storeRef.current,
-                sessions: { ...storeRef.current.sessions, [incoming.id]: incoming },
-                dirtySessionIds: storeRef.current.dirtySessionIds.filter(
-                  (id) => id !== incoming.id,
+                ...current,
+                sessions: { ...current.sessions, [incoming.id]: outcome.record },
+                baseSessions: { ...current.baseSessions, [incoming.id]: outcome.base },
+                dirtySessionIds: current.dirtySessionIds.filter((id) => id !== incoming.id),
+                conflicts: removeConflictByEntity(current.conflicts, 'session', incoming.id),
+              };
+            } else if (outcome.action === 'keep_local' || outcome.action === 'merged') {
+              const nextDirty = outcome.needsPush
+                ? Array.from(new Set([...current.dirtySessionIds, incoming.id]))
+                : current.dirtySessionIds.filter((id) => id !== incoming.id);
+              storeRef.current = {
+                ...current,
+                sessions: { ...current.sessions, [incoming.id]: outcome.record },
+                baseSessions: { ...current.baseSessions, [incoming.id]: outcome.base },
+                dirtySessionIds: nextDirty,
+                conflicts: removeConflictByEntity(current.conflicts, 'session', incoming.id),
+              };
+            } else {
+              storeRef.current = {
+                ...current,
+                baseSessions: { ...current.baseSessions, [incoming.id]: outcome.base },
+                dirtySessionIds: current.dirtySessionIds.filter((id) => id !== incoming.id),
+                conflicts: upsertConflictItem(
+                  current.conflicts,
+                  buildSessionConflictItem(
+                    incoming.id,
+                    base,
+                    existing!,
+                    incoming,
+                    outcome.conflictingFields,
+                  ),
                 ),
               };
-              saveLocalSyncStore(activeUserId, storeRef.current);
-              refreshDerivedState();
             }
+
+            persistStoreAndNotifyTabs(activeUserId, storeRef.current);
+            setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
+            refreshDerivedState();
           },
         )
         .on(
@@ -316,19 +793,59 @@ export function useSyncedAttendanceData(
           { event: '*', schema: 'public', table: 'session_attendance' },
           (payload) => {
             if (userIdRef.current !== activeUserId) return;
+            const current = storeRef.current;
+
             if (payload.eventType === 'DELETE') {
               const oldRow = payload.old as { session_id?: string; member_id?: string } | null;
               if (!oldRow?.session_id || !oldRow?.member_id) return;
               const key = makeAttendanceKey(oldRow.session_id, oldRow.member_id);
-              if (!storeRef.current.attendance[key]) return;
-              const nextAttendance = { ...storeRef.current.attendance };
+              if (!current.attendance[key]) return;
+              const isDirty = current.dirtyAttendanceKeys.includes(key);
+              const isEditingThis = activeFieldEditsRef.current.has(`attendance:${key}`);
+              if (isDirty || isEditingThis) {
+                const deletedRemote: SyncedAttendanceRecord = {
+                  ...(current.baseAttendance[key] ?? current.attendance[key]),
+                  syncVersion: undefined,
+                  deletedAt: new Date().toISOString(),
+                };
+                const nextBaseAttendance = { ...current.baseAttendance };
+                delete nextBaseAttendance[key];
+                storeRef.current = {
+                  ...current,
+                  baseAttendance: nextBaseAttendance,
+                  dirtyAttendanceKeys: current.dirtyAttendanceKeys.filter((k) => k !== key),
+                  conflicts: upsertConflictItem(
+                    current.conflicts,
+                    buildAttendanceConflictItem(
+                      key,
+                      current.baseAttendance[key],
+                      current.attendance[key],
+                      deletedRemote,
+                      ['Deleted on Cloud'],
+                      {
+                        memberName: current.members[oldRow.member_id]?.name,
+                        sessionName: current.sessions[oldRow.session_id]?.name,
+                      },
+                    ),
+                  ),
+                };
+                persistStoreAndNotifyTabs(activeUserId, storeRef.current);
+                setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
+                refreshDerivedState();
+                return;
+              }
+
+              const nextAttendance = { ...current.attendance };
+              const nextBaseAttendance = { ...current.baseAttendance };
               delete nextAttendance[key];
+              delete nextBaseAttendance[key];
               storeRef.current = {
-                ...storeRef.current,
+                ...current,
                 attendance: nextAttendance,
-                dirtyAttendanceKeys: storeRef.current.dirtyAttendanceKeys.filter((k) => k !== key),
+                baseAttendance: nextBaseAttendance,
+                conflicts: removeConflictByEntity(current.conflicts, 'attendance', key),
               };
-              saveLocalSyncStore(activeUserId, storeRef.current);
+              persistStoreAndNotifyTabs(activeUserId, storeRef.current);
               refreshDerivedState();
               return;
             }
@@ -338,40 +855,239 @@ export function useSyncedAttendanceData(
               payload.new as Parameters<typeof attendanceFromDbRow>[0],
             );
             const key = makeAttendanceKey(incoming.sessionId, incoming.memberId);
-            const existing = storeRef.current.attendance[key];
-            const incomingTs = getEffectiveTimestamp(incoming.updatedAt, incoming.deletedAt);
-            const existingTs = existing
-              ? getEffectiveTimestamp(existing.updatedAt, existing.deletedAt)
-              : -1;
+            const existing = current.attendance[key];
+            const base = current.baseAttendance[key];
+            const isDirty = current.dirtyAttendanceKeys.includes(key);
+            const isEditingThis = activeFieldEditsRef.current.has(`attendance:${key}`);
 
-            if (incomingTs >= existingTs) {
-              storeRef.current = {
-                ...storeRef.current,
-                attendance: { ...storeRef.current.attendance, [key]: incoming },
-                dirtyAttendanceKeys: storeRef.current.dirtyAttendanceKeys.filter((k) => k !== key),
-              };
-              saveLocalSyncStore(activeUserId, storeRef.current);
-              refreshDerivedState();
+            if (
+              base?.syncVersion !== undefined &&
+              incoming.syncVersion !== undefined &&
+              incoming.syncVersion <= base.syncVersion &&
+              !isDirty
+            ) {
+              return;
             }
+
+            if (isEditingThis) {
+              // Keep user's focused absence-reason text intact without advancing `base`, so CAS
+              // still detects concurrent edits against the true ancestor version.
+              deferredAttendanceRealtimeRef.current.set(key, incoming);
+              return;
+            }
+
+            const outcome = reconcileIncomingEntity({
+              local: existing,
+              base,
+              remote: incoming,
+              isDirty,
+              fields: ATTENDANCE_MERGE_FIELDS,
+              normalizeMerged: normalizeMergedAttendance,
+            });
+
+            if (outcome.action === 'accept_remote') {
+              storeRef.current = {
+                ...current,
+                attendance: { ...current.attendance, [key]: outcome.record },
+                baseAttendance: { ...current.baseAttendance, [key]: outcome.base },
+                dirtyAttendanceKeys: current.dirtyAttendanceKeys.filter((k) => k !== key),
+                conflicts: removeConflictByEntity(current.conflicts, 'attendance', key),
+              };
+            } else if (outcome.action === 'keep_local' || outcome.action === 'merged') {
+              const nextDirty = outcome.needsPush
+                ? Array.from(new Set([...current.dirtyAttendanceKeys, key]))
+                : current.dirtyAttendanceKeys.filter((k) => k !== key);
+              storeRef.current = {
+                ...current,
+                attendance: { ...current.attendance, [key]: outcome.record },
+                baseAttendance: { ...current.baseAttendance, [key]: outcome.base },
+                dirtyAttendanceKeys: nextDirty,
+                conflicts: removeConflictByEntity(current.conflicts, 'attendance', key),
+              };
+            } else {
+              storeRef.current = {
+                ...current,
+                baseAttendance: { ...current.baseAttendance, [key]: outcome.base },
+                dirtyAttendanceKeys: current.dirtyAttendanceKeys.filter((k) => k !== key),
+                conflicts: upsertConflictItem(
+                  current.conflicts,
+                  buildAttendanceConflictItem(
+                    key,
+                    base,
+                    existing!,
+                    incoming,
+                    outcome.conflictingFields,
+                    {
+                      memberName: current.members[incoming.memberId]?.name,
+                      sessionName: current.sessions[incoming.sessionId]?.name,
+                    },
+                  ),
+                ),
+              };
+            }
+
+            persistStoreAndNotifyTabs(activeUserId, storeRef.current);
+            setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
+            refreshDerivedState();
           },
         )
-        .subscribe();
+        .subscribe((status) => {
+          if (!mountedRef.current || userIdRef.current !== activeUserId) return;
+          if (status === 'SUBSCRIBED') {
+            realtimeReconnectAttemptRef.current = 0;
+            clearRealtimeReconnectTimer();
+            setRealtimeStatus('connected');
+          } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+            if (realtimeChannelRef.current === channel) {
+              realtimeChannelRef.current = null;
+              void Promise.resolve(supabase.removeChannel(channel)).catch(() => {});
+            }
+            setRealtimeStatus('reconnecting');
+            if (realtimeReconnectTimerRef.current === null && !syncBlockedRef.current) {
+              const attempt = realtimeReconnectAttemptRef.current;
+              realtimeReconnectAttemptRef.current = Math.min(attempt + 1, 4);
+              const delayMs = Math.min(2_000 * 2 ** attempt, 20_000);
+              realtimeReconnectTimerRef.current = window.setTimeout(() => {
+                realtimeReconnectTimerRef.current = null;
+                if (mountedRef.current && userIdRef.current === activeUserId && !syncBlockedRef.current) {
+                  ensureRealtimeSubscription(activeUserId);
+                }
+              }, delayMs);
+            }
+          }
+        });
 
       realtimeChannelRef.current = channel;
     },
-    [refreshDerivedState],
+    [
+      clearRealtimeReconnectTimer,
+      persistStoreAndNotifyTabs,
+      refreshDerivedState,
+      resolveStatusFromStore,
+    ],
+  );
+
+  const mergeConcurrentEditsIntoResult = useCallback(
+    (
+      snapshotBefore: LocalSyncStore,
+      remoteResult: LocalSyncStore,
+      current: LocalSyncStore,
+      options?: { readOnlyPullOnly?: boolean },
+    ): { store: LocalSyncStore; hadConcurrentEdits: boolean } => {
+      const hasActiveEdits = activeFieldEditsRef.current.size > 0;
+      if (options?.readOnlyPullOnly || (current === snapshotBefore && !hasActiveEdits)) {
+        return { store: remoteResult, hadConcurrentEdits: false };
+      }
+
+      const nextMembers = { ...remoteResult.members };
+      const nextBaseMembers = { ...remoteResult.baseMembers };
+      const nextDirtyMembers = new Set(remoteResult.dirtyMemberIds);
+      let hadConcurrentEdits = false;
+
+      if (current !== snapshotBefore) {
+        for (const id of current.dirtyMemberIds) {
+          const curRec = current.members[id];
+          const snapRec = snapshotBefore.members[id];
+          const isEditingThis = activeFieldEditsRef.current.has(`member:${id}`);
+          if (curRec && (curRec !== snapRec || isEditingThis)) {
+            nextMembers[id] = curRec;
+            nextDirtyMembers.add(id);
+            hadConcurrentEdits = true;
+          }
+        }
+      }
+
+      const nextSessions = { ...remoteResult.sessions };
+      const nextDirtySessions = new Set(remoteResult.dirtySessionIds);
+      if (current !== snapshotBefore) {
+        for (const id of current.dirtySessionIds) {
+          const curRec = current.sessions[id];
+          const snapRec = snapshotBefore.sessions[id];
+          if (curRec && curRec !== snapRec) {
+            nextSessions[id] = curRec;
+            nextDirtySessions.add(id);
+            hadConcurrentEdits = true;
+          }
+        }
+      }
+
+      const nextAttendance = { ...remoteResult.attendance };
+      const nextBaseAttendance = { ...remoteResult.baseAttendance };
+      const nextDirtyAttendance = new Set(remoteResult.dirtyAttendanceKeys);
+      if (current !== snapshotBefore) {
+        for (const key of current.dirtyAttendanceKeys) {
+          const curRec = current.attendance[key];
+          const snapRec = snapshotBefore.attendance[key];
+          const isEditingThis = activeFieldEditsRef.current.has(`attendance:${key}`);
+          if (curRec && (curRec !== snapRec || isEditingThis)) {
+            nextAttendance[key] = curRec;
+            nextDirtyAttendance.add(key);
+            hadConcurrentEdits = true;
+          }
+        }
+      }
+
+      for (const editKey of activeFieldEditsRef.current) {
+        if (editKey.startsWith('attendance:')) {
+          const attKey = editKey.slice('attendance:'.length);
+          if (current.attendance[attKey]) {
+            if (remoteResult.attendance[attKey]) {
+              deferredAttendanceRealtimeRef.current.set(attKey, remoteResult.attendance[attKey]);
+            }
+            nextAttendance[attKey] = current.attendance[attKey];
+            if (snapshotBefore.baseAttendance[attKey]) {
+              nextBaseAttendance[attKey] = snapshotBefore.baseAttendance[attKey];
+            } else {
+              delete nextBaseAttendance[attKey];
+            }
+          }
+        } else if (editKey.startsWith('member:')) {
+          const memberId = editKey.slice('member:'.length);
+          if (current.members[memberId]) {
+            if (remoteResult.members[memberId]) {
+              deferredMemberRealtimeRef.current.set(memberId, remoteResult.members[memberId]);
+            }
+            nextMembers[memberId] = current.members[memberId];
+            if (snapshotBefore.baseMembers[memberId]) {
+              nextBaseMembers[memberId] = snapshotBefore.baseMembers[memberId];
+            } else {
+              delete nextBaseMembers[memberId];
+            }
+          }
+        }
+      }
+
+      return {
+        store: {
+          ...remoteResult,
+          members: nextMembers,
+          sessions: nextSessions,
+          attendance: nextAttendance,
+          baseMembers: nextBaseMembers,
+          baseAttendance: nextBaseAttendance,
+          dirtyMemberIds: Array.from(nextDirtyMembers),
+          dirtySessionIds: Array.from(nextDirtySessions),
+          dirtyAttendanceKeys: Array.from(nextDirtyAttendance),
+        },
+        hadConcurrentEdits,
+      };
+    },
+    [],
   );
 
   const flushDirtyQueue = useCallback(async (): Promise<boolean> => {
     const activeUserId = userIdRef.current;
     if (!activeUserId) return true;
+    if (isReadOnlyCloudRef.current) {
+      return true;
+    }
 
     clearDebounceTimer();
     clearChangeSyncTimer();
 
     if (syncBlockedRef.current) {
       if (mountedRef.current) {
-        setSyncStatus(hasDirtySyncItems(storeRef.current) ? 'pending' : 'error');
+        setSyncStatus(resolveStatusFromStore(storeRef.current, 'error'));
         refreshDerivedState();
       }
       return false;
@@ -380,7 +1096,7 @@ export function useSyncedAttendanceData(
     if (!hasDirtySyncItems(storeRef.current)) {
       ensureRealtimeSubscription(activeUserId);
       if (mountedRef.current) {
-        setSyncStatus('synced');
+        setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
         setSyncError(null);
         refreshDerivedState();
       }
@@ -400,82 +1116,70 @@ export function useSyncedAttendanceData(
     }
 
     try {
-      const snapshotToPush = storeRef.current;
-      const pushed = await pushDirtyQueueToSupabase(activeUserId, snapshotToPush);
+      let hadConcurrentLocalEdits = false;
+      let madeDirtyProgress = false;
+
+      const pushed = await withTabPushLease(activeUserId, async () => {
+        // Re-read store inside the lease so we push the latest cross-tab state.
+        const snapshotToPush = storeRef.current;
+        const snapshotDirtyCount = countDirtySyncItems(snapshotToPush);
+        const result = await pushDirtyQueueToSupabase(activeUserId, snapshotToPush, {
+          onPartialProgress: (partialStore) => {
+            if (userIdRef.current !== activeUserId) return;
+            const mergedPartial = mergeConcurrentEditsIntoResult(
+              snapshotToPush,
+              partialStore,
+              storeRef.current,
+            );
+            storeRef.current = mergedPartial.store;
+            persistStoreAndNotifyTabs(activeUserId, mergedPartial.store);
+          },
+        });
+
+        if (userIdRef.current !== activeUserId) {
+          return result;
+        }
+
+        const merged = mergeConcurrentEditsIntoResult(snapshotToPush, result, storeRef.current);
+        hadConcurrentLocalEdits = merged.hadConcurrentEdits;
+        madeDirtyProgress = countDirtySyncItems(result) < snapshotDirtyCount;
+        storeRef.current = merged.store;
+        persistStoreAndNotifyTabs(activeUserId, storeRef.current);
+
+        return storeRef.current;
+      });
 
       if (userIdRef.current !== activeUserId) {
         syncInFlightRef.current = false;
         return false;
       }
 
-      // Preserve any newer mutations that occurred while push was in flight.
-      if (storeRef.current === snapshotToPush) {
-        storeRef.current = pushed;
-      } else {
-        const pushedMembers = new Set(snapshotToPush.dirtyMemberIds);
-        const pushedSessions = new Set(snapshotToPush.dirtySessionIds);
-        const pushedAttendance = new Set(snapshotToPush.dirtyAttendanceKeys);
-
-        storeRef.current = {
-          ...storeRef.current,
-          dirtyMemberIds: storeRef.current.dirtyMemberIds.filter((id) => {
-            if (!pushedMembers.has(id)) return true;
-            return (
-              getEffectiveTimestamp(
-                storeRef.current.members[id]?.updatedAt,
-                storeRef.current.members[id]?.deletedAt,
-              ) >
-              getEffectiveTimestamp(
-                snapshotToPush.members[id]?.updatedAt,
-                snapshotToPush.members[id]?.deletedAt,
-              )
-            );
-          }),
-          dirtySessionIds: storeRef.current.dirtySessionIds.filter((id) => {
-            if (!pushedSessions.has(id)) return true;
-            return (
-              getEffectiveTimestamp(
-                storeRef.current.sessions[id]?.updatedAt,
-                storeRef.current.sessions[id]?.deletedAt,
-              ) >
-              getEffectiveTimestamp(
-                snapshotToPush.sessions[id]?.updatedAt,
-                snapshotToPush.sessions[id]?.deletedAt,
-              )
-            );
-          }),
-          dirtyAttendanceKeys: storeRef.current.dirtyAttendanceKeys.filter((key) => {
-            if (!pushedAttendance.has(key)) return true;
-            return (
-              getEffectiveTimestamp(
-                storeRef.current.attendance[key]?.updatedAt,
-                storeRef.current.attendance[key]?.deletedAt,
-              ) >
-              getEffectiveTimestamp(
-                snapshotToPush.attendance[key]?.updatedAt,
-                snapshotToPush.attendance[key]?.deletedAt,
-              )
-            );
-          }),
-        };
-        saveLocalSyncStore(activeUserId, storeRef.current);
-      }
-
+      persistStoreAndNotifyTabs(activeUserId, pushed);
       syncInFlightRef.current = false;
       syncBlockedRef.current = false;
       ensureRealtimeSubscription(activeUserId);
 
-      if (needsFollowUpFlushRef.current || hasDirtySyncItems(storeRef.current)) {
+      if (needsFollowUpReconcileRef.current) {
+        needsFollowUpReconcileRef.current = false;
+        needsFollowUpFlushRef.current = false;
+        return await reconcileNowRef.current();
+      }
+
+      if (
+        needsFollowUpFlushRef.current ||
+        hadConcurrentLocalEdits ||
+        (hasDirtySyncItems(storeRef.current) && madeDirtyProgress)
+      ) {
         needsFollowUpFlushRef.current = false;
         return await flushDirtyQueue();
       }
 
       if (mountedRef.current) {
-        setSyncStatus('synced');
+        setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
         setSyncError(null);
         refreshDerivedState();
       }
-      return true;
+      return !hasSyncConflicts(storeRef.current);
     } catch (error) {
       if (userIdRef.current !== activeUserId) {
         syncInFlightRef.current = false;
@@ -483,6 +1187,7 @@ export function useSyncedAttendanceData(
       }
       syncInFlightRef.current = false;
       needsFollowUpFlushRef.current = false;
+      needsFollowUpReconcileRef.current = false;
       const syncErr = toSupabaseSyncError(error, 'Unable to sync changes with Supabase.');
       if (isBlockingSyncError(syncErr)) {
         syncBlockedRef.current = true;
@@ -494,7 +1199,15 @@ export function useSyncedAttendanceData(
       }
       return false;
     }
-  }, [clearChangeSyncTimer, clearDebounceTimer, ensureRealtimeSubscription, refreshDerivedState]);
+  }, [
+    clearChangeSyncTimer,
+    clearDebounceTimer,
+    ensureRealtimeSubscription,
+    mergeConcurrentEditsIntoResult,
+    persistStoreAndNotifyTabs,
+    refreshDerivedState,
+    resolveStatusFromStore,
+  ]);
 
   const scheduleChangeSync = useCallback(() => {
     const activeUserId = userIdRef.current;
@@ -523,14 +1236,18 @@ export function useSyncedAttendanceData(
     }, remainingMs);
   }, [clearChangeSyncTimer, flushDirtyQueue]);
 
+  const reconcileNowRef = useRef<(options?: { background?: boolean }) => Promise<boolean>>(
+    async () => false,
+  );
+
   const reconcileNow = useCallback(
     async (options?: { background?: boolean }): Promise<boolean> => {
       const activeUserId = userIdRef.current;
-      if (!activeUserId || syncBlockedRef.current) return false;
+      if (!activeUserId || syncBlockedRef.current || isAuthResolvingRef.current) return false;
 
       if (syncInFlightRef.current) {
         if (!options?.background) {
-          needsFollowUpFlushRef.current = true;
+          needsFollowUpReconcileRef.current = true;
         }
         return false;
       }
@@ -543,75 +1260,44 @@ export function useSyncedAttendanceData(
       }
 
       try {
-        const merged = await reconcileWithSupabase(activeUserId, storeRef.current);
+        const readOnlyPullOnly = isReadOnlyCloudRef.current;
+        let hadConcurrentLocalEdits = false;
+
+        await withTabPushLease(activeUserId, async () => {
+          const snapshotBeforeReconcile = storeRef.current;
+          const merged = await reconcileWithSupabase(activeUserId, snapshotBeforeReconcile, {
+            readOnlyPullOnly,
+            onPartialProgress: (partialStore) => {
+              if (userIdRef.current !== activeUserId) return;
+              const mergedPartial = mergeConcurrentEditsIntoResult(
+                snapshotBeforeReconcile,
+                partialStore,
+                storeRef.current,
+                { readOnlyPullOnly },
+              );
+              storeRef.current = mergedPartial.store;
+              persistStoreAndNotifyTabs(activeUserId, mergedPartial.store);
+            },
+          });
+
+          if (userIdRef.current !== activeUserId) {
+            return;
+          }
+
+          const finalState = mergeConcurrentEditsIntoResult(
+            snapshotBeforeReconcile,
+            merged,
+            storeRef.current,
+            { readOnlyPullOnly },
+          );
+          hadConcurrentLocalEdits = finalState.hadConcurrentEdits;
+          storeRef.current = finalState.store;
+          persistStoreAndNotifyTabs(activeUserId, storeRef.current);
+        });
+
         if (userIdRef.current !== activeUserId) {
           syncInFlightRef.current = false;
           return false;
-        }
-
-        // If local mutations happened while reconciling, preserve newer local items over merged snapshot.
-        const current = storeRef.current;
-        if (hasDirtySyncItems(current)) {
-          const nextMembers = { ...merged.members };
-          const nextDirtyMembers = new Set<string>();
-          for (const id of current.dirtyMemberIds) {
-            const localRec = current.members[id];
-            const mergedRec = merged.members[id];
-            if (
-              localRec &&
-              (!mergedRec ||
-                getEffectiveTimestamp(localRec.updatedAt, localRec.deletedAt) >
-                  getEffectiveTimestamp(mergedRec.updatedAt, mergedRec.deletedAt))
-            ) {
-              nextMembers[id] = localRec;
-              nextDirtyMembers.add(id);
-            }
-          }
-
-          const nextSessions = { ...merged.sessions };
-          const nextDirtySessions = new Set<string>();
-          for (const id of current.dirtySessionIds) {
-            const localRec = current.sessions[id];
-            const mergedRec = merged.sessions[id];
-            if (
-              localRec &&
-              (!mergedRec ||
-                getEffectiveTimestamp(localRec.updatedAt, localRec.deletedAt) >
-                  getEffectiveTimestamp(mergedRec.updatedAt, mergedRec.deletedAt))
-            ) {
-              nextSessions[id] = localRec;
-              nextDirtySessions.add(id);
-            }
-          }
-
-          const nextAttendance = { ...merged.attendance };
-          const nextDirtyAttendance = new Set<string>();
-          for (const key of current.dirtyAttendanceKeys) {
-            const localRec = current.attendance[key];
-            const mergedRec = merged.attendance[key];
-            if (
-              localRec &&
-              (!mergedRec ||
-                getEffectiveTimestamp(localRec.updatedAt, localRec.deletedAt) >
-                  getEffectiveTimestamp(mergedRec.updatedAt, mergedRec.deletedAt))
-            ) {
-              nextAttendance[key] = localRec;
-              nextDirtyAttendance.add(key);
-            }
-          }
-
-          storeRef.current = {
-            members: nextMembers,
-            sessions: nextSessions,
-            attendance: nextAttendance,
-            dirtyMemberIds: Array.from(nextDirtyMembers),
-            dirtySessionIds: Array.from(nextDirtySessions),
-            dirtyAttendanceKeys: Array.from(nextDirtyAttendance),
-            legacyImported: true,
-          };
-          saveLocalSyncStore(activeUserId, storeRef.current);
-        } else {
-          storeRef.current = merged;
         }
 
         syncInFlightRef.current = false;
@@ -619,24 +1305,33 @@ export function useSyncedAttendanceData(
         ensureRealtimeSubscription(activeUserId);
 
         const hasActiveEditTimer =
-          debounceTimerRef.current !== null || changeSyncTimerRef.current !== null;
-        if (!hasActiveEditTimer) {
-          applyProgressionToCurrentStore(activeUserId);
+          debounceTimerRef.current !== null ||
+          changeSyncTimerRef.current !== null ||
+          activeFieldEditsRef.current.size > 0;
+        let didProgression = false;
+        if (!hasActiveEditTimer && !hasSyncConflicts(storeRef.current) && !isReadOnlyCloudRef.current) {
+          didProgression = applyProgressionToCurrentStore(activeUserId);
         }
 
-        if (!hasActiveEditTimer && (hasDirtySyncItems(storeRef.current) || needsFollowUpFlushRef.current)) {
+        if (needsFollowUpReconcileRef.current) {
+          needsFollowUpReconcileRef.current = false;
+          return await reconcileNow();
+        }
+
+        if (
+          !hasActiveEditTimer &&
+          (needsFollowUpFlushRef.current || hadConcurrentLocalEdits || didProgression)
+        ) {
           needsFollowUpFlushRef.current = false;
           return await flushDirtyQueue();
         }
 
         if (mountedRef.current) {
-          if (!hasActiveEditTimer) {
-            setSyncStatus('synced');
-            setSyncError(null);
-          }
+          setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
+          setSyncError(null);
           refreshDerivedState();
         }
-        return true;
+        return !hasSyncConflicts(storeRef.current);
       } catch (error) {
         if (userIdRef.current !== activeUserId) {
           syncInFlightRef.current = false;
@@ -644,6 +1339,7 @@ export function useSyncedAttendanceData(
         }
         syncInFlightRef.current = false;
         needsFollowUpFlushRef.current = false;
+        needsFollowUpReconcileRef.current = false;
         const syncErr = toSupabaseSyncError(error, 'Unable to reach Supabase database.');
         if (isBlockingSyncError(syncErr)) {
           syncBlockedRef.current = true;
@@ -655,7 +1351,194 @@ export function useSyncedAttendanceData(
         }
         return false;
       }
-  }, [applyProgressionToCurrentStore, ensureRealtimeSubscription, flushDirtyQueue, refreshDerivedState]);
+    },
+    [
+      applyProgressionToCurrentStore,
+      ensureRealtimeSubscription,
+      flushDirtyQueue,
+      mergeConcurrentEditsIntoResult,
+      persistStoreAndNotifyTabs,
+      refreshDerivedState,
+      resolveStatusFromStore,
+    ],
+  );
+
+  reconcileNowRef.current = reconcileNow;
+
+  const endFieldEdit = useCallback(
+    (fieldKey: string) => {
+      activeFieldEditsRef.current.delete(fieldKey);
+      setIsEditingActive(activeFieldEditsRef.current.size > 0);
+
+      const activeUserId = userIdRef.current;
+      if (activeUserId && fieldKey.startsWith('member:')) {
+        const memberId = fieldKey.slice('member:'.length);
+        const deferred = deferredMemberRealtimeRef.current.get(memberId);
+        if (deferred) {
+          deferredMemberRealtimeRef.current.delete(memberId);
+          const current = storeRef.current;
+          const isDirty = current.dirtyMemberIds.includes(memberId);
+          const existing = current.members[memberId];
+          const base = current.baseMembers[memberId];
+          const outcome = reconcileIncomingEntity({
+            local: existing,
+            base,
+            remote: deferred,
+            isDirty,
+            fields: MEMBER_MERGE_FIELDS,
+          });
+          if (outcome.action === 'accept_remote') {
+            storeRef.current = {
+              ...current,
+              members: { ...current.members, [memberId]: outcome.record },
+              baseMembers: { ...current.baseMembers, [memberId]: outcome.base },
+              dirtyMemberIds: current.dirtyMemberIds.filter((id) => id !== memberId),
+              conflicts: removeConflictByEntity(current.conflicts, 'member', memberId),
+            };
+          } else if (outcome.action === 'keep_local' || outcome.action === 'merged') {
+            const nextDirty = outcome.needsPush
+              ? Array.from(new Set([...current.dirtyMemberIds, memberId]))
+              : current.dirtyMemberIds.filter((id) => id !== memberId);
+            storeRef.current = {
+              ...current,
+              members: { ...current.members, [memberId]: outcome.record },
+              baseMembers: { ...current.baseMembers, [memberId]: outcome.base },
+              dirtyMemberIds: nextDirty,
+              conflicts: removeConflictByEntity(current.conflicts, 'member', memberId),
+            };
+          } else {
+            storeRef.current = {
+              ...current,
+              baseMembers: { ...current.baseMembers, [memberId]: outcome.base },
+              dirtyMemberIds: current.dirtyMemberIds.filter((id) => id !== memberId),
+              conflicts: upsertConflictItem(
+                current.conflicts,
+                buildMemberConflictItem(
+                  memberId,
+                  base,
+                  existing!,
+                  deferred,
+                  outcome.conflictingFields,
+                ),
+              ),
+            };
+          }
+          persistStoreAndNotifyTabs(activeUserId, storeRef.current);
+          setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
+        }
+      } else if (activeUserId && fieldKey.startsWith('attendance:')) {
+        const attKey = fieldKey.slice('attendance:'.length);
+        const deferred = deferredAttendanceRealtimeRef.current.get(attKey);
+        if (deferred) {
+          deferredAttendanceRealtimeRef.current.delete(attKey);
+          const current = storeRef.current;
+          const isDirty = current.dirtyAttendanceKeys.includes(attKey);
+          const existing = current.attendance[attKey];
+          const base = current.baseAttendance[attKey];
+          const outcome = reconcileIncomingEntity({
+            local: existing,
+            base,
+            remote: deferred,
+            isDirty,
+            fields: ATTENDANCE_MERGE_FIELDS,
+            normalizeMerged: normalizeMergedAttendance,
+          });
+          if (outcome.action === 'accept_remote') {
+            storeRef.current = {
+              ...current,
+              attendance: { ...current.attendance, [attKey]: outcome.record },
+              baseAttendance: { ...current.baseAttendance, [attKey]: outcome.base },
+              dirtyAttendanceKeys: current.dirtyAttendanceKeys.filter((k) => k !== attKey),
+              conflicts: removeConflictByEntity(current.conflicts, 'attendance', attKey),
+            };
+          } else if (outcome.action === 'keep_local' || outcome.action === 'merged') {
+            const nextDirty = outcome.needsPush
+              ? Array.from(new Set([...current.dirtyAttendanceKeys, attKey]))
+              : current.dirtyAttendanceKeys.filter((k) => k !== attKey);
+            storeRef.current = {
+              ...current,
+              attendance: { ...current.attendance, [attKey]: outcome.record },
+              baseAttendance: { ...current.baseAttendance, [attKey]: outcome.base },
+              dirtyAttendanceKeys: nextDirty,
+              conflicts: removeConflictByEntity(current.conflicts, 'attendance', attKey),
+            };
+          } else {
+            storeRef.current = {
+              ...current,
+              baseAttendance: { ...current.baseAttendance, [attKey]: outcome.base },
+              dirtyAttendanceKeys: current.dirtyAttendanceKeys.filter((k) => k !== attKey),
+              conflicts: upsertConflictItem(
+                current.conflicts,
+                buildAttendanceConflictItem(
+                  attKey,
+                  base,
+                  existing!,
+                  deferred,
+                  outcome.conflictingFields,
+                  {
+                    memberName: current.members[deferred.memberId]?.name,
+                    sessionName: current.sessions[deferred.sessionId]?.name,
+                  },
+                ),
+              ),
+            };
+          }
+          persistStoreAndNotifyTabs(activeUserId, storeRef.current);
+          setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
+        }
+      }
+
+      refreshDerivedState();
+      if (
+        userIdRef.current &&
+        activeFieldEditsRef.current.size === 0 &&
+        hasDirtySyncItems(storeRef.current) &&
+        debounceTimerRef.current === null
+      ) {
+        scheduleChangeSync();
+      }
+    },
+    [persistStoreAndNotifyTabs, refreshDerivedState, resolveStatusFromStore, scheduleChangeSync],
+  );
+
+  const resolveConflict = useCallback(
+    async (conflictId: string, resolution: SyncConflictResolution) => {
+      const activeUserId = userIdRef.current;
+      const nextStore = applyConflictResolutionToStore(storeRef.current, conflictId, resolution);
+      if (nextStore === storeRef.current) return;
+
+      storeRef.current = nextStore;
+      persistStoreAndNotifyTabs(activeUserId, nextStore);
+      setSyncStatus(resolveStatusFromStore(nextStore, 'synced'));
+      refreshDerivedState();
+
+      if (activeUserId && hasDirtySyncItems(nextStore) && !syncBlockedRef.current) {
+        await flushDirtyQueue();
+      }
+    },
+    [flushDirtyQueue, persistStoreAndNotifyTabs, refreshDerivedState, resolveStatusFromStore],
+  );
+
+  const resolveAllConflicts = useCallback(
+    async (resolution: SyncConflictResolution) => {
+      const activeUserId = userIdRef.current;
+      let nextStore = storeRef.current;
+      for (const conflict of storeRef.current.conflicts) {
+        nextStore = applyConflictResolutionToStore(nextStore, conflict.id, resolution);
+      }
+      if (nextStore === storeRef.current) return;
+
+      storeRef.current = nextStore;
+      persistStoreAndNotifyTabs(activeUserId, nextStore);
+      setSyncStatus(resolveStatusFromStore(nextStore, 'synced'));
+      refreshDerivedState();
+
+      if (activeUserId && hasDirtySyncItems(nextStore) && !syncBlockedRef.current) {
+        await flushDirtyQueue();
+      }
+    },
+    [flushDirtyQueue, persistStoreAndNotifyTabs, refreshDerivedState, resolveStatusFromStore],
+  );
 
   const retrySync = useCallback(async (): Promise<boolean> => {
     if (!userIdRef.current) return true;
@@ -671,8 +1554,37 @@ export function useSyncedAttendanceData(
     syncBlockedRef.current = false;
     undoStackRef.current = [];
     lastUndoTokenRef.current = null;
+    activeFieldEditsRef.current.clear();
+    deferredMemberRealtimeRef.current.clear();
+    deferredAttendanceRealtimeRef.current.clear();
+    setIsEditingActive(false);
     cleanupRealtimeSubscription();
     clearBackgroundInterval();
+
+    if (broadcastChannelRef.current) {
+      broadcastChannelRef.current.close();
+      broadcastChannelRef.current = null;
+    }
+
+    const channelName = userId ? `team-spirit-sync-bc:${userId}` : 'team-spirit-sync-bc:local';
+    if (typeof BroadcastChannel !== 'undefined') {
+      try {
+        const bc = new BroadcastChannel(channelName);
+        bc.onmessage = (event: MessageEvent<{ type?: string; senderTabId?: string }>) => {
+          if (!mountedRef.current) return;
+          if (event.data?.senderTabId === getClientTabId()) return;
+          if (event.data?.type === 'store-updated') {
+            const latest = userIdRef.current
+              ? loadLocalSyncStore(userIdRef.current)
+              : loadLocalOnlyStore();
+            mergeSiblingStoreIntoCurrent(userIdRef.current, latest);
+          }
+        };
+        broadcastChannelRef.current = bc;
+      } catch {
+        broadcastChannelRef.current = null;
+      }
+    }
 
     if (!userId) {
       clearDebounceTimer();
@@ -680,6 +1592,7 @@ export function useSyncedAttendanceData(
       lastChangeSyncAtRef.current = 0;
       syncInFlightRef.current = false;
       needsFollowUpFlushRef.current = false;
+      needsFollowUpReconcileRef.current = false;
       storeRef.current = loadLocalOnlyStore();
       applyProgressionToCurrentStore(null);
       setSyncStatus('local');
@@ -688,9 +1601,8 @@ export function useSyncedAttendanceData(
 
       function handleLocalStorageChange(event: StorageEvent) {
         if (event.key === LOCAL_ONLY_STORE_KEY && !userIdRef.current) {
-          storeRef.current = loadLocalOnlyStore();
+          mergeSiblingStoreIntoCurrent(null, loadLocalOnlyStore());
           applyProgressionToCurrentStore(null);
-          refreshDerivedState();
         }
       }
 
@@ -716,22 +1628,44 @@ export function useSyncedAttendanceData(
         clearBackgroundInterval();
         clearChangeSyncTimer();
         clearDebounceTimer();
+        broadcastChannelRef.current?.close();
+        broadcastChannelRef.current = null;
         window.removeEventListener('storage', handleLocalStorageChange);
         document.removeEventListener('visibilitychange', handleLocalVisibilityOrInterval);
       };
     }
 
-    const shouldMergeLocal = mergeLocalOnNextConnectRef.current;
+    const connectedUserId = userId;
+    if (isAuthResolving) {
+      storeRef.current = loadLocalSyncStore(connectedUserId);
+      setSyncStatus('loading');
+      setSyncError(null);
+      refreshDerivedState();
+      return () => {
+        mountedRef.current = false;
+        broadcastChannelRef.current?.close();
+        broadcastChannelRef.current = null;
+      };
+    }
+
+    const shouldMergeLocal = mergeLocalOnNextConnectRef.current && !isReadOnlyCloud;
     mergeLocalOnNextConnectRef.current = false;
 
     const initialStore = shouldMergeLocal
-      ? mergeLocalOnlyIntoUserStore(userId, loadLocalOnlyStore())
-      : loadLocalSyncStore(userId);
+      ? mergeLocalOnlyIntoUserStore(connectedUserId, loadLocalOnlyStore())
+      : loadLocalSyncStore(connectedUserId);
     storeRef.current = initialStore;
     setSyncStatus('loading');
     setSyncError(null);
     refreshDerivedState();
     void reconcileNow();
+
+    const userStoreKey = getSyncStoreKey(connectedUserId);
+    function handleCloudStorageChange(event: StorageEvent) {
+      if (event.key === userStoreKey && userIdRef.current === connectedUserId) {
+        mergeSiblingStoreIntoCurrent(connectedUserId, loadLocalSyncStore(connectedUserId));
+      }
+    }
 
     backgroundIntervalRef.current = window.setInterval(() => {
       if (!mountedRef.current || userIdRef.current !== userId) return;
@@ -740,7 +1674,8 @@ export function useSyncedAttendanceData(
       if (
         syncInFlightRef.current ||
         debounceTimerRef.current !== null ||
-        changeSyncTimerRef.current !== null
+        changeSyncTimerRef.current !== null ||
+        activeFieldEditsRef.current.size > 0
       ) {
         return;
       }
@@ -759,6 +1694,7 @@ export function useSyncedAttendanceData(
       }
     }
 
+    window.addEventListener('storage', handleCloudStorageChange);
     window.addEventListener('online', handleOnline);
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
@@ -769,6 +1705,9 @@ export function useSyncedAttendanceData(
       clearChangeSyncTimer();
       clearDebounceTimer();
       lastChangeSyncAtRef.current = 0;
+      broadcastChannelRef.current?.close();
+      broadcastChannelRef.current = null;
+      window.removeEventListener('storage', handleCloudStorageChange);
       window.removeEventListener('online', handleOnline);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       cleanupRealtimeSubscription();
@@ -779,10 +1718,24 @@ export function useSyncedAttendanceData(
     clearBackgroundInterval,
     clearChangeSyncTimer,
     clearDebounceTimer,
+    isAuthResolving,
+    isReadOnlyCloud,
+    mergeSiblingStoreIntoCurrent,
     reconcileNow,
     refreshDerivedState,
     userId,
   ]);
+
+  // Re-pull visible cloud records when role or global Member Visibility permissions change,
+  // without tearing down Realtime, pending sync timers, active field edits, or undo history.
+  useEffect(() => {
+    const prevScope = prevScopeVersionKeyRef.current;
+    prevScopeVersionKeyRef.current = scopeVersionKey;
+    if (!userId || isAuthResolving || prevScope === scopeVersionKey) {
+      return;
+    }
+    void reconcileNow();
+  }, [isAuthResolving, reconcileNow, scopeVersionKey, userId]);
 
   // Warn only when closing/reloading while unsaved/unsynced changes exist (Google Docs behavior).
   useEffect(() => {
@@ -817,7 +1770,7 @@ export function useSyncedAttendanceData(
         const token = generateId('undo');
         undoStackRef.current = [
           ...undoStackRef.current.slice(-14),
-          { token, snapshot: prevStore },
+          { token, delta: buildUndoDelta(prevStore, nextStore) },
         ];
         lastUndoTokenRef.current = token;
       }
@@ -825,17 +1778,24 @@ export function useSyncedAttendanceData(
       storeRef.current = nextStore;
 
       if (!activeUserId) {
-        saveLocalOnlyStore(nextStore);
+        persistStoreAndNotifyTabs(null, nextStore);
         refreshDerivedState();
         return;
       }
 
-      saveLocalSyncStore(activeUserId, nextStore);
+      if (isReadOnlyCloudRef.current) {
+        // Read-only cloud users cannot mutate shared club records; revert optimistic mutation.
+        storeRef.current = prevStore;
+        refreshDerivedState();
+        return;
+      }
+
+      persistStoreAndNotifyTabs(activeUserId, nextStore);
 
       if (syncBlockedRef.current) {
         clearDebounceTimer();
         clearChangeSyncTimer();
-        setSyncStatus(hasDirtySyncItems(nextStore) ? 'pending' : 'error');
+        setSyncStatus(resolveStatusFromStore(nextStore, 'error'));
         refreshDerivedState();
         return;
       }
@@ -854,7 +1814,14 @@ export function useSyncedAttendanceData(
         refreshDerivedState();
       }
     },
-    [clearChangeSyncTimer, clearDebounceTimer, refreshDerivedState, scheduleChangeSync],
+    [
+      clearChangeSyncTimer,
+      clearDebounceTimer,
+      persistStoreAndNotifyTabs,
+      refreshDerivedState,
+      resolveStatusFromStore,
+      scheduleChangeSync,
+    ],
   );
 
   const createSession = useCallback(
@@ -985,6 +1952,39 @@ export function useSyncedAttendanceData(
     [mutateStore],
   );
 
+  const addMembersBulk = useCallback(
+    (inputs: MemberProfileInput[]): ClubMember[] => {
+      if (inputs.length === 0) return [];
+
+      const createdMembers = inputs.map((input) => buildClubMember(input));
+      mutateStore(
+        (prev) => {
+          const nextMembers = { ...prev.members };
+          const dirtyMembers = new Set(prev.dirtyMemberIds);
+
+          for (const created of createdMembers) {
+            nextMembers[created.id] = {
+              ...created,
+              updatedAt: created.updatedAt ?? created.createdAt,
+              deletedAt: null,
+            };
+            dirtyMembers.add(created.id);
+          }
+
+          return {
+            ...prev,
+            members: nextMembers,
+            dirtyMemberIds: Array.from(dirtyMembers),
+          };
+        },
+        { recordUndo: true },
+      );
+
+      return createdMembers;
+    },
+    [mutateStore],
+  );
+
   const updateMember = useCallback(
     (memberId: string, input: MemberProfileInput) => {
       mutateStore(
@@ -1010,36 +2010,217 @@ export function useSyncedAttendanceData(
     [mutateStore],
   );
 
-  const setMemberLegacyStatus = useCallback(
-    (memberId: string, isLegacy: boolean) => {
+  const updateMembersClass = useCallback(
+    (
+      memberIds: string[],
+      patch: { classYear?: ClassYear; classLetter?: ClassLetter },
+    ): number => {
+      if (memberIds.length === 0 || (!patch.classYear && !patch.classLetter)) {
+        return 0;
+      }
+
+      const targetIds = new Set(memberIds);
+      const cycleYear = getPromotionCycleYear(new Date());
+      const isSettingNa = patch.classLetter === 'N/A';
+      let updatedCount = 0;
+
       mutateStore(
         (prev, now) => {
-          const existing = prev.members[memberId];
-          if (!existing || existing.deletedAt) return prev;
-          if (Boolean(existing.isLegacy) === isLegacy) return prev;
+          const nextMembers = { ...prev.members };
+          const dirtyMembers = new Set(prev.dirtyMemberIds);
+          let changed = false;
 
-          const record: SyncedMemberRecord = {
-            ...existing,
-            isLegacy,
-            retiredAt: isLegacy ? (existing.retiredAt ?? now) : undefined,
-            graduationYear: isLegacy ? existing.graduationYear : undefined,
-            lastPromotedYear: isLegacy
-              ? existing.lastPromotedYear
-              : getPromotionCycleYear(new Date()),
-            updatedAt: now,
-            deletedAt: null,
-          };
+          for (const id of targetIds) {
+            const existing = nextMembers[id];
+            if (!existing || existing.deletedAt) continue;
+
+            const memberType = normalizeMemberType(existing.memberType);
+
+            if (isSettingNa) {
+              if (
+                existing.classYear === undefined &&
+                existing.classLetter === 'N/A' &&
+                existing.className === 'N/A'
+              ) {
+                continue;
+              }
+              nextMembers[id] = {
+                ...existing,
+                memberType,
+                classYear: undefined,
+                classLetter: 'N/A',
+                className: 'N/A',
+                updatedAt: now,
+                deletedAt: null,
+              };
+              dirtyMembers.add(id);
+              updatedCount += 1;
+              changed = true;
+              continue;
+            }
+
+            if (memberType !== 'student') continue;
+
+            const resolved = resolveStudentClassFields({
+              memberType,
+              classYear: existing.classYear,
+              classLetter: existing.classLetter,
+              className: existing.className,
+            });
+
+            const existingStandardLetter =
+              resolved.classLetter && resolved.classLetter !== 'N/A'
+                ? resolved.classLetter
+                : undefined;
+            const nextYear = patch.classYear ?? resolved.classYear;
+            const nextLetter = patch.classLetter ?? existingStandardLetter;
+            if (!nextYear || !nextLetter || nextLetter === 'N/A') continue;
+
+            const nextClassName = formatStudentClassName(nextYear, nextLetter);
+            if (
+              existing.classYear === nextYear &&
+              existing.classLetter === nextLetter &&
+              existing.className === nextClassName
+            ) {
+              continue;
+            }
+
+            const yearChanged = nextYear !== resolved.classYear;
+            nextMembers[id] = {
+              ...existing,
+              memberType,
+              classYear: nextYear,
+              classLetter: nextLetter,
+              className: nextClassName,
+              lastPromotedYear: yearChanged ? cycleYear : existing.lastPromotedYear,
+              updatedAt: now,
+              deletedAt: null,
+            };
+            dirtyMembers.add(id);
+            updatedCount += 1;
+            changed = true;
+          }
+
+          if (!changed) return prev;
 
           return {
             ...prev,
-            members: { ...prev.members, [memberId]: record },
-            dirtyMemberIds: Array.from(new Set([...prev.dirtyMemberIds, memberId])),
+            members: nextMembers,
+            dirtyMemberIds: Array.from(dirtyMembers),
           };
         },
         { recordUndo: true },
       );
+
+      return updatedCount;
     },
     [mutateStore],
+  );
+
+  const setMembersLegacyStatus = useCallback(
+    (
+      memberIds: string[],
+      isLegacy: boolean,
+      options?: { fallbackClassYear?: ClassYear; fallbackClassLetter?: ClassLetter },
+    ): number => {
+      if (memberIds.length === 0) return 0;
+
+      const targetIds = new Set(memberIds);
+      const cycleYear = getPromotionCycleYear(new Date());
+      let updatedCount = 0;
+
+      mutateStore(
+        (prev, now) => {
+          const nextMembers = { ...prev.members };
+          const dirtyMembers = new Set(prev.dirtyMemberIds);
+          let changed = false;
+
+          for (const id of targetIds) {
+            const existing = nextMembers[id];
+            if (!existing || existing.deletedAt) continue;
+            if (Boolean(existing.isLegacy) === isLegacy) continue;
+
+            let classFields: Pick<SyncedMemberRecord, 'classYear' | 'classLetter' | 'className'> = {
+              classYear: existing.classYear,
+              classLetter: existing.classLetter,
+              className: existing.className,
+            };
+
+            if (!isLegacy) {
+              const memberType = normalizeMemberType(existing.memberType);
+              if (memberType === 'student') {
+                const resolved = resolveStudentClassFields({
+                  memberType,
+                  classYear: existing.classYear,
+                  classLetter: existing.classLetter,
+                  className: existing.className,
+                });
+                if (resolved.classLetter === 'N/A') {
+                  classFields = {
+                    classYear: undefined,
+                    classLetter: 'N/A',
+                    className: 'N/A',
+                  };
+                } else if (
+                  (!resolved.classYear || !resolved.classLetter) &&
+                  options?.fallbackClassLetter === 'N/A'
+                ) {
+                  classFields = {
+                    classYear: undefined,
+                    classLetter: 'N/A',
+                    className: 'N/A',
+                  };
+                } else {
+                  const nextYear = resolved.classYear ?? options?.fallbackClassYear;
+                  const nextLetter = resolved.classLetter ?? options?.fallbackClassLetter;
+                  if (!nextYear || !nextLetter || nextLetter === 'N/A') {
+                    continue;
+                  }
+                  classFields = {
+                    classYear: nextYear,
+                    classLetter: nextLetter,
+                    className: formatStudentClassName(nextYear, nextLetter),
+                  };
+                }
+              }
+            }
+
+            nextMembers[id] = {
+              ...existing,
+              ...classFields,
+              isLegacy,
+              retiredAt: isLegacy ? (existing.retiredAt ?? now) : undefined,
+              graduationYear: isLegacy ? existing.graduationYear : undefined,
+              lastPromotedYear: isLegacy ? existing.lastPromotedYear : cycleYear,
+              updatedAt: now,
+              deletedAt: null,
+            };
+            dirtyMembers.add(id);
+            updatedCount += 1;
+            changed = true;
+          }
+
+          if (!changed) return prev;
+
+          return {
+            ...prev,
+            members: nextMembers,
+            dirtyMemberIds: Array.from(dirtyMembers),
+          };
+        },
+        { recordUndo: true },
+      );
+
+      return updatedCount;
+    },
+    [mutateStore],
+  );
+
+  const setMemberLegacyStatus = useCallback(
+    (memberId: string, isLegacy: boolean) => {
+      setMembersLegacyStatus([memberId], isLegacy);
+    },
+    [setMembersLegacyStatus],
   );
 
   const deleteMembers = useCallback(
@@ -1437,23 +2618,22 @@ export function useSyncedAttendanceData(
 
       const entry = undoStackRef.current[idx];
       undoStackRef.current = undoStackRef.current.filter((item) => item.token !== token);
-      const target = entry.snapshot;
+      const { delta } = entry;
 
       mutateStore((current, now) => {
         const nextMembers = { ...current.members };
         const dirtyMembers = new Set(current.dirtyMemberIds);
-        const allMemberIds = new Set([
-          ...Object.keys(current.members),
-          ...Object.keys(target.members),
-        ]);
 
-        for (const id of allMemberIds) {
+        for (const [id, prev] of Object.entries(delta.members)) {
           const cur = current.members[id];
-          const prev = target.members[id];
-          if (prev && cur !== prev) {
-            nextMembers[id] = { ...prev, updatedAt: now };
+          if (prev) {
+            nextMembers[id] = {
+              ...prev,
+              syncVersion: cur?.syncVersion ?? prev.syncVersion,
+              updatedAt: now,
+            };
             dirtyMembers.add(id);
-          } else if (!prev && cur && !cur.deletedAt) {
+          } else if (cur && !cur.deletedAt) {
             nextMembers[id] = { ...cur, updatedAt: now, deletedAt: now };
             dirtyMembers.add(id);
           }
@@ -1461,18 +2641,17 @@ export function useSyncedAttendanceData(
 
         const nextSessions = { ...current.sessions };
         const dirtySessions = new Set(current.dirtySessionIds);
-        const allSessionIds = new Set([
-          ...Object.keys(current.sessions),
-          ...Object.keys(target.sessions),
-        ]);
 
-        for (const id of allSessionIds) {
+        for (const [id, prev] of Object.entries(delta.sessions)) {
           const cur = current.sessions[id];
-          const prev = target.sessions[id];
-          if (prev && cur !== prev) {
-            nextSessions[id] = { ...prev, updatedAt: now };
+          if (prev) {
+            nextSessions[id] = {
+              ...prev,
+              syncVersion: cur?.syncVersion ?? prev.syncVersion,
+              updatedAt: now,
+            };
             dirtySessions.add(id);
-          } else if (!prev && cur && !cur.deletedAt) {
+          } else if (cur && !cur.deletedAt) {
             nextSessions[id] = { ...cur, updatedAt: now, deletedAt: now };
             dirtySessions.add(id);
           }
@@ -1480,18 +2659,17 @@ export function useSyncedAttendanceData(
 
         const nextAttendance = { ...current.attendance };
         const dirtyAttendance = new Set(current.dirtyAttendanceKeys);
-        const allAttendanceKeys = new Set([
-          ...Object.keys(current.attendance),
-          ...Object.keys(target.attendance),
-        ]);
 
-        for (const key of allAttendanceKeys) {
+        for (const [key, prev] of Object.entries(delta.attendance)) {
           const cur = current.attendance[key];
-          const prev = target.attendance[key];
-          if (prev && cur !== prev) {
-            nextAttendance[key] = { ...prev, updatedAt: now };
+          if (prev) {
+            nextAttendance[key] = {
+              ...prev,
+              syncVersion: cur?.syncVersion ?? prev.syncVersion,
+              updatedAt: now,
+            };
             dirtyAttendance.add(key);
-          } else if (!prev && cur && !cur.deletedAt) {
+          } else if (cur && !cur.deletedAt) {
             nextAttendance[key] = { ...cur, updatedAt: now, deletedAt: now };
             dirtyAttendance.add(key);
           }
@@ -1519,7 +2697,7 @@ export function useSyncedAttendanceData(
 
     const flushed = await flushDirtyQueue();
     // Clear local sync cache on clean sign-out so signed-out browsers retain no club records.
-    if (flushed) {
+    if (flushed && !hasSyncConflicts(storeRef.current)) {
       clearLocalSyncStore(activeUserId);
     }
   }, [flushDirtyQueue]);
@@ -1528,14 +2706,25 @@ export function useSyncedAttendanceData(
     members,
     sessions,
     syncStatus,
+    realtimeStatus,
     syncError,
     pendingCount,
+    conflicts,
+    conflictCount: conflicts.length,
+    isEditingActive,
     hasUnsavedChanges,
+    beginFieldEdit,
+    endFieldEdit,
+    resolveConflict,
+    resolveAllConflicts,
     createSession,
     deleteSession,
     addMember,
+    addMembersBulk,
     updateMember,
+    updateMembersClass,
     setMemberLegacyStatus,
+    setMembersLegacyStatus,
     deleteMembers,
     assignMemberToSession,
     assignMembersToSession,

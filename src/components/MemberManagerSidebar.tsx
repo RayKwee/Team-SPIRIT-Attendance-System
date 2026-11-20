@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useId,
   useMemo,
@@ -6,8 +7,10 @@ import {
   useState,
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
 } from 'react';
 import type {
+  AccessScope,
   AttendanceSession,
   AttendanceStatus,
   ClassLetter,
@@ -31,7 +34,9 @@ import {
   getNextPromotionDateLabel,
   isLegacyMember,
   normalizeMemberType,
+  parseBulkMemberInput,
   resolveStudentClassFields,
+  sortMembersByRoleAndName,
   summarizeMemberAttendance,
   type MemberAttendanceStats,
 } from '../utils/attendance';
@@ -48,6 +53,7 @@ import {
   PixelArchiveIcon,
   PixelArrowLeftIcon,
   PixelCalendarIcon,
+  PixelCheckSquareIcon,
   PixelChevronIcon,
   PixelCloseIcon,
   PixelDownloadIcon,
@@ -70,24 +76,46 @@ interface MemberManagerSidebarProps {
   sessions: AttendanceSession[];
   selectedMemberId: string | null;
   confirmDeleteMember: boolean;
+  canManageClubRecords?: boolean;
+  accessScope?: AccessScope;
+  linkedMemberId?: string | null;
+  canBrowseFullRoster?: boolean;
+  canViewAttendanceRates?: boolean;
   onSelectMember: (memberId: string | null) => void;
   onClose: () => void;
   onAddMember: (input: MemberProfileInput) => ClubMember;
+  onAddMembersBulk: (inputs: MemberProfileInput[]) => ClubMember[];
   onUpdateMember: (memberId: string, input: MemberProfileInput) => void;
+  onUpdateMembersClass: (
+    memberIds: string[],
+    patch: { classYear?: ClassYear; classLetter?: ClassLetter },
+  ) => void;
   onSetMemberLegacyStatus: (memberId: string, isLegacy: boolean) => void;
+  onSetMembersLegacyStatus: (
+    memberIds: string[],
+    isLegacy: boolean,
+    options?: { fallbackClassYear?: ClassYear; fallbackClassLetter?: ClassLetter },
+  ) => void;
   onDeleteMember: (memberId: string) => void;
+  onDeleteMembers: (memberIds: string[]) => void;
+  onBeginFieldEdit?: (fieldKey: string) => void;
+  onEndFieldEdit?: (fieldKey: string) => void;
 }
 
-type SidebarViewMode = 'directory' | 'profile' | 'add' | 'edit';
+type SidebarViewMode = 'directory' | 'profile' | 'add' | 'edit' | 'bulk_add';
 type DirectoryScope = 'active' | 'legacy';
 
 const ROLE_SUGGESTIONS = [
+  'President',
+  'Vice President',
+  'Secretary',
+  'Lead',
   'Captain',
   'Vice Captain',
-  'Secretary',
   'Treasurer',
   'Coach',
   'Coordinator',
+  'Advisor',
   'Member',
 ];
 
@@ -168,7 +196,10 @@ function memberToFormValues(member: ClubMember, overrideIsLegacy?: boolean): Mem
     classLetter: member.classLetter,
     className: member.className,
   });
-  const hasStructuredClass = Boolean(resolvedClass.classYear && resolvedClass.classLetter);
+  const hasStructuredClass = Boolean(
+    resolvedClass.classLetter === 'N/A' ||
+      (resolvedClass.classYear && resolvedClass.classLetter),
+  );
 
   return {
     name: member.name,
@@ -397,12 +428,23 @@ export function MemberManagerSidebar({
   sessions,
   selectedMemberId,
   confirmDeleteMember,
+  canManageClubRecords = true,
+  accessScope = 'local',
+  linkedMemberId = null,
+  canBrowseFullRoster = true,
+  canViewAttendanceRates = true,
   onSelectMember,
   onClose,
   onAddMember,
+  onAddMembersBulk,
   onUpdateMember,
+  onUpdateMembersClass,
   onSetMemberLegacyStatus,
+  onSetMembersLegacyStatus,
   onDeleteMember,
+  onDeleteMembers,
+  onBeginFieldEdit,
+  onEndFieldEdit,
 }: MemberManagerSidebarProps) {
   const titleId = useId();
   const roleListId = useId();
@@ -410,6 +452,12 @@ export function MemberManagerSidebar({
   const memberTypeLabelId = useId();
   const classYearInputId = useId();
   const classLetterLabelId = useId();
+  const bulkTextareaId = useId();
+  const bulkClassYearInputId = useId();
+  const bulkClassLetterLabelId = useId();
+  const bulkRoleInputId = useId();
+  const bulkJoinedInputId = useId();
+  const bulkNotesInputId = useId();
   const roleInputId = useId();
   const joinedInputId = useId();
   const emailInputId = useId();
@@ -418,8 +466,23 @@ export function MemberManagerSidebar({
   const notesInputId = useId();
 
   const nameInputRef = useRef<HTMLInputElement | null>(null);
+  const roleInputRef = useRef<HTMLInputElement | null>(null);
   const classYearSelectRef = useRef<HTMLSelectElement | null>(null);
+  const bulkTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const bulkRoleInputRef = useRef<HTMLInputElement | null>(null);
+  const bulkClassYearSelectRef = useRef<HTMLSelectElement | null>(null);
   const exportMenuRef = useRef<HTMLDivElement | null>(null);
+  const selectAllCheckboxRef = useRef<HTMLInputElement | null>(null);
+  const lastAnchorIndexRef = useRef<number | null>(null);
+  const suppressNextRowClickRef = useRef(false);
+  const suppressResetTimerRef = useRef<number | null>(null);
+  const dragStateRef = useRef<{
+    active: boolean;
+    targetState: boolean;
+    startIndex: number;
+    initialSelection: Set<string>;
+    moved: boolean;
+  } | null>(null);
 
   const [viewMode, setViewMode] = useState<SidebarViewMode>(() =>
     selectedMemberId && members.some((member) => member.id === selectedMemberId)
@@ -432,36 +495,139 @@ export function MemberManagerSidebar({
   const [roleFilter, setRoleFilter] = useState('all');
   const [formValues, setFormValues] = useState<MemberFormValues>(emptyFormValues);
   const [editingTargetId, setEditingTargetId] = useState<string | null>(null);
+  const [editingBaselineMember, setEditingBaselineMember] = useState<ClubMember | null>(null);
   const [formError, setFormError] = useState('');
+  const [bulkText, setBulkText] = useState('');
+  const [bulkClassYear, setBulkClassYear] = useState<ClassYear | ''>('');
+  const [bulkClassLetter, setBulkClassLetter] = useState<ClassLetter | ''>('');
+  const [bulkRole, setBulkRole] = useState('');
+  const [bulkJoinedDate, setBulkJoinedDate] = useState('');
+  const [bulkNotes, setBulkNotes] = useState('');
+  const [bulkError, setBulkError] = useState('');
   const [absenceFilter, setAbsenceFilter] = useState<'reasons_only' | 'all'>('reasons_only');
   const [showAllAbsences, setShowAllAbsences] = useState(false);
   const [pendingDeleteMember, setPendingDeleteMember] = useState<ClubMember | null>(null);
+  const [pendingBulkDeleteIds, setPendingBulkDeleteIds] = useState<string[] | null>(null);
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [isDragSelecting, setIsDragSelecting] = useState(false);
+  const [bulkPanelMode, setBulkPanelMode] = useState<'none' | 'change_class' | 'restore_class'>(
+    'none',
+  );
+  const [bulkTargetYear, setBulkTargetYear] = useState<ClassYear | ''>('');
+  const [bulkTargetLetter, setBulkTargetLetter] = useState<ClassLetter | ''>('');
+  const [bulkActionError, setBulkActionError] = useState('');
+
+  const isRestrictedMemberAccount =
+    accessScope === 'member_self' || accessScope === 'member_unlinked';
+  const isSelfOnlyScope = !canBrowseFullRoster && accessScope === 'member_self';
+  const isUnlinkedMemberScope = !canBrowseFullRoster && accessScope === 'member_unlinked';
+  const canEditRoster =
+    canManageClubRecords && accessScope !== 'broad_viewer' && !isRestrictedMemberAccount;
+  const canViewPeerAttendanceStats =
+    accessScope === 'local' ||
+    accessScope === 'admin' ||
+    accessScope === 'broad_viewer' ||
+    canViewAttendanceRates;
 
   const selectedMember = useMemo(
     () => members.find((member) => member.id === selectedMemberId) ?? null,
     [members, selectedMemberId],
   );
+  const canShowSelectedMemberRates = Boolean(
+    selectedMember &&
+      (canViewPeerAttendanceStats || (linkedMemberId && selectedMember.id === linkedMemberId)),
+  );
+
+  const prevSelectedMemberIdRef = useRef<string | null>(selectedMemberId);
 
   // Sync external member selection (e.g. clicking a member in the main roster) into profile view.
   useEffect(() => {
+    const selectedMemberChanged = prevSelectedMemberIdRef.current !== selectedMemberId;
+    prevSelectedMemberIdRef.current = selectedMemberId;
+
+    if (isUnlinkedMemberScope) {
+      if (viewMode !== 'directory') {
+        setViewMode('directory');
+      }
+      if (selectedMemberId !== null) {
+        onSelectMember(null);
+      }
+      return;
+    }
+
+    if (isSelfOnlyScope) {
+      if (linkedMemberId && selectedMemberId !== linkedMemberId) {
+        onSelectMember(linkedMemberId);
+      }
+      if (linkedMemberId && members.some((member) => member.id === linkedMemberId)) {
+        if (viewMode !== 'profile') {
+          setViewMode('profile');
+          setShowAllAbsences(false);
+        } else if (selectedMemberChanged) {
+          setShowAllAbsences(false);
+        }
+      } else if (viewMode !== 'directory') {
+        setViewMode('directory');
+      }
+      return;
+    }
+
+    if (!canEditRoster && (viewMode === 'add' || viewMode === 'edit' || viewMode === 'bulk_add')) {
+      setEditingTargetId(null);
+      setEditingBaselineMember(null);
+      setFormError('');
+      setBulkError('');
+      setViewMode(selectedMemberId && selectedMember ? 'profile' : 'directory');
+      return;
+    }
+
     if (selectedMemberId && selectedMember) {
       setViewMode((current) =>
         current === 'edit' && editingTargetId === selectedMemberId ? current : 'profile',
       );
-      setShowAllAbsences(false);
+      if (selectedMemberChanged) {
+        setShowAllAbsences(false);
+      }
     } else if (viewMode === 'profile') {
       setViewMode('directory');
       if (selectedMemberId && !selectedMember) {
         onSelectMember(null);
       }
     }
-  }, [selectedMemberId, selectedMember, viewMode, editingTargetId, onSelectMember]);
+  }, [
+    canEditRoster,
+    isUnlinkedMemberScope,
+    isSelfOnlyScope,
+    linkedMemberId,
+    members,
+    selectedMemberId,
+    selectedMember,
+    viewMode,
+    editingTargetId,
+    onSelectMember,
+  ]);
+
+  useEffect(() => {
+    if (!isOpen || viewMode !== 'edit' || !editingTargetId) return;
+    const key = `member:${editingTargetId}`;
+    onBeginFieldEdit?.(key);
+    return () => {
+      onEndFieldEdit?.(key);
+    };
+  }, [editingTargetId, isOpen, onBeginFieldEdit, onEndFieldEdit, viewMode]);
 
   useEffect(() => {
     if (isOpen && (viewMode === 'add' || viewMode === 'edit')) {
       const timer = window.setTimeout(() => {
         nameInputRef.current?.focus({ preventScroll: true });
+      }, 0);
+      return () => window.clearTimeout(timer);
+    }
+    if (isOpen && viewMode === 'bulk_add') {
+      const timer = window.setTimeout(() => {
+        bulkTextareaRef.current?.focus({ preventScroll: true });
       }, 0);
       return () => window.clearTimeout(timer);
     }
@@ -484,13 +650,39 @@ export function MemberManagerSidebar({
     return () => document.removeEventListener('mousedown', handleDocumentMouseDown);
   }, [isExportMenuOpen]);
 
+  const exitSelectionMode = useCallback(() => {
+    setIsSelectionMode(false);
+    setSelectedIds(new Set());
+    setBulkPanelMode('none');
+    setBulkTargetYear('');
+    setBulkTargetLetter('');
+    setBulkActionError('');
+    setIsDragSelecting(false);
+    dragStateRef.current = null;
+    lastAnchorIndexRef.current = null;
+  }, []);
+
   function handleSidebarKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
     if (event.key === 'Escape' && isExportMenuOpen) {
       event.stopPropagation();
       setIsExportMenuOpen(false);
       return;
     }
-    if (event.key === 'Escape' && isOpen && !pendingDeleteMember) {
+    if (event.key === 'Escape' && (pendingDeleteMember || pendingBulkDeleteIds)) {
+      return;
+    }
+    if (event.key === 'Escape' && bulkPanelMode !== 'none') {
+      event.stopPropagation();
+      setBulkPanelMode('none');
+      setBulkActionError('');
+      return;
+    }
+    if (event.key === 'Escape' && viewMode === 'directory' && isSelectionMode) {
+      event.stopPropagation();
+      exitSelectionMode();
+      return;
+    }
+    if (event.key === 'Escape' && isOpen) {
       event.stopPropagation();
       onClose();
     }
@@ -519,7 +711,7 @@ export function MemberManagerSidebar({
   const distinctClasses = useMemo(() => {
     const classes = new Set<string>();
     for (const member of scopedMembers) {
-      if (normalizeMemberType(member.memberType) === 'student' && member.className) {
+      if (member.className) {
         classes.add(member.className);
       }
     }
@@ -547,7 +739,7 @@ export function MemberManagerSidebar({
 
   const filteredMembers = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
-    return scopedMembers.filter((member) => {
+    const filtered = scopedMembers.filter((member) => {
       const memberType = normalizeMemberType(member.memberType);
       const matchesRole =
         effectiveRoleFilter === 'all' ||
@@ -557,14 +749,13 @@ export function MemberManagerSidebar({
       if (!matchesRole) return false;
 
       const matchesClass =
-        effectiveClassFilter === 'all' ||
-        (memberType === 'student' && member.className === effectiveClassFilter);
+        effectiveClassFilter === 'all' || member.className === effectiveClassFilter;
       if (!matchesClass) return false;
 
       if (!query) return true;
       return [
         member.name,
-        memberType === 'student' ? member.className : undefined,
+        member.className,
         member.graduationYear ? String(member.graduationYear) : undefined,
         member.graduationYear ? `Graduated ${member.graduationYear}` : undefined,
         MEMBER_TYPE_LABELS[memberType],
@@ -576,13 +767,414 @@ export function MemberManagerSidebar({
         .filter((value): value is string => Boolean(value))
         .some((value) => value.toLowerCase().includes(query));
     });
+    return sortMembersByRoleAndName(filtered);
   }, [effectiveClassFilter, effectiveRoleFilter, scopedMembers, searchQuery]);
 
   const activeProfileStats = selectedMember
     ? memberStatsMap.get(selectedMember.id) ?? summarizeMemberAttendance(selectedMember.id, sessions)
     : null;
 
+  const bulkParseResult = useMemo(
+    () => parseBulkMemberInput(bulkText, activeMembers),
+    [activeMembers, bulkText],
+  );
+  const bulkReadyCount = bulkParseResult.namesToAdd.length;
+
+  // Prune selection when scoped members change (e.g. external delete/archive/realtime sync).
+  useEffect(() => {
+    const validIds = new Set(scopedMembers.map((member) => member.id));
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      let changed = false;
+      const next = new Set<string>();
+      for (const memberId of prev) {
+        if (validIds.has(memberId)) {
+          next.add(memberId);
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [scopedMembers]);
+
+  // Clear selection when leaving directory view or switching Active <-> Legacy tabs.
+  useEffect(() => {
+    if (viewMode !== 'directory') {
+      exitSelectionMode();
+    }
+  }, [viewMode, exitSelectionMode]);
+
+  useEffect(() => {
+    setSelectedIds(new Set());
+    setBulkPanelMode('none');
+    setBulkTargetYear('');
+    setBulkTargetLetter('');
+    setBulkActionError('');
+    lastAnchorIndexRef.current = null;
+  }, [directoryScope]);
+
+  // Global mouseup/blur cleanup for click-and-drag mass selection.
+  useEffect(() => {
+    function finishDragSelection() {
+      if (!dragStateRef.current) return;
+      dragStateRef.current = null;
+      setIsDragSelecting(false);
+      if (suppressResetTimerRef.current !== null) {
+        window.clearTimeout(suppressResetTimerRef.current);
+      }
+      suppressResetTimerRef.current = window.setTimeout(() => {
+        suppressNextRowClickRef.current = false;
+        suppressResetTimerRef.current = null;
+      }, 0);
+    }
+
+    window.addEventListener('mouseup', finishDragSelection);
+    window.addEventListener('blur', finishDragSelection);
+    return () => {
+      window.removeEventListener('mouseup', finishDragSelection);
+      window.removeEventListener('blur', finishDragSelection);
+      if (suppressResetTimerRef.current !== null) {
+        window.clearTimeout(suppressResetTimerRef.current);
+      }
+    };
+  }, []);
+
+  const selectedMembersList = useMemo(
+    () => scopedMembers.filter((member) => selectedIds.has(member.id)),
+    [scopedMembers, selectedIds],
+  );
+
+  const selectedVisibleCount = useMemo(
+    () => filteredMembers.reduce((count, member) => count + (selectedIds.has(member.id) ? 1 : 0), 0),
+    [filteredMembers, selectedIds],
+  );
+
+  const allVisibleSelected =
+    filteredMembers.length > 0 && selectedVisibleCount === filteredMembers.length;
+  const someVisibleSelected =
+    selectedVisibleCount > 0 && selectedVisibleCount < filteredMembers.length;
+  const hiddenSelectedCount = Math.max(0, selectedIds.size - selectedVisibleCount);
+
+  useEffect(() => {
+    if (selectAllCheckboxRef.current) {
+      selectAllCheckboxRef.current.indeterminate = someVisibleSelected;
+    }
+  }, [someVisibleSelected]);
+
+  const selectedStudentMembers = useMemo(
+    () =>
+      selectedMembersList.filter(
+        (member) => normalizeMemberType(member.memberType) === 'student',
+      ),
+    [selectedMembersList],
+  );
+
+  const selectedLegacyStudentsMissingClass = useMemo(
+    () =>
+      selectedStudentMembers.filter((member) => {
+        const resolved = resolveStudentClassFields({
+          memberType: 'student',
+          classYear: member.classYear,
+          classLetter: member.classLetter,
+          className: member.className,
+        });
+        if (resolved.classLetter === 'N/A') return false;
+        return !resolved.classYear || !resolved.classLetter;
+      }),
+    [selectedStudentMembers],
+  );
+
+  const classUpdatePreview = useMemo(() => {
+    if (bulkTargetLetter === 'N/A') {
+      return { eligibleCount: selectedMembersList.length, missingComplementCount: 0 };
+    }
+    if (bulkTargetYear === '' && bulkTargetLetter === '') {
+      return { eligibleCount: 0, missingComplementCount: 0 };
+    }
+    let eligibleCount = 0;
+    let missingComplementCount = 0;
+    for (const student of selectedStudentMembers) {
+      const resolved = resolveStudentClassFields({
+        memberType: 'student',
+        classYear: student.classYear,
+        classLetter: student.classLetter,
+        className: student.className,
+      });
+      const existingLetter =
+        resolved.classLetter && resolved.classLetter !== 'N/A' ? resolved.classLetter : undefined;
+      const nextYear = bulkTargetYear !== '' ? bulkTargetYear : resolved.classYear;
+      const nextLetter = bulkTargetLetter !== '' ? bulkTargetLetter : existingLetter;
+      if (nextYear && nextLetter) {
+        eligibleCount += 1;
+      } else {
+        missingComplementCount += 1;
+      }
+    }
+    return { eligibleCount, missingComplementCount };
+  }, [bulkTargetLetter, bulkTargetYear, selectedMembersList.length, selectedStudentMembers]);
+
+  function handleToggleSelectionMode() {
+    if (isSelectionMode) {
+      exitSelectionMode();
+    } else {
+      setIsSelectionMode(true);
+      setSelectedIds(new Set());
+      setBulkPanelMode('none');
+      setBulkActionError('');
+    }
+  }
+
+  function handleToggleSelectAll() {
+    if (filteredMembers.length === 0) return;
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allVisibleSelected) {
+        for (const member of filteredMembers) {
+          next.delete(member.id);
+        }
+      } else {
+        for (const member of filteredMembers) {
+          next.add(member.id);
+        }
+      }
+      return next;
+    });
+    setBulkActionError('');
+  }
+
+  function handleClearSelection() {
+    setSelectedIds(new Set());
+    setBulkPanelMode('none');
+    setBulkActionError('');
+    lastAnchorIndexRef.current = null;
+  }
+
+  function applyRangeSelection(
+    baseSelection: Set<string>,
+    startIndex: number,
+    endIndex: number,
+    targetState: boolean,
+  ): Set<string> {
+    const next = new Set(baseSelection);
+    const min = Math.min(startIndex, endIndex);
+    const max = Math.max(startIndex, endIndex);
+    for (let i = min; i <= max; i += 1) {
+      const targetMember = filteredMembers[i];
+      if (!targetMember) continue;
+      if (targetState) {
+        next.add(targetMember.id);
+      } else {
+        next.delete(targetMember.id);
+      }
+    }
+    return next;
+  }
+
+  function handleSelectableRowMouseDown(
+    event: ReactMouseEvent<HTMLDivElement>,
+    member: ClubMember,
+    index: number,
+  ) {
+    if (!isSelectionMode || event.button !== 0) return;
+
+    const targetState = !selectedIds.has(member.id);
+    if (event.shiftKey && lastAnchorIndexRef.current !== null) {
+      suppressNextRowClickRef.current = true;
+      setSelectedIds((prev) =>
+        applyRangeSelection(prev, lastAnchorIndexRef.current as number, index, targetState),
+      );
+      lastAnchorIndexRef.current = index;
+      setBulkActionError('');
+      return;
+    }
+
+    const initialSelection = new Set(selectedIds);
+    dragStateRef.current = {
+      active: true,
+      targetState,
+      startIndex: index,
+      initialSelection,
+      moved: false,
+    };
+    setIsDragSelecting(true);
+    suppressNextRowClickRef.current = true;
+    setSelectedIds(applyRangeSelection(initialSelection, index, index, targetState));
+    lastAnchorIndexRef.current = index;
+    setBulkActionError('');
+  }
+
+  function handleSelectableRowMouseEnter(index: number) {
+    const drag = dragStateRef.current;
+    if (!drag || !drag.active) return;
+    drag.moved = true;
+    setSelectedIds(
+      applyRangeSelection(drag.initialSelection, drag.startIndex, index, drag.targetState),
+    );
+    lastAnchorIndexRef.current = index;
+  }
+
+  function handleSelectableRowClick(
+    event: ReactMouseEvent<HTMLDivElement>,
+    member: ClubMember,
+    index: number,
+  ) {
+    if (suppressNextRowClickRef.current) {
+      suppressNextRowClickRef.current = false;
+      return;
+    }
+
+    const targetState = !selectedIds.has(member.id);
+    if (event.shiftKey && lastAnchorIndexRef.current !== null) {
+      setSelectedIds((prev) =>
+        applyRangeSelection(prev, lastAnchorIndexRef.current as number, index, targetState),
+      );
+    } else {
+      setSelectedIds((prev) => applyRangeSelection(prev, index, index, targetState));
+    }
+    lastAnchorIndexRef.current = index;
+    setBulkActionError('');
+  }
+
+  function handleSelectableRowKeyDown(
+    event: ReactKeyboardEvent<HTMLDivElement>,
+    member: ClubMember,
+    index: number,
+  ) {
+    if (event.key === ' ' || event.key === 'Enter') {
+      event.preventDefault();
+      const targetState = !selectedIds.has(member.id);
+      if (event.shiftKey && lastAnchorIndexRef.current !== null) {
+        setSelectedIds((prev) =>
+          applyRangeSelection(prev, lastAnchorIndexRef.current as number, index, targetState),
+        );
+      } else {
+        setSelectedIds((prev) => applyRangeSelection(prev, index, index, targetState));
+      }
+      lastAnchorIndexRef.current = index;
+      setBulkActionError('');
+    }
+  }
+
+  function handleBulkArchiveSelected() {
+    if (selectedMembersList.length === 0) return;
+    onSetMembersLegacyStatus(
+      selectedMembersList.map((member) => member.id),
+      true,
+    );
+    exitSelectionMode();
+  }
+
+  function handleBulkRestoreSelected() {
+    if (selectedMembersList.length === 0) return;
+    if (selectedLegacyStudentsMissingClass.length > 0) {
+      setBulkTargetYear('');
+      setBulkTargetLetter('');
+      setBulkActionError('');
+      setBulkPanelMode('restore_class');
+      return;
+    }
+    onSetMembersLegacyStatus(
+      selectedMembersList.map((member) => member.id),
+      false,
+    );
+    exitSelectionMode();
+  }
+
+  function handleConfirmBulkRestoreWithClass(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (bulkTargetLetter !== 'N/A' && (bulkTargetYear === '' || bulkTargetLetter === '')) {
+      setBulkActionError(
+        'Select both Year (7–11) and Class (T, E, N, B), or choose N/A for students without a saved class.',
+      );
+      return;
+    }
+    onSetMembersLegacyStatus(
+      selectedMembersList.map((member) => member.id),
+      false,
+      bulkTargetLetter === 'N/A'
+        ? { fallbackClassLetter: 'N/A' }
+        : {
+            fallbackClassYear: bulkTargetYear as ClassYear,
+            fallbackClassLetter: bulkTargetLetter as ClassLetter,
+          },
+    );
+    exitSelectionMode();
+  }
+
+  function handleOpenChangeClassPanel() {
+    if (bulkPanelMode === 'change_class') {
+      setBulkPanelMode('none');
+      setBulkActionError('');
+      return;
+    }
+    setBulkTargetYear('');
+    setBulkTargetLetter('');
+    setBulkActionError('');
+    setBulkPanelMode('change_class');
+  }
+
+  function handleApplyBulkClassUpdate(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (bulkTargetLetter === 'N/A') {
+      if (selectedMembersList.length === 0) {
+        setBulkActionError('Select at least one member to assign Class N/A.');
+        return;
+      }
+      onUpdateMembersClass(
+        selectedMembersList.map((member) => member.id),
+        { classLetter: 'N/A' },
+      );
+      setBulkPanelMode('none');
+      setBulkTargetYear('');
+      setBulkTargetLetter('');
+      setBulkActionError('');
+      return;
+    }
+    if (selectedStudentMembers.length === 0) {
+      setBulkActionError(
+        'Select at least one Student member to set a standard Year/Class, or choose N/A.',
+      );
+      return;
+    }
+    if (bulkTargetYear === '' && bulkTargetLetter === '') {
+      setBulkActionError('Choose a new Year, a new Class letter, or N/A.');
+      return;
+    }
+    if (classUpdatePreview.eligibleCount === 0) {
+      setBulkActionError(
+        'Selected students do not have a standard class yet. Choose both Year and Class, or select N/A.',
+      );
+      return;
+    }
+    onUpdateMembersClass(
+      selectedStudentMembers.map((member) => member.id),
+      {
+        classYear: bulkTargetYear !== '' ? bulkTargetYear : undefined,
+        classLetter: bulkTargetLetter !== '' ? bulkTargetLetter : undefined,
+      },
+    );
+    setBulkPanelMode('none');
+    setBulkTargetYear('');
+    setBulkTargetLetter('');
+    setBulkActionError('');
+  }
+
+  function handleRequestBulkDelete() {
+    if (selectedMembersList.length === 0) return;
+    setPendingBulkDeleteIds(selectedMembersList.map((member) => member.id));
+  }
+
+  function handleConfirmBulkDelete() {
+    if (!pendingBulkDeleteIds || pendingBulkDeleteIds.length === 0) return;
+    const idsToDelete = pendingBulkDeleteIds;
+    setPendingBulkDeleteIds(null);
+    onDeleteMembers(idsToDelete);
+    exitSelectionMode();
+  }
+
   function openDirectory(targetScope?: DirectoryScope) {
+    if (isSelfOnlyScope) return;
     if (targetScope) {
       setDirectoryScope(targetScope);
     } else if (selectedMember) {
@@ -591,30 +1183,52 @@ export function MemberManagerSidebar({
     onSelectMember(null);
     setEditingTargetId(null);
     setFormError('');
+    setBulkError('');
     setViewMode('directory');
   }
 
   function openMemberProfile(memberId: string) {
+    if (isUnlinkedMemberScope) return;
+    if (isSelfOnlyScope && linkedMemberId && memberId !== linkedMemberId) return;
     onSelectMember(memberId);
     setEditingTargetId(null);
     setFormError('');
+    setBulkError('');
     setShowAllAbsences(false);
     setViewMode('profile');
   }
 
   function openAddForm() {
+    if (!canEditRoster) return;
     setEditingTargetId(null);
     setFormValues(emptyFormValues());
     setFormError('');
+    setBulkError('');
     setViewMode('add');
+  }
+
+  function openBulkAddForm() {
+    if (!canEditRoster) return;
+    setEditingTargetId(null);
+    setFormError('');
+    setBulkText('');
+    setBulkClassYear('');
+    setBulkClassLetter('');
+    setBulkRole('');
+    setBulkJoinedDate('');
+    setBulkNotes('');
+    setBulkError('');
+    setViewMode('bulk_add');
   }
 
   function openEditForm(
     member: ClubMember,
     options?: { overrideIsLegacy?: boolean; noticeMessage?: string },
   ) {
+    if (!canEditRoster) return;
     onSelectMember(member.id);
     setEditingTargetId(member.id);
+    setEditingBaselineMember(member);
     setFormValues(memberToFormValues(member, options?.overrideIsLegacy));
     setFormError(options?.noticeMessage ?? '');
     setViewMode('edit');
@@ -629,11 +1243,11 @@ export function MemberManagerSidebar({
         classLetter: member.classLetter,
         className: member.className,
       });
-      if (!resolved.classYear || !resolved.classLetter) {
+      if (resolved.classLetter !== 'N/A' && (!resolved.classYear || !resolved.classLetter)) {
         openEditForm(member, {
           overrideIsLegacy: false,
           noticeMessage:
-            'Select a Year (7–11) and Class (T, E, N, B) to restore this student to the Active Roster.',
+            'Select a Year (7–11) and Class (T, E, N, B) — or N/A — to restore this student to the Active Roster.',
         });
         return;
       }
@@ -656,6 +1270,7 @@ export function MemberManagerSidebar({
 
   function handleFormSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!canEditRoster) return;
     const cleanedName = formValues.name.trim();
     if (!cleanedName) {
       setFormError('Member name is required.');
@@ -663,14 +1278,26 @@ export function MemberManagerSidebar({
       return;
     }
 
+    const cleanedRole = formValues.role.trim();
+    if (!cleanedRole) {
+      setFormError('Club role is required.');
+      roleInputRef.current?.focus();
+      return;
+    }
+
     const isStudent = formValues.memberType === 'student';
+    const isNaClass = formValues.classLetter === 'N/A';
     const hasYear = formValues.classYear !== '';
     const hasLetter = formValues.classLetter !== '';
     let resolvedClassYear: ClassYear | undefined;
     let resolvedClassLetter: ClassLetter | undefined;
     let resolvedClassName: string | undefined;
 
-    if (isStudent) {
+    if (isNaClass) {
+      resolvedClassYear = undefined;
+      resolvedClassLetter = 'N/A';
+      resolvedClassName = 'N/A';
+    } else if (isStudent) {
       if (hasYear && hasLetter) {
         resolvedClassYear = formValues.classYear as ClassYear;
         resolvedClassLetter = formValues.classLetter as ClassLetter;
@@ -680,10 +1307,24 @@ export function MemberManagerSidebar({
       } else {
         setFormError(
           !hasYear && !hasLetter
-            ? 'Select both Year (7–11) and Class (T, E, N, B) for student members.'
+            ? 'Select both Year (7–11) and Class (T, E, N, B), or choose N/A for non-standard students.'
             : !hasYear
-              ? 'Select a Year (Year 7 – Year 11) for this student.'
-              : 'Select a Class letter (T, E, N, or B) for this student.',
+              ? 'Select a Year (Year 7 – Year 11) or choose N/A.'
+              : 'Select a Class letter (T, E, N, B) or choose N/A.',
+        );
+        if (!hasYear) {
+          classYearSelectRef.current?.focus();
+        }
+        return;
+      }
+    } else if (hasYear || hasLetter) {
+      if (hasYear && hasLetter) {
+        resolvedClassYear = formValues.classYear as ClassYear;
+        resolvedClassLetter = formValues.classLetter as ClassLetter;
+        resolvedClassName = formatStudentClassName(resolvedClassYear, resolvedClassLetter);
+      } else {
+        setFormError(
+          'Select N/A, or pick both Year (7–11) and Class (T, E, N, B).',
         );
         if (!hasYear) {
           classYearSelectRef.current?.focus();
@@ -695,11 +1336,11 @@ export function MemberManagerSidebar({
     const payload: MemberProfileInput = {
       name: cleanedName,
       memberType: formValues.memberType,
-      classYear: isStudent ? resolvedClassYear : undefined,
-      classLetter: isStudent ? resolvedClassLetter : undefined,
-      className: isStudent ? resolvedClassName : undefined,
+      classYear: resolvedClassYear,
+      classLetter: resolvedClassLetter,
+      className: resolvedClassName,
       isLegacy: formValues.isLegacy,
-      role: formValues.role.trim() || undefined,
+      role: cleanedRole,
       joinedDate: formValues.joinedDate.trim() || undefined,
       email: formValues.email.trim() || undefined,
       phone: formValues.phone.trim() || undefined,
@@ -708,11 +1349,22 @@ export function MemberManagerSidebar({
     };
 
     if (viewMode === 'edit' && editingTargetId) {
-      onUpdateMember(editingTargetId, payload);
-      setEditingTargetId(null);
-      setDirectoryScope(payload.isLegacy ? 'legacy' : 'active');
-      onSelectMember(editingTargetId);
-      setViewMode('profile');
+      const stillExists = members.some((member) => member.id === editingTargetId);
+      if (stillExists) {
+        onUpdateMember(editingTargetId, payload);
+        setEditingTargetId(null);
+        setEditingBaselineMember(null);
+        setDirectoryScope(payload.isLegacy ? 'legacy' : 'active');
+        onSelectMember(editingTargetId);
+        setViewMode('profile');
+      } else {
+        const recreated = onAddMember(payload);
+        setEditingTargetId(null);
+        setEditingBaselineMember(null);
+        setDirectoryScope(payload.isLegacy ? 'legacy' : 'active');
+        onSelectMember(recreated.id);
+        setViewMode('profile');
+      }
     } else {
       const created = onAddMember(payload);
       setDirectoryScope('active');
@@ -720,6 +1372,82 @@ export function MemberManagerSidebar({
       setViewMode('profile');
     }
     setFormError('');
+  }
+
+  function handleBulkSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!canEditRoster) return;
+
+    if (bulkReadyCount === 0) {
+      setBulkError(
+        bulkParseResult.skippedActiveDuplicates.length > 0
+          ? 'All entered names already exist in the active roster.'
+          : 'Enter at least one member name (one per line).',
+      );
+      bulkTextareaRef.current?.focus();
+      return;
+    }
+
+    const cleanedRole = bulkRole.trim();
+    if (!cleanedRole) {
+      setBulkError('Club role is required for bulk import.');
+      bulkRoleInputRef.current?.focus();
+      return;
+    }
+
+    const isNaClass = bulkClassLetter === 'N/A';
+    const hasYear = bulkClassYear !== '';
+    const hasLetter = bulkClassLetter !== '';
+    if (!isNaClass && hasYear !== hasLetter) {
+      setBulkError(
+        'Select both Year (7–11) and Class (T, E, N, B), choose N/A, or click Clear to add without a class.',
+      );
+      if (!hasYear) {
+        bulkClassYearSelectRef.current?.focus();
+      }
+      return;
+    }
+
+    const batchClassFields = isNaClass
+      ? {
+          classYear: undefined,
+          classLetter: 'N/A' as ClassLetter,
+          className: 'N/A',
+        }
+      : hasYear && hasLetter
+        ? {
+            classYear: bulkClassYear as ClassYear,
+            classLetter: bulkClassLetter as ClassLetter,
+            className: formatStudentClassName(
+              bulkClassYear as ClassYear,
+              bulkClassLetter as ClassLetter,
+            ),
+          }
+        : {};
+
+    const cleanedJoinedDate = bulkJoinedDate.trim() || undefined;
+    const cleanedNotes = bulkNotes.trim() || undefined;
+
+    const inputs: MemberProfileInput[] = bulkParseResult.namesToAdd.map((name) => ({
+      name,
+      memberType: 'student',
+      ...batchClassFields,
+      role: cleanedRole,
+      joinedDate: cleanedJoinedDate,
+      notes: cleanedNotes,
+    }));
+
+    onAddMembersBulk(inputs);
+    setBulkText('');
+    setBulkClassYear('');
+    setBulkClassLetter('');
+    setBulkRole('');
+    setBulkJoinedDate('');
+    setBulkNotes('');
+    setBulkError('');
+    onSelectMember(null);
+    setDirectoryScope('active');
+    setViewMode('directory');
   }
 
   function executeDeleteMember(deletingId: string) {
@@ -762,6 +1490,7 @@ export function MemberManagerSidebar({
       <aside
         id={id}
         className={`member-drawer ${isOpen ? 'is-open' : 'is-closed'}`}
+        data-tutorial-target="member-sidebar"
         aria-labelledby={titleId}
         aria-hidden={!isOpen}
         inert={!isOpen || undefined}
@@ -772,27 +1501,51 @@ export function MemberManagerSidebar({
               <div className="member-drawer-title-row">
                 <span className="modal-badge">
                   <PixelUsersIcon />
-                  <span>{directoryScope === 'legacy' && viewMode === 'directory' ? 'Legacy' : 'Directory'}</span>
+                  <span>
+                    {isUnlinkedMemberScope
+                      ? 'Profile Link'
+                      : isSelfOnlyScope
+                        ? 'My Profile'
+                        : directoryScope === 'legacy' && viewMode === 'directory'
+                          ? 'Legacy'
+                          : 'Directory'}
+                  </span>
                 </span>
-                <span
-                  className="panel-count"
-                  title={`${activeMembers.length} active • ${legacyMembers.length} legacy`}
-                >
-                  {directoryScope === 'legacy' && viewMode === 'directory'
-                    ? legacyMembers.length
-                    : activeMembers.length}
-                </span>
+                {!isUnlinkedMemberScope && !isSelfOnlyScope && (
+                  <span
+                    className="panel-count"
+                    title={`${activeMembers.length} active • ${legacyMembers.length} legacy`}
+                  >
+                    {directoryScope === 'legacy' && viewMode === 'directory'
+                      ? legacyMembers.length
+                      : activeMembers.length}
+                  </span>
+                )}
               </div>
               <h2 id={titleId} className="member-drawer-title">
-                {viewMode === 'directory' && 'Member Manager'}
-                {viewMode === 'profile' && (selectedMember?.name ?? 'Member Profile')}
-                {viewMode === 'add' && 'Add Club Member'}
-                {viewMode === 'edit' && 'Edit Member Profile'}
+                {isUnlinkedMemberScope
+                  ? 'My Member Profile'
+                  : isSelfOnlyScope
+                    ? (selectedMember?.name ?? 'My Member Profile')
+                    : (
+                      <>
+                        {viewMode === 'directory' && 'Member Manager'}
+                        {viewMode === 'profile' && (selectedMember?.name ?? 'Member Profile')}
+                        {viewMode === 'add' && 'Add Club Member'}
+                        {viewMode === 'bulk_add' && 'Bulk Add Members'}
+                        {viewMode === 'edit' && 'Edit Member Profile'}
+                      </>
+                    )}
               </h2>
             </div>
 
             <div className="member-drawer-header-actions">
-              {(viewMode === 'directory' || (viewMode === 'profile' && selectedMember)) && (
+              {!isUnlinkedMemberScope &&
+                (viewMode === 'profile' && selectedMember
+                  ? canShowSelectedMemberRates
+                  : !isSelfOnlyScope &&
+                    viewMode === 'directory' &&
+                    canViewPeerAttendanceStats) && (
                 <div className="export-menu-wrap" ref={exportMenuRef}>
                   <button
                     type="button"
@@ -885,7 +1638,10 @@ export function MemberManagerSidebar({
                 </div>
               )}
 
-              {viewMode === 'directory' && (
+              {!isSelfOnlyScope &&
+                !isUnlinkedMemberScope &&
+                viewMode === 'directory' &&
+                canEditRoster && (
                 <button type="button" className="btn-primary btn-compact-primary" onClick={openAddForm}>
                   <PixelPlusIcon />
                   <span>Add</span>
@@ -904,7 +1660,33 @@ export function MemberManagerSidebar({
           </div>
 
           <div className="member-drawer-body">
-            {viewMode === 'directory' && (
+            <datalist id={roleListId}>
+              {ROLE_SUGGESTIONS.map((role) => (
+                <option key={role} value={role} />
+              ))}
+            </datalist>
+
+            {isUnlinkedMemberScope && (
+              <div className="member-empty-state" role="status">
+                <strong>Profile Not Linked Yet</strong>
+                <span>
+                  Your login is active, but an administrator has not linked your account to a Team
+                  SPIRIT roster profile yet. Ask a club admin in Settings → Admin Management to link
+                  your account.
+                </span>
+              </div>
+            )}
+
+            {!isUnlinkedMemberScope && isSelfOnlyScope && !selectedMember && (
+              <div className="member-empty-state" role="status">
+                <strong>Loading Linked Profile</strong>
+                <span>
+                  Fetching your personal roster profile and attendance history from Supabase...
+                </span>
+              </div>
+            )}
+
+            {!isUnlinkedMemberScope && !isSelfOnlyScope && viewMode === 'directory' && (
               <div className="member-directory-view">
                 <div
                   className="member-directory-tabs"
@@ -949,6 +1731,40 @@ export function MemberManagerSidebar({
                       Academic Cycle <strong>{getAcademicCycleLabel()}</strong> • Auto-promotes{' '}
                       <strong>{getNextPromotionDateLabel()}</strong> (Year 11 → Legacy)
                     </span>
+                  </div>
+                )}
+
+                {canEditRoster && (directoryScope === 'active' || scopedMembers.length > 0) && (
+                  <div className="member-bulk-entry-row">
+                    {directoryScope === 'active' && (
+                      <button
+                        type="button"
+                        className="btn-secondary btn-compact member-bulk-entry-btn"
+                        onClick={openBulkAddForm}
+                      >
+                        <PixelUsersIcon />
+                        <span>Bulk Add Members</span>
+                      </button>
+                    )}
+
+                    {scopedMembers.length > 0 && (
+                      <button
+                        type="button"
+                        className={`btn-secondary btn-compact member-select-toggle-btn ${
+                          isSelectionMode ? 'is-active' : ''
+                        }`}
+                        aria-pressed={isSelectionMode}
+                        onClick={handleToggleSelectionMode}
+                        title={
+                          isSelectionMode
+                            ? 'Exit selection mode (Esc)'
+                            : 'Select multiple members at once'
+                        }
+                      >
+                        <PixelCheckSquareIcon />
+                        <span>{isSelectionMode ? 'Done Selecting' : 'Select'}</span>
+                      </button>
+                    )}
                   </div>
                 )}
 
@@ -1005,6 +1821,46 @@ export function MemberManagerSidebar({
                   )}
                 </div>
 
+                {isSelectionMode && filteredMembers.length > 0 && (
+                  <div
+                    className="member-selection-toolbar"
+                    role="region"
+                    aria-label="Bulk selection controls"
+                  >
+                    <label className="select-all-label member-select-all-label">
+                      <input
+                        ref={selectAllCheckboxRef}
+                        type="checkbox"
+                        className="selection-checkbox"
+                        checked={allVisibleSelected}
+                        onChange={handleToggleSelectAll}
+                        aria-label={
+                          allVisibleSelected
+                            ? 'Deselect all visible members'
+                            : 'Select all visible members'
+                        }
+                      />
+                      <span>{allVisibleSelected ? 'Deselect All' : 'Select All'}</span>
+                    </label>
+
+                    <div className="member-selection-toolbar-right">
+                      <span className="selection-count-pill">
+                        {selectedIds.size} selected
+                        {hiddenSelectedCount > 0 ? ` (${hiddenSelectedCount} filtered)` : ''}
+                      </span>
+                      {selectedIds.size > 0 && (
+                        <button
+                          type="button"
+                          className="ring-reset-btn"
+                          onClick={handleClearSelection}
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 {filteredMembers.length === 0 ? (
                   <div className="reserved-empty-state member-empty-state">
                     <div className="empty-badge">
@@ -1028,38 +1884,52 @@ export function MemberManagerSidebar({
                       {scopedMembers.length === 0
                         ? directoryScope === 'legacy'
                           ? 'Use the Archive button on any active member to move them here while keeping their full attendance history.'
-                          : 'Add students (Year 7–11, Class T/E/N/B), teachers, or visitors with optional role and contact details.'
+                          : 'Add students (Year 7–11, Class T/E/N/B or N/A), teachers, or visitors with a required club role.'
                         : 'Try clearing your search term or switching the class/role filters.'}
                     </p>
-                    {scopedMembers.length === 0 && directoryScope === 'active' && (
-                      <button type="button" className="btn-primary" onClick={openAddForm}>
-                        <PixelPlusIcon />
-                        <span>Add First Member</span>
-                      </button>
+                    {canEditRoster && scopedMembers.length === 0 && directoryScope === 'active' && (
+                      <div className="member-empty-actions">
+                        <button type="button" className="btn-primary" onClick={openAddForm}>
+                          <PixelPlusIcon />
+                          <span>Add First Member</span>
+                        </button>
+                        <button type="button" className="btn-secondary" onClick={openBulkAddForm}>
+                          <PixelUsersIcon />
+                          <span>Bulk Add Members</span>
+                        </button>
+                      </div>
                     )}
                   </div>
                 ) : (
                   <ul
-                    className="member-directory-list"
+                    className={`member-directory-list ${
+                      isDragSelecting ? 'is-drag-selecting' : ''
+                    }`}
                     aria-label={
                       directoryScope === 'legacy'
                         ? 'Legacy and retired member archive'
                         : 'Active club member directory'
                     }
                   >
-                    {filteredMembers.map((member) => {
+                    {filteredMembers.map((member, index) => {
                       const stats = memberStatsMap.get(member.id);
+                      const canShowRowRates =
+                        canViewPeerAttendanceStats ||
+                        (Boolean(linkedMemberId) && member.id === linkedMemberId);
                       const rateLabel =
                         stats && stats.markedRate !== null ? `${stats.markedRate}%` : '--%';
                       const memberType = normalizeMemberType(member.memberType);
                       const memberIsLegacy = isLegacyMember(member);
+                      const isRowSelected = isSelectionMode && selectedIds.has(member.id);
                       const hasStreakHighlight = Boolean(
-                        !memberIsLegacy &&
+                        canShowRowRates &&
+                          !memberIsLegacy &&
                           stats &&
                           stats.currentPresentStreak >= STREAK_HIGHLIGHT_THRESHOLD,
                       );
                       const hasAbsenceFlag = Boolean(
-                        !memberIsLegacy &&
+                        canShowRowRates &&
+                          !memberIsLegacy &&
                           stats &&
                           stats.consecutiveUnexcusedAbsences >= CONSECUTIVE_ABSENCE_ALERT_THRESHOLD,
                       );
@@ -1067,6 +1937,7 @@ export function MemberManagerSidebar({
                       return (
                         <li key={member.id} className="member-directory-item">
                           <div
+                            data-member-index={index}
                             className={`member-directory-row ${
                               memberIsLegacy
                                 ? 'is-legacy'
@@ -1075,17 +1946,50 @@ export function MemberManagerSidebar({
                                   : hasAbsenceFlag
                                     ? 'is-absence-flag'
                                     : ''
+                            } ${isSelectionMode ? 'is-selectable' : ''} ${
+                              isRowSelected ? 'is-selected' : ''
                             }`}
-                            role="button"
+                            role={isSelectionMode ? 'checkbox' : 'button'}
+                            aria-checked={isSelectionMode ? isRowSelected : undefined}
+                            aria-label={isSelectionMode ? `Select ${member.name}` : undefined}
                             tabIndex={0}
-                            onClick={() => openMemberProfile(member.id)}
+                            onMouseDown={
+                              isSelectionMode
+                                ? (event) => handleSelectableRowMouseDown(event, member, index)
+                                : undefined
+                            }
+                            onMouseEnter={
+                              isSelectionMode
+                                ? () => handleSelectableRowMouseEnter(index)
+                                : undefined
+                            }
+                            onClick={
+                              isSelectionMode
+                                ? (event) => handleSelectableRowClick(event, member, index)
+                                : () => openMemberProfile(member.id)
+                            }
                             onKeyDown={(event) => {
+                              if (isSelectionMode) {
+                                handleSelectableRowKeyDown(event, member, index);
+                                return;
+                              }
                               if (event.key === 'Enter' || event.key === ' ') {
                                 event.preventDefault();
                                 openMemberProfile(member.id);
                               }
                             }}
                           >
+                            {isSelectionMode && (
+                              <input
+                                type="checkbox"
+                                className="selection-checkbox member-row-checkbox"
+                                checked={isRowSelected}
+                                readOnly
+                                tabIndex={-1}
+                                aria-hidden="true"
+                              />
+                            )}
+
                             <div className="member-avatar-badge" aria-hidden="true">
                               {getMemberInitials(member.name)}
                             </div>
@@ -1106,32 +2010,42 @@ export function MemberManagerSidebar({
                                     Graduated {member.graduationYear}
                                   </span>
                                 )}
-                                {memberType === 'student'
-                                  ? member.className && (
-                                      <span
-                                        className="member-class-pill"
-                                        title={`Class: ${member.className}`}
-                                      >
-                                        {member.className}
-                                      </span>
-                                    )
-                                  : (
-                                      <span className={`member-type-pill is-${memberType}`}>
-                                        {MEMBER_TYPE_LABELS[memberType]}
-                                      </span>
-                                    )}
+                                {memberType !== 'student' && (
+                                  <span className={`member-type-pill is-${memberType}`}>
+                                    {MEMBER_TYPE_LABELS[memberType]}
+                                  </span>
+                                )}
+                                {member.className && (
+                                  <span
+                                    className="member-class-pill"
+                                    title={`Class: ${member.className}`}
+                                  >
+                                    {member.className}
+                                  </span>
+                                )}
                                 {member.role && (
                                   <span className="member-role-pill">{member.role}</span>
                                 )}
                               </div>
 
                               <div className="member-directory-meta">
-                                <span className="mono-meta">
-                                  {stats ? `${stats.presentCount}/${stats.totalSessions} present` : '0 sessions'}
-                                </span>
-                                <span className="member-rate-chip" title="Marked attendance rate">
-                                  {rateLabel}
-                                </span>
+                                {canShowRowRates ? (
+                                  <>
+                                    <span className="mono-meta">
+                                      {stats
+                                        ? `${stats.presentCount}/${stats.totalSessions} present`
+                                        : '0 sessions'}
+                                    </span>
+                                    <span
+                                      className="member-rate-chip"
+                                      title="Marked attendance rate"
+                                    >
+                                      {rateLabel}
+                                    </span>
+                                  </>
+                                ) : (
+                                  <span className="mono-meta">Attendance stats hidden</span>
+                                )}
                                 {hasStreakHighlight && stats && (
                                   <span
                                     className="member-streak-badge"
@@ -1156,51 +2070,68 @@ export function MemberManagerSidebar({
                               </div>
                             </div>
 
-                            <div
-                              className="member-directory-actions"
-                              onClick={(event) => event.stopPropagation()}
-                              onKeyDown={(event) => event.stopPropagation()}
-                            >
-                              {memberIsLegacy ? (
+                            {!isSelectionMode && canEditRoster && (
+                              <div
+                                className="member-directory-actions"
+                                onClick={(event) => event.stopPropagation()}
+                                onKeyDown={(event) => event.stopPropagation()}
+                              >
+                                {memberIsLegacy ? (
+                                  <button
+                                    type="button"
+                                    className="icon-btn icon-btn-restore"
+                                    disabled={!canManageClubRecords}
+                                    onClick={() => handleRestoreMember(member)}
+                                    aria-label={`Restore ${member.name} to Active Roster`}
+                                    title={
+                                      canManageClubRecords
+                                        ? 'Restore to Active Roster'
+                                        : 'Admin privileges required'
+                                    }
+                                  >
+                                    <PixelRestoreIcon />
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="icon-btn icon-btn-archive"
+                                    disabled={!canManageClubRecords}
+                                    onClick={() => handleArchiveMember(member)}
+                                    aria-label={`Move ${member.name} to Legacy`}
+                                    title={
+                                      canManageClubRecords
+                                        ? 'Move to Legacy / Retired'
+                                        : 'Admin privileges required'
+                                    }
+                                  >
+                                    <PixelArchiveIcon />
+                                  </button>
+                                )}
                                 <button
                                   type="button"
-                                  className="icon-btn icon-btn-restore"
-                                  onClick={() => handleRestoreMember(member)}
-                                  aria-label={`Restore ${member.name} to Active Roster`}
-                                  title="Restore to Active Roster"
+                                  className="icon-btn"
+                                  onClick={() => openEditForm(member)}
+                                  aria-label={`Edit ${member.name}`}
+                                  title="Edit member"
                                 >
-                                  <PixelRestoreIcon />
+                                  <PixelEditIcon />
                                 </button>
-                              ) : (
                                 <button
                                   type="button"
-                                  className="icon-btn icon-btn-archive"
-                                  onClick={() => handleArchiveMember(member)}
-                                  aria-label={`Move ${member.name} to Legacy`}
-                                  title="Move to Legacy / Retired"
+                                  className="icon-btn icon-btn-danger"
+                                  disabled={!canManageClubRecords}
+                                  onClick={() => handleRequestDeleteMember(member)}
+                                  aria-label={`Delete ${member.name}`}
+                                  title={
+                                    canManageClubRecords
+                                      ? 'Delete member'
+                                      : 'Admin privileges required to delete members'
+                                  }
                                 >
-                                  <PixelArchiveIcon />
+                                  <PixelTrashIcon />
                                 </button>
-                              )}
-                              <button
-                                type="button"
-                                className="icon-btn"
-                                onClick={() => openEditForm(member)}
-                                aria-label={`Edit ${member.name}`}
-                                title="Edit member"
-                              >
-                                <PixelEditIcon />
-                              </button>
-                              <button
-                                type="button"
-                                className="icon-btn icon-btn-danger"
-                                onClick={() => handleRequestDeleteMember(member)}
-                                aria-label={`Delete ${member.name}`}
-                                title="Delete member"
-                              >
-                                <PixelTrashIcon />
-                              </button>
-                            </div>
+                              </div>
+                            )}
                           </div>
                         </li>
                       );
@@ -1210,59 +2141,67 @@ export function MemberManagerSidebar({
               </div>
             )}
 
-            {viewMode === 'profile' && selectedMember && activeProfileStats && (
+            {!isUnlinkedMemberScope && viewMode === 'profile' && selectedMember && activeProfileStats && (
               <div className="member-profile-view">
                 <div className="member-profile-topbar">
-                  <button
-                    type="button"
-                    className="btn-secondary btn-compact"
-                    onClick={() => openDirectory(isLegacyMember(selectedMember) ? 'legacy' : 'active')}
-                  >
-                    <PixelArrowLeftIcon />
-                    <span>{isLegacyMember(selectedMember) ? 'Legacy List' : 'Active Roster'}</span>
-                  </button>
-
-                  <div className="member-profile-topbar-actions">
-                    {isLegacyMember(selectedMember) ? (
-                      <button
-                        type="button"
-                        className="btn-secondary btn-compact btn-restore-inline"
-                        onClick={() => handleRestoreMember(selectedMember)}
-                        title="Restore this member to the active club roster"
-                      >
-                        <PixelRestoreIcon />
-                        <span>Restore</span>
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        className="btn-secondary btn-compact btn-archive-inline"
-                        onClick={() => handleArchiveMember(selectedMember)}
-                        title="Move this graduated or retired member to the Legacy archive"
-                      >
-                        <PixelArchiveIcon />
-                        <span>Retire</span>
-                      </button>
-                    )}
+                  {!isSelfOnlyScope ? (
                     <button
                       type="button"
                       className="btn-secondary btn-compact"
-                      onClick={() => openEditForm(selectedMember)}
+                      onClick={() => openDirectory(isLegacyMember(selectedMember) ? 'legacy' : 'active')}
                     >
-                      <PixelEditIcon />
-                      <span>Edit</span>
+                      <PixelArrowLeftIcon />
+                      <span>{isLegacyMember(selectedMember) ? 'Legacy List' : 'Active Roster'}</span>
                     </button>
-                    <button
-                      type="button"
-                      className="icon-btn icon-btn-danger"
-                      onClick={() => handleRequestDeleteMember(selectedMember)}
-                      aria-label={`Delete ${selectedMember.name}`}
-                      title="Delete member permanently"
-                    >
-                      <PixelTrashIcon />
-                      <span>Delete</span>
-                    </button>
-                  </div>
+                  ) : (
+                    <span className="settings-mode-tag is-cloud">
+                      Linked Roster Profile • Read-only
+                    </span>
+                  )}
+
+                  {canEditRoster && (
+                    <div className="member-profile-topbar-actions">
+                      {isLegacyMember(selectedMember) ? (
+                        <button
+                          type="button"
+                          className="btn-secondary btn-compact btn-restore-inline"
+                          onClick={() => handleRestoreMember(selectedMember)}
+                          title="Restore this member to the active club roster"
+                        >
+                          <PixelRestoreIcon />
+                          <span>Restore</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="btn-secondary btn-compact btn-archive-inline"
+                          onClick={() => handleArchiveMember(selectedMember)}
+                          title="Move this graduated or retired member to the Legacy archive"
+                        >
+                          <PixelArchiveIcon />
+                          <span>Retire</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="btn-secondary btn-compact"
+                        onClick={() => openEditForm(selectedMember)}
+                      >
+                        <PixelEditIcon />
+                        <span>Edit</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn icon-btn-danger"
+                        onClick={() => handleRequestDeleteMember(selectedMember)}
+                        aria-label={`Delete ${selectedMember.name}`}
+                        title="Delete member permanently"
+                      >
+                        <PixelTrashIcon />
+                        <span>Delete</span>
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 <section
@@ -1291,23 +2230,19 @@ export function MemberManagerSidebar({
                             Graduated {selectedMember.graduationYear}
                           </span>
                         )}
-                        {selectedMemberType === 'student' ? (
-                          <>
-                            {selectedMember.className ? (
-                              <span className="member-class-pill">
-                                Class: {selectedMember.className}
-                              </span>
-                            ) : (
-                              <span className="member-muted-pill">
-                                <span>No class set</span>
-                              </span>
-                            )}
-                            <span className="member-type-pill is-student">Student</span>
-                          </>
-                        ) : (
-                          <span className={`member-type-pill is-${selectedMemberType}`}>
-                            {MEMBER_TYPE_LABELS[selectedMemberType]}
+                        <span className={`member-type-pill is-${selectedMemberType}`}>
+                          {MEMBER_TYPE_LABELS[selectedMemberType]}
+                        </span>
+                        {selectedMember.className ? (
+                          <span className="member-class-pill">
+                            Class: {selectedMember.className}
                           </span>
+                        ) : (
+                          selectedMemberType === 'student' && (
+                            <span className="member-muted-pill">
+                              <span>No class set</span>
+                            </span>
+                          )
                         )}
                         {selectedMember.role ? (
                           <span className="member-role-pill">{selectedMember.role}</span>
@@ -1325,7 +2260,8 @@ export function MemberManagerSidebar({
                               : `Added ${formatTimestamp(selectedMember.createdAt)}`}
                           </span>
                         </span>
-                        {activeProfileStats.currentPresentStreak >= STREAK_HIGHLIGHT_THRESHOLD && (
+                        {canShowSelectedMemberRates &&
+                          activeProfileStats.currentPresentStreak >= STREAK_HIGHLIGHT_THRESHOLD && (
                           <span
                             className="member-streak-badge"
                             title={`Active attendance streak: ${activeProfileStats.currentPresentStreak} consecutive sessions present`}
@@ -1334,8 +2270,9 @@ export function MemberManagerSidebar({
                             <span>{activeProfileStats.currentPresentStreak} Session Streak</span>
                           </span>
                         )}
-                        {activeProfileStats.consecutiveUnexcusedAbsences >=
-                          CONSECUTIVE_ABSENCE_ALERT_THRESHOLD && (
+                        {canShowSelectedMemberRates &&
+                          activeProfileStats.consecutiveUnexcusedAbsences >=
+                            CONSECUTIVE_ABSENCE_ALERT_THRESHOLD && (
                           <span
                             className="member-absence-alert-badge"
                             title={`Flagged: missed ${activeProfileStats.consecutiveUnexcusedAbsences} consecutive sessions without a reason`}
@@ -1350,8 +2287,9 @@ export function MemberManagerSidebar({
                     </div>
                   </div>
 
-                  {activeProfileStats.consecutiveUnexcusedAbsences >=
-                    CONSECUTIVE_ABSENCE_ALERT_THRESHOLD && (
+                  {canShowSelectedMemberRates &&
+                    activeProfileStats.consecutiveUnexcusedAbsences >=
+                      CONSECUTIVE_ABSENCE_ALERT_THRESHOLD && (
                     <div className="member-tracking-banner is-warning" role="status">
                       <PixelAlertIcon width={14} height={14} />
                       <span>
@@ -1362,7 +2300,8 @@ export function MemberManagerSidebar({
                     </div>
                   )}
 
-                  {activeProfileStats.currentPresentStreak >= STREAK_HIGHLIGHT_THRESHOLD && (
+                  {canShowSelectedMemberRates &&
+                    activeProfileStats.currentPresentStreak >= STREAK_HIGHLIGHT_THRESHOLD && (
                     <div className="member-tracking-banner is-streak" role="status">
                       <PixelFlameIcon width={14} height={14} />
                       <span>
@@ -1405,7 +2344,9 @@ export function MemberManagerSidebar({
                   )}
                 </section>
 
-                <MemberAttendanceRing stats={activeProfileStats} />
+                {canShowSelectedMemberRates ? (
+                  <>
+                    <MemberAttendanceRing stats={activeProfileStats} />
 
                 <section className="member-stats-grid" aria-label="Attendance summary metrics">
                   <article className="day-metric" data-accent="green">
@@ -1529,10 +2470,20 @@ export function MemberManagerSidebar({
                     </>
                   )}
                 </section>
+                  </>
+                ) : (
+                  <div className="member-tracking-banner" role="status">
+                    <PixelAlertIcon width={14} height={14} />
+                    <span>
+                      Attendance rates, streaks, and absence history are currently hidden under
+                      Club Member Visibility Permissions.
+                    </span>
+                  </div>
+                )}
               </div>
             )}
 
-            {(viewMode === 'add' || viewMode === 'edit') && (
+            {canEditRoster && (viewMode === 'add' || viewMode === 'edit') && (
               <form className="member-form" onSubmit={handleFormSubmit} noValidate>
                 <div className="member-profile-topbar">
                   <button
@@ -1543,6 +2494,17 @@ export function MemberManagerSidebar({
                     <PixelArrowLeftIcon />
                     <span>{viewMode === 'edit' ? 'Back to Profile' : 'All Members'}</span>
                   </button>
+
+                  {viewMode === 'add' && (
+                    <button
+                      type="button"
+                      className="btn-secondary btn-compact"
+                      onClick={openBulkAddForm}
+                    >
+                      <PixelUsersIcon />
+                      <span>Bulk Add</span>
+                    </button>
+                  )}
                 </div>
 
                 {formError && (
@@ -1551,23 +2513,163 @@ export function MemberManagerSidebar({
                   </div>
                 )}
 
-                <div className="form-field">
-                  <label htmlFor={nameInputId}>
-                    Full Name <span className="required-mark">*</span>
-                  </label>
-                  <input
-                    ref={nameInputRef}
-                    id={nameInputId}
-                    type="text"
-                    className="form-control"
-                    placeholder="e.g. Alex Tan"
-                    value={formValues.name}
-                    onChange={(event) => {
-                      setFormValues((prev) => ({ ...prev, name: event.target.value }));
-                      if (formError) setFormError('');
-                    }}
-                    required
-                  />
+                {viewMode === 'edit' &&
+                  editingTargetId &&
+                  editingBaselineMember &&
+                  (() => {
+                    const liveMember =
+                      members.find((member) => member.id === editingTargetId) ?? null;
+                    if (!liveMember) {
+                      return (
+                        <div className="concurrent-edit-banner is-danger" role="alert">
+                          <div className="concurrent-edit-copy">
+                            <PixelAlertIcon width={14} height={14} />
+                            <div>
+                              <strong>Member removed on another device</strong>
+                              <p>
+                                Saving will re-create this profile as a new member so your edits are
+                                not lost.
+                              </p>
+                            </div>
+                          </div>
+                          <div className="concurrent-edit-actions">
+                            <button
+                              type="button"
+                              className="btn-secondary btn-compact"
+                              onClick={() => {
+                                setEditingTargetId(null);
+                                setEditingBaselineMember(null);
+                                onSelectMember(null);
+                                setViewMode('directory');
+                              }}
+                            >
+                              Return to Directory
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    const baseForm = memberToFormValues(editingBaselineMember);
+                    const remoteForm = memberToFormValues(liveMember);
+                    const hasRemoteProfileChanges =
+                      JSON.stringify(baseForm) !== JSON.stringify(remoteForm);
+
+                    if (!hasRemoteProfileChanges) {
+                      return null;
+                    }
+
+                    const handleMergeUnchanged = () => {
+                      setFormValues((current) => ({
+                        name: current.name === baseForm.name ? remoteForm.name : current.name,
+                        memberType:
+                          current.memberType === baseForm.memberType
+                            ? remoteForm.memberType
+                            : current.memberType,
+                        classYear:
+                          current.classYear === baseForm.classYear
+                            ? remoteForm.classYear
+                            : current.classYear,
+                        classLetter:
+                          current.classLetter === baseForm.classLetter
+                            ? remoteForm.classLetter
+                            : current.classLetter,
+                        legacyClassFallback:
+                          current.legacyClassFallback === baseForm.legacyClassFallback
+                            ? remoteForm.legacyClassFallback
+                            : current.legacyClassFallback,
+                        isLegacy:
+                          current.isLegacy === baseForm.isLegacy
+                            ? remoteForm.isLegacy
+                            : current.isLegacy,
+                        role: current.role === baseForm.role ? remoteForm.role : current.role,
+                        joinedDate:
+                          current.joinedDate === baseForm.joinedDate
+                            ? remoteForm.joinedDate
+                            : current.joinedDate,
+                        email: current.email === baseForm.email ? remoteForm.email : current.email,
+                        phone: current.phone === baseForm.phone ? remoteForm.phone : current.phone,
+                        handle:
+                          current.handle === baseForm.handle ? remoteForm.handle : current.handle,
+                        notes: current.notes === baseForm.notes ? remoteForm.notes : current.notes,
+                      }));
+                      setEditingBaselineMember(liveMember);
+                    };
+
+                    return (
+                      <div className="concurrent-edit-banner" role="status">
+                        <div className="concurrent-edit-copy">
+                          <PixelAlertIcon width={14} height={14} />
+                          <div>
+                            <strong>Updated elsewhere while editing</strong>
+                            <p>
+                              Another tab or device updated this profile. Load the latest version or
+                              merge unchanged fields.
+                            </p>
+                          </div>
+                        </div>
+                        <div className="concurrent-edit-actions">
+                          <button
+                            type="button"
+                            className="btn-secondary btn-compact"
+                            onClick={() => {
+                              setFormValues(remoteForm);
+                              setEditingBaselineMember(liveMember);
+                            }}
+                          >
+                            Load Latest
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-primary btn-compact"
+                            onClick={handleMergeUnchanged}
+                          >
+                            Merge Unchanged Fields
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                <div className="modal-grid-2">
+                  <div className="form-field">
+                    <label htmlFor={nameInputId}>
+                      Full Name <span className="required-mark">*</span>
+                    </label>
+                    <input
+                      ref={nameInputRef}
+                      id={nameInputId}
+                      type="text"
+                      className="form-control"
+                      placeholder="e.g. John Doe"
+                      value={formValues.name}
+                      onChange={(event) => {
+                        setFormValues((prev) => ({ ...prev, name: event.target.value }));
+                        if (formError) setFormError('');
+                      }}
+                      required
+                    />
+                  </div>
+
+                  <div className="form-field">
+                    <label htmlFor={roleInputId}>
+                      Club Role <span className="required-mark">*</span>
+                    </label>
+                    <input
+                      ref={roleInputRef}
+                      id={roleInputId}
+                      type="text"
+                      list={roleListId}
+                      className="form-control"
+                      placeholder="e.g. Captain, Advisor, Member"
+                      value={formValues.role}
+                      onChange={(event) => {
+                        setFormValues((prev) => ({ ...prev, role: event.target.value }));
+                        if (formError) setFormError('');
+                      }}
+                      required
+                    />
+                  </div>
                 </div>
 
                 <div className="form-field">
@@ -1589,7 +2691,24 @@ export function MemberManagerSidebar({
                           aria-checked={isSelected}
                           className={`member-type-option is-${typeOption} ${isSelected ? 'is-selected' : ''}`}
                           onClick={() => {
-                            setFormValues((prev) => ({ ...prev, memberType: typeOption }));
+                            setFormValues((prev) => {
+                              if (typeOption !== 'student') {
+                                return {
+                                  ...prev,
+                                  memberType: typeOption,
+                                  classYear: '',
+                                  classLetter: 'N/A',
+                                };
+                              }
+                              return {
+                                ...prev,
+                                memberType: typeOption,
+                                classLetter:
+                                  prev.memberType !== 'student' && prev.classLetter === 'N/A'
+                                    ? ''
+                                    : prev.classLetter,
+                              };
+                            });
                             if (formError) setFormError('');
                           }}
                         >
@@ -1600,109 +2719,110 @@ export function MemberManagerSidebar({
                   </div>
                 </div>
 
-                {formValues.memberType === 'student' && (
-                  <div className="form-field">
-                    <div className="member-class-field-header">
-                      <label htmlFor={classYearInputId}>
-                        Year &amp; Class <span className="required-mark">*</span>
-                      </label>
-                      {formValues.classYear !== '' && formValues.classLetter !== '' && (
-                        <span className="member-class-pill member-class-preview" aria-live="polite">
-                          {formatStudentClassName(formValues.classYear, formValues.classLetter)}
-                        </span>
+                <div className="form-field">
+                  <div className="member-class-field-header">
+                    <label htmlFor={classYearInputId}>
+                      Year &amp; Class{' '}
+                      {formValues.memberType === 'student' ? (
+                        <span className="required-mark">*</span>
+                      ) : (
+                        <span className="optional-mark">(N/A by default)</span>
                       )}
-                    </div>
+                    </label>
+                    {(formValues.classLetter === 'N/A' ||
+                      (formValues.classYear !== '' && formValues.classLetter !== '')) && (
+                      <span className="member-class-pill member-class-preview" aria-live="polite">
+                        {formValues.classLetter === 'N/A'
+                          ? 'N/A'
+                          : formatStudentClassName(
+                              formValues.classYear as ClassYear,
+                              formValues.classLetter as ClassLetter,
+                            )}
+                      </span>
+                    )}
+                  </div>
 
-                    {formValues.legacyClassFallback &&
-                      formValues.classYear === '' &&
-                      formValues.classLetter === '' && (
-                        <p className="member-class-legacy-hint">
-                          Previous class: <strong>{formValues.legacyClassFallback}</strong> — choose
-                          a Year (7–11) and Class (T, E, N, B) below.
-                        </p>
-                      )}
+                  {formValues.legacyClassFallback &&
+                    formValues.classYear === '' &&
+                    formValues.classLetter === '' && (
+                      <p className="member-class-legacy-hint">
+                        Previous class: <strong>{formValues.legacyClassFallback}</strong> — choose
+                        a Year (7–11) and Class (T, E, N, B) or N/A below.
+                      </p>
+                    )}
 
-                    <div className="member-class-builder">
-                      <select
-                        ref={classYearSelectRef}
-                        id={classYearInputId}
-                        className="form-control member-class-year-select"
-                        value={formValues.classYear}
-                        aria-label="Student Year (Year 7 to Year 11)"
-                        onChange={(event) => {
-                          const raw = event.target.value;
+                  <div className="member-class-builder">
+                    <select
+                      ref={classYearSelectRef}
+                      id={classYearInputId}
+                      className="form-control member-class-year-select"
+                      value={formValues.classLetter === 'N/A' ? 'N/A' : formValues.classYear}
+                      aria-label="Member Year (Year 7 to Year 11, or N/A)"
+                      onChange={(event) => {
+                        const raw = event.target.value;
+                        if (raw === 'N/A') {
+                          setFormValues((prev) => ({
+                            ...prev,
+                            classYear: '',
+                            classLetter: 'N/A',
+                          }));
+                        } else {
                           const nextYear = raw ? (Number(raw) as ClassYear) : '';
                           setFormValues((prev) => ({
                             ...prev,
                             classYear: nextYear,
+                            classLetter: prev.classLetter === 'N/A' ? '' : prev.classLetter,
                           }));
-                          if (formError) setFormError('');
-                        }}
-                        required={!formValues.isLegacy}
-                      >
-                        <option value="">Select Year...</option>
-                        {CLASS_YEARS.map((year) => (
-                          <option key={year} value={year}>
-                            Year {year}
-                          </option>
-                        ))}
-                      </select>
+                        }
+                        if (formError) setFormError('');
+                      }}
+                      required={formValues.memberType === 'student' && !formValues.isLegacy}
+                    >
+                      <option value="">Select Year...</option>
+                      {CLASS_YEARS.map((year) => (
+                        <option key={year} value={year}>
+                          Year {year}
+                        </option>
+                      ))}
+                      <option value="N/A">N/A (No Class)</option>
+                    </select>
 
-                      <div
-                        className="member-class-letter-group"
-                        role="radiogroup"
-                        aria-labelledby={classLetterLabelId}
-                      >
-                        <span id={classLetterLabelId} className="sr-only">
-                          Class letter T, E, N, or B
-                        </span>
-                        {CLASS_LETTERS.map((letter) => {
-                          const isSelected = formValues.classLetter === letter;
-                          return (
-                            <button
-                              key={letter}
-                              type="button"
-                              role="radio"
-                              aria-checked={isSelected}
-                              className={`member-class-letter-btn ${isSelected ? 'is-selected' : ''}`}
-                              onClick={() => {
-                                setFormValues((prev) => ({ ...prev, classLetter: letter }));
-                                if (formError) setFormError('');
-                              }}
-                              title={`Class ${letter}`}
-                            >
-                              {letter}
-                            </button>
-                          );
-                        })}
-                      </div>
+                    <div
+                      className="member-class-letter-group"
+                      role="radiogroup"
+                      aria-labelledby={classLetterLabelId}
+                    >
+                      <span id={classLetterLabelId} className="sr-only">
+                        Class letter T, E, N, B, or N/A
+                      </span>
+                      {CLASS_LETTERS.map((letter) => {
+                        const isSelected = formValues.classLetter === letter;
+                        return (
+                          <button
+                            key={letter}
+                            type="button"
+                            role="radio"
+                            aria-checked={isSelected}
+                            className={`member-class-letter-btn ${isSelected ? 'is-selected' : ''}`}
+                            onClick={() => {
+                              setFormValues((prev) => ({
+                                ...prev,
+                                classYear: letter === 'N/A' ? '' : prev.classYear,
+                                classLetter: letter,
+                              }));
+                              if (formError) setFormError('');
+                            }}
+                            title={letter === 'N/A' ? 'No standard class (N/A)' : `Class ${letter}`}
+                          >
+                            {letter}
+                          </button>
+                        );
+                      })}
                     </div>
                   </div>
-                )}
+                </div>
 
                 <div className="modal-grid-2">
-                  <div className="form-field">
-                    <label htmlFor={roleInputId}>
-                      Club Role <span className="optional-mark">(Optional)</span>
-                    </label>
-                    <input
-                      id={roleInputId}
-                      type="text"
-                      list={roleListId}
-                      className="form-control"
-                      placeholder="e.g. Captain, Member"
-                      value={formValues.role}
-                      onChange={(event) =>
-                        setFormValues((prev) => ({ ...prev, role: event.target.value }))
-                      }
-                    />
-                    <datalist id={roleListId}>
-                      {ROLE_SUGGESTIONS.map((role) => (
-                        <option key={role} value={role} />
-                      ))}
-                    </datalist>
-                  </div>
-
                   <div className="form-field">
                     <label htmlFor={joinedInputId}>
                       Joined Date <span className="optional-mark">(Optional)</span>
@@ -1717,6 +2837,22 @@ export function MemberManagerSidebar({
                       }
                     />
                   </div>
+
+                  <div className="form-field">
+                    <label htmlFor={handleInputId}>
+                      Handle / Member ID <span className="optional-mark">(Optional)</span>
+                    </label>
+                    <input
+                      id={handleInputId}
+                      type="text"
+                      className="form-control"
+                      placeholder="e.g. @johndoe or TS-014"
+                      value={formValues.handle}
+                      onChange={(event) =>
+                        setFormValues((prev) => ({ ...prev, handle: event.target.value }))
+                      }
+                    />
+                  </div>
                 </div>
 
                 <div className="modal-grid-2">
@@ -1728,7 +2864,7 @@ export function MemberManagerSidebar({
                       id={emailInputId}
                       type="email"
                       className="form-control"
-                      placeholder="name@example.com"
+                      placeholder="john.doe@example.com"
                       value={formValues.email}
                       onChange={(event) =>
                         setFormValues((prev) => ({ ...prev, email: event.target.value }))
@@ -1751,22 +2887,6 @@ export function MemberManagerSidebar({
                       }
                     />
                   </div>
-                </div>
-
-                <div className="form-field">
-                  <label htmlFor={handleInputId}>
-                    Handle / Member ID <span className="optional-mark">(Optional)</span>
-                  </label>
-                  <input
-                    id={handleInputId}
-                    type="text"
-                    className="form-control"
-                    placeholder="e.g. @alextan or TS-014"
-                    value={formValues.handle}
-                    onChange={(event) =>
-                      setFormValues((prev) => ({ ...prev, handle: event.target.value }))
-                    }
-                  />
                 </div>
 
                 <div className="form-field">
@@ -1804,7 +2924,674 @@ export function MemberManagerSidebar({
                 </div>
               </form>
             )}
+
+            {canEditRoster && viewMode === 'bulk_add' && (
+              <form className="member-form member-bulk-form" onSubmit={handleBulkSubmit} noValidate>
+                <div className="member-profile-topbar">
+                  <button
+                    type="button"
+                    className="btn-secondary btn-compact"
+                    onClick={() => openDirectory('active')}
+                  >
+                    <PixelArrowLeftIcon />
+                    <span>Active Roster</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    className="btn-secondary btn-compact"
+                    onClick={openAddForm}
+                  >
+                    <PixelPlusIcon />
+                    <span>Single Member</span>
+                  </button>
+                </div>
+
+                {bulkError && (
+                  <div className="modal-error" role="alert">
+                    {bulkError}
+                  </div>
+                )}
+
+                <div className="form-field">
+                  <div className="member-class-field-header">
+                    <label htmlFor={bulkTextareaId}>
+                      Member Names (One Per Line) <span className="required-mark">*</span>
+                    </label>
+                    <span className="member-bulk-line-hint">Spaces kept intact</span>
+                  </div>
+                  <textarea
+                    ref={bulkTextareaRef}
+                    id={bulkTextareaId}
+                    className="form-control form-textarea member-bulk-textarea"
+                    rows={7}
+                    placeholder="John Doe"
+                    value={bulkText}
+                    onChange={(event) => {
+                      setBulkText(event.target.value);
+                      if (bulkError) setBulkError('');
+                    }}
+                  />
+                  <p className="member-bulk-helper">
+                    Paste or type one full name per line. Blank lines and duplicate names already in
+                    the active roster are automatically skipped.
+                  </p>
+                </div>
+
+                <div className="modal-grid-2">
+                  <div className="form-field">
+                    <label htmlFor={bulkRoleInputId}>
+                      Club Role <span className="required-mark">*</span>
+                    </label>
+                    <input
+                      ref={bulkRoleInputRef}
+                      id={bulkRoleInputId}
+                      type="text"
+                      list={roleListId}
+                      className="form-control"
+                      placeholder="e.g. Captain, Advisor, Member"
+                      value={bulkRole}
+                      onChange={(event) => {
+                        setBulkRole(event.target.value);
+                        if (bulkError) setBulkError('');
+                      }}
+                      required
+                    />
+                  </div>
+
+                  <div className="form-field">
+                    <label htmlFor={bulkJoinedInputId}>
+                      Joined Date <span className="optional-mark">(Optional)</span>
+                    </label>
+                    <input
+                      id={bulkJoinedInputId}
+                      type="date"
+                      className="form-control"
+                      value={bulkJoinedDate}
+                      onChange={(event) => setBulkJoinedDate(event.target.value)}
+                    />
+                  </div>
+                </div>
+
+                <div className="form-field">
+                  <div className="member-class-field-header">
+                    <label htmlFor={bulkClassYearInputId}>
+                      Default Year &amp; Class <span className="optional-mark">(Optional)</span>
+                    </label>
+                    <div className="member-bulk-class-actions">
+                      {(bulkClassLetter === 'N/A' ||
+                        (bulkClassYear !== '' && bulkClassLetter !== '')) && (
+                        <span className="member-class-pill member-class-preview" aria-live="polite">
+                          {bulkClassLetter === 'N/A'
+                            ? 'N/A'
+                            : formatStudentClassName(
+                                bulkClassYear as ClassYear,
+                                bulkClassLetter as ClassLetter,
+                              )}
+                        </span>
+                      )}
+                      {(bulkClassYear !== '' || bulkClassLetter !== '') && (
+                        <button
+                          type="button"
+                          className="ring-reset-btn"
+                          onClick={() => {
+                            setBulkClassYear('');
+                            setBulkClassLetter('');
+                            if (bulkError) setBulkError('');
+                          }}
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="member-class-builder">
+                    <select
+                      ref={bulkClassYearSelectRef}
+                      id={bulkClassYearInputId}
+                      className="form-control member-class-year-select"
+                      value={bulkClassLetter === 'N/A' ? 'N/A' : bulkClassYear}
+                      aria-label="Optional default Year (Year 7 to Year 11, or N/A)"
+                      onChange={(event) => {
+                        const raw = event.target.value;
+                        if (raw === 'N/A') {
+                          setBulkClassYear('');
+                          setBulkClassLetter('N/A');
+                        } else {
+                          setBulkClassYear(raw ? (Number(raw) as ClassYear) : '');
+                          if (bulkClassLetter === 'N/A') {
+                            setBulkClassLetter('');
+                          }
+                        }
+                        if (bulkError) setBulkError('');
+                      }}
+                    >
+                      <option value="">No Year (Optional)</option>
+                      {CLASS_YEARS.map((year) => (
+                        <option key={year} value={year}>
+                          Year {year}
+                        </option>
+                      ))}
+                      <option value="N/A">N/A (No Class)</option>
+                    </select>
+
+                    <div
+                      className="member-class-letter-group"
+                      role="radiogroup"
+                      aria-labelledby={bulkClassLetterLabelId}
+                    >
+                      <span id={bulkClassLetterLabelId} className="sr-only">
+                        Optional batch class letter T, E, N, B, or N/A
+                      </span>
+                      {CLASS_LETTERS.map((letter) => {
+                        const isSelected = bulkClassLetter === letter;
+                        return (
+                          <button
+                            key={letter}
+                            type="button"
+                            role="radio"
+                            aria-checked={isSelected}
+                            className={`member-class-letter-btn ${isSelected ? 'is-selected' : ''}`}
+                            onClick={() => {
+                              if (letter === 'N/A') {
+                                setBulkClassYear('');
+                                setBulkClassLetter((prev) => (prev === 'N/A' ? '' : 'N/A'));
+                              } else {
+                                setBulkClassLetter((prev) => (prev === letter ? '' : letter));
+                              }
+                              if (bulkError) setBulkError('');
+                            }}
+                            title={
+                              isSelected
+                                ? `Clear class ${letter}`
+                                : letter === 'N/A'
+                                  ? 'Apply N/A class to batch'
+                                  : `Apply class ${letter} to batch`
+                            }
+                          >
+                            {letter}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="form-field">
+                  <label htmlFor={bulkNotesInputId}>
+                    Notes <span className="optional-mark">(Optional)</span>
+                  </label>
+                  <textarea
+                    id={bulkNotesInputId}
+                    className="form-control form-textarea"
+                    rows={2}
+                    placeholder="Team division, skills, availability, or admin notes..."
+                    value={bulkNotes}
+                    onChange={(event) => setBulkNotes(event.target.value)}
+                  />
+                </div>
+
+                <section className="member-bulk-preview-box" aria-label="Bulk add preview">
+                  <div className="member-bulk-stats-row">
+                    <span
+                      className={`member-bulk-stat-chip ${
+                        bulkReadyCount > 0 ? 'is-ready' : ''
+                      }`}
+                    >
+                      {bulkReadyCount} ready to add
+                    </span>
+
+                    {!bulkRole.trim() && (
+                      <span className="member-bulk-stat-chip is-skipped">
+                        Club role required
+                      </span>
+                    )}
+
+                    {bulkParseResult.skippedActiveDuplicates.length +
+                      bulkParseResult.skippedBatchDuplicates.length >
+                      0 && (
+                      <span className="member-bulk-stat-chip is-skipped">
+                        {bulkParseResult.skippedActiveDuplicates.length +
+                          bulkParseResult.skippedBatchDuplicates.length}{' '}
+                        duplicate
+                        {bulkParseResult.skippedActiveDuplicates.length +
+                          bulkParseResult.skippedBatchDuplicates.length ===
+                        1
+                          ? ''
+                          : 's'}{' '}
+                        skipped
+                      </span>
+                    )}
+
+                    {bulkParseResult.blankLineCount > 0 && bulkText.trim().length > 0 && (
+                      <span className="member-bulk-stat-chip">
+                        {bulkParseResult.blankLineCount} blank ignored
+                      </span>
+                    )}
+                  </div>
+
+                  {(bulkRole.trim() || bulkJoinedDate.trim() || bulkNotes.trim()) && (
+                    <div className="member-bulk-batch-meta" aria-label="Batch metadata applied to all queued members">
+                      {bulkRole.trim() && (
+                        <span className="member-role-pill">Role: {bulkRole.trim()}</span>
+                      )}
+                      {bulkJoinedDate.trim() && (
+                        <span className="member-joined-pill">
+                          Joined: {formatSessionDate(bulkJoinedDate.trim())}
+                        </span>
+                      )}
+                      {bulkNotes.trim() && (
+                        <span className="member-bulk-stat-chip" title={bulkNotes.trim()}>
+                          Notes attached
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  {bulkReadyCount > 0 ? (
+                    <ul className="member-bulk-name-list" aria-label="Members queued to be added">
+                      {bulkParseResult.namesToAdd.map((name, index) => (
+                        <li key={`${name}-${index}`} className="member-bulk-name-chip">
+                          <span>{name}</span>
+                          {(bulkClassLetter === 'N/A' ||
+                            (bulkClassYear !== '' && bulkClassLetter !== '')) && (
+                            <span className="member-bulk-chip-class">
+                              {bulkClassLetter === 'N/A'
+                                ? 'N/A'
+                                : formatStudentClassName(
+                                    bulkClassYear as ClassYear,
+                                    bulkClassLetter as ClassLetter,
+                                  )}
+                            </span>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="member-bulk-preview-empty">
+                      {bulkText.trim().length === 0
+                        ? 'Preview will appear here as you paste or type names above.'
+                        : 'No new unique names to add yet.'}
+                    </p>
+                  )}
+
+                  {(bulkParseResult.skippedActiveDuplicates.length > 0 ||
+                    bulkParseResult.skippedBatchDuplicates.length > 0) && (
+                    <div className="member-bulk-skipped-note">
+                      {bulkParseResult.skippedActiveDuplicates.length > 0 && (
+                        <span>
+                          Already in active roster:{' '}
+                          {bulkParseResult.skippedActiveDuplicates.join(', ')}
+                        </span>
+                      )}
+                      {bulkParseResult.skippedBatchDuplicates.length > 0 && (
+                        <span>
+                          Repeated in list: {bulkParseResult.skippedBatchDuplicates.join(', ')}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </section>
+
+                <div className="modal-footer">
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => openDirectory('active')}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn-primary"
+                    disabled={bulkReadyCount === 0}
+                    aria-label={
+                      bulkReadyCount === 0
+                        ? 'Add Members'
+                        : `Add ${bulkReadyCount} ${bulkReadyCount === 1 ? 'Member' : 'Members'}`
+                    }
+                  >
+                    <PixelPlusIcon />
+                    <span>
+                      {bulkReadyCount === 0 ? (
+                        'Add Members'
+                      ) : (
+                        <>
+                          Add <span className="btn-primary-count">{bulkReadyCount}</span>{' '}
+                          {bulkReadyCount === 1 ? 'Member' : 'Members'}
+                        </>
+                      )}
+                    </span>
+                  </button>
+                </div>
+              </form>
+            )}
           </div>
+
+          {canEditRoster &&
+            viewMode === 'directory' &&
+            isSelectionMode &&
+            selectedMembersList.length > 0 && (
+            <div className="member-bulk-action-bar" role="region" aria-label="Bulk member actions">
+              {bulkPanelMode === 'change_class' && (
+                <form className="member-bulk-class-popover" onSubmit={handleApplyBulkClassUpdate}>
+                  <div className="member-bulk-popover-header">
+                    <span className="member-section-label">Change Year / Class</span>
+                    <button
+                      type="button"
+                      className="ring-reset-btn"
+                      onClick={() => {
+                        setBulkPanelMode('none');
+                        setBulkActionError('');
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+
+                  <p className="member-bulk-popover-note">
+                    {bulkTargetLetter === 'N/A' ? (
+                      <>
+                        Applies <strong>Class N/A</strong> to all{' '}
+                        <strong>
+                          {selectedMembersList.length}{' '}
+                          {selectedMembersList.length === 1 ? 'member' : 'members'}
+                        </strong>
+                        .
+                      </>
+                    ) : (
+                      <>
+                        Applies to{' '}
+                        <strong>
+                          {selectedStudentMembers.length}{' '}
+                          {selectedStudentMembers.length === 1 ? 'student' : 'students'}
+                        </strong>
+                        {selectedMembersList.length > selectedStudentMembers.length &&
+                          ` (${selectedMembersList.length - selectedStudentMembers.length} non-student skipped unless N/A is chosen)`}
+                        . Leave Year or Class unchanged to update only the other.
+                      </>
+                    )}
+                  </p>
+
+                  {bulkActionError && (
+                    <div className="modal-error" role="alert">
+                      {bulkActionError}
+                    </div>
+                  )}
+
+                  {bulkTargetLetter !== 'N/A' &&
+                    classUpdatePreview.missingComplementCount > 0 &&
+                    (bulkTargetYear !== '' || bulkTargetLetter !== '') && (
+                      <p className="member-bulk-popover-warning">
+                        {classUpdatePreview.missingComplementCount}{' '}
+                        {classUpdatePreview.missingComplementCount === 1
+                          ? 'student has'
+                          : 'students have'}{' '}
+                        no standard class — select both Year and Class to update them too.
+                      </p>
+                    )}
+
+                  <div className="member-class-builder">
+                    <select
+                      className="form-control member-class-year-select"
+                      value={bulkTargetLetter === 'N/A' ? 'N/A' : bulkTargetYear}
+                      aria-label="Target Year for selected members"
+                      onChange={(event) => {
+                        const raw = event.target.value;
+                        if (raw === 'N/A') {
+                          setBulkTargetYear('');
+                          setBulkTargetLetter('N/A');
+                        } else {
+                          setBulkTargetYear(raw ? (Number(raw) as ClassYear) : '');
+                          if (bulkTargetLetter === 'N/A') {
+                            setBulkTargetLetter('');
+                          }
+                        }
+                        if (bulkActionError) setBulkActionError('');
+                      }}
+                    >
+                      <option value="">Keep Year</option>
+                      {CLASS_YEARS.map((year) => (
+                        <option key={year} value={year}>
+                          Year {year}
+                        </option>
+                      ))}
+                      <option value="N/A">N/A (No Class)</option>
+                    </select>
+
+                    <div
+                      className="member-class-letter-group"
+                      role="radiogroup"
+                      aria-label="Target Class letter"
+                    >
+                      {CLASS_LETTERS.map((letter) => {
+                        const isSelected = bulkTargetLetter === letter;
+                        return (
+                          <button
+                            key={letter}
+                            type="button"
+                            role="radio"
+                            aria-checked={isSelected}
+                            className={`member-class-letter-btn ${isSelected ? 'is-selected' : ''}`}
+                            onClick={() => {
+                              if (letter === 'N/A') {
+                                setBulkTargetYear('');
+                                setBulkTargetLetter((prev) => (prev === 'N/A' ? '' : 'N/A'));
+                              } else {
+                                setBulkTargetLetter((prev) => (prev === letter ? '' : letter));
+                              }
+                              if (bulkActionError) setBulkActionError('');
+                            }}
+                            title={
+                              isSelected
+                                ? `Keep existing class`
+                                : letter === 'N/A'
+                                  ? 'Set Class N/A'
+                                  : `Set Class ${letter}`
+                            }
+                          >
+                            {letter}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="member-bulk-popover-footer">
+                    <button
+                      type="submit"
+                      className="btn-primary btn-compact-primary"
+                      disabled={
+                        bulkTargetLetter === 'N/A'
+                          ? selectedMembersList.length === 0
+                          : selectedStudentMembers.length === 0
+                      }
+                    >
+                      Apply to{' '}
+                      <span className="btn-primary-count">
+                        {classUpdatePreview.eligibleCount > 0
+                          ? classUpdatePreview.eligibleCount
+                          : bulkTargetLetter === 'N/A'
+                            ? selectedMembersList.length
+                            : selectedStudentMembers.length}
+                      </span>
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {bulkPanelMode === 'restore_class' && (
+                <form
+                  className="member-bulk-class-popover"
+                  onSubmit={handleConfirmBulkRestoreWithClass}
+                >
+                  <div className="member-bulk-popover-header">
+                    <span className="member-section-label">Assign Class to Restore</span>
+                    <button
+                      type="button"
+                      className="ring-reset-btn"
+                      onClick={() => {
+                        setBulkPanelMode('none');
+                        setBulkActionError('');
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+
+                  <p className="member-bulk-popover-note">
+                    {selectedLegacyStudentsMissingClass.length} selected legacy{' '}
+                    {selectedLegacyStudentsMissingClass.length === 1 ? 'student lacks' : 'students lack'}{' '}
+                    a structured Year &amp; Class. Choose one to restore all{' '}
+                    {selectedMembersList.length} selected members to the Active Roster.
+                  </p>
+
+                  {bulkActionError && (
+                    <div className="modal-error" role="alert">
+                      {bulkActionError}
+                    </div>
+                  )}
+
+                  <div className="member-class-builder">
+                    <select
+                      className="form-control member-class-year-select"
+                      value={bulkTargetLetter === 'N/A' ? 'N/A' : bulkTargetYear}
+                      aria-label="Fallback Year for restoring students"
+                      onChange={(event) => {
+                        const raw = event.target.value;
+                        if (raw === 'N/A') {
+                          setBulkTargetYear('');
+                          setBulkTargetLetter('N/A');
+                        } else {
+                          setBulkTargetYear(raw ? (Number(raw) as ClassYear) : '');
+                          if (bulkTargetLetter === 'N/A') {
+                            setBulkTargetLetter('');
+                          }
+                        }
+                        if (bulkActionError) setBulkActionError('');
+                      }}
+                    >
+                      <option value="">Select Year...</option>
+                      {CLASS_YEARS.map((year) => (
+                        <option key={year} value={year}>
+                          Year {year}
+                        </option>
+                      ))}
+                      <option value="N/A">N/A (No Class)</option>
+                    </select>
+
+                    <div
+                      className="member-class-letter-group"
+                      role="radiogroup"
+                      aria-label="Fallback Class letter"
+                    >
+                      {CLASS_LETTERS.map((letter) => {
+                        const isSelected = bulkTargetLetter === letter;
+                        return (
+                          <button
+                            key={letter}
+                            type="button"
+                            role="radio"
+                            aria-checked={isSelected}
+                            className={`member-class-letter-btn ${isSelected ? 'is-selected' : ''}`}
+                            onClick={() => {
+                              if (letter === 'N/A') {
+                                setBulkTargetYear('');
+                              }
+                              setBulkTargetLetter(letter);
+                              if (bulkActionError) setBulkActionError('');
+                            }}
+                          >
+                            {letter}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="member-bulk-popover-footer">
+                    <button type="submit" className="btn-primary btn-compact-primary">
+                      Restore &amp; Save
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              <div className="member-bulk-action-summary">
+                <span className="selection-count-pill">
+                  {selectedMembersList.length} selected
+                </span>
+                <span className="member-bulk-action-hint">Click or drag rows</span>
+              </div>
+
+              <div className="member-bulk-action-buttons">
+                {directoryScope === 'legacy' ? (
+                  <button
+                    type="button"
+                    className="btn-secondary btn-compact btn-restore-inline"
+                    disabled={!canManageClubRecords}
+                    onClick={handleBulkRestoreSelected}
+                    title={
+                      canManageClubRecords
+                        ? 'Restore selected members to Active Roster'
+                        : 'Admin privileges required for bulk actions'
+                    }
+                  >
+                    <PixelRestoreIcon />
+                    <span>Restore</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn-secondary btn-compact btn-archive-inline"
+                    disabled={!canManageClubRecords}
+                    onClick={handleBulkArchiveSelected}
+                    title={
+                      canManageClubRecords
+                        ? 'Move selected members to Legacy / Retired'
+                        : 'Admin privileges required for bulk actions'
+                    }
+                  >
+                    <PixelArchiveIcon />
+                    <span>Archive</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  className={`btn-secondary btn-compact ${
+                    bulkPanelMode === 'change_class' ? 'is-active' : ''
+                  }`}
+                  onClick={handleOpenChangeClassPanel}
+                  disabled={!canManageClubRecords || selectedMembersList.length === 0}
+                  title={
+                    canManageClubRecords
+                      ? 'Change Year or Class (including N/A) for selected members'
+                      : 'Admin privileges required for bulk class updates'
+                  }
+                >
+                  <PixelEditIcon />
+                  <span>Year / Class</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="btn-danger btn-compact"
+                  disabled={!canManageClubRecords}
+                  onClick={handleRequestBulkDelete}
+                  title={
+                    canManageClubRecords
+                      ? 'Permanently delete selected members'
+                      : 'Admin privileges required to delete members'
+                  }
+                >
+                  <PixelTrashIcon />
+                  <span>Delete ({selectedMembersList.length})</span>
+                </button>
+              </div>
+            </div>
+          )}
         </aside>
 
       <ConfirmDialog
@@ -1819,6 +3606,42 @@ export function MemberManagerSidebar({
         confirmLabel="Delete Member"
         onConfirm={handleConfirmDelete}
         onCancel={() => setPendingDeleteMember(null)}
+      />
+
+      <ConfirmDialog
+        isOpen={pendingBulkDeleteIds !== null && pendingBulkDeleteIds.length > 0}
+        badgeLabel="Bulk Delete"
+        title={
+          pendingBulkDeleteIds
+            ? pendingBulkDeleteIds.length === 1
+              ? `Permanently delete "${
+                  members.find((m) => m.id === pendingBulkDeleteIds[0])?.name ?? '1 member'
+                }"?`
+              : `Permanently delete ${pendingBulkDeleteIds.length} selected members?`
+            : ''
+        }
+        message={(() => {
+          if (!pendingBulkDeleteIds || pendingBulkDeleteIds.length === 0) return '';
+          const names = pendingBulkDeleteIds
+            .map((memberId) => members.find((m) => m.id === memberId)?.name)
+            .filter((name): name is string => Boolean(name));
+          const preview =
+            names.length <= 3
+              ? names.join(', ')
+              : `${names.slice(0, 3).join(', ')} and ${names.length - 3} more`;
+          return `This will permanently delete ${
+            names.length > 0 ? preview : `${pendingBulkDeleteIds.length} members`
+          } along with all their attendance records across every saved session, both locally and in Supabase Cloud Sync.`;
+        })()}
+        confirmLabel={
+          pendingBulkDeleteIds
+            ? `Delete ${pendingBulkDeleteIds.length} ${
+                pendingBulkDeleteIds.length === 1 ? 'Member' : 'Members'
+              }`
+            : 'Delete Selected'
+        }
+        onConfirm={handleConfirmBulkDelete}
+        onCancel={() => setPendingBulkDeleteIds(null)}
       />
     </>
   );

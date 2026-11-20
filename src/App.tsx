@@ -1,30 +1,42 @@
-import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { AttendanceLeaderboard } from './components/AttendanceLeaderboard';
 import { AttendanceWorkspace } from './components/AttendanceWorkspace';
 import { CloudSyncModal } from './components/CloudSyncModal';
 import { CreateSessionModal } from './components/CreateSessionModal';
 import { Header } from './components/Header';
 import { MemberManagerSidebar } from './components/MemberManagerSidebar';
 import { Preloader } from './components/Preloader';
+import { ProjectIdeasWorkspace } from './components/ProjectIdeasWorkspace';
 import { SessionCalendarWorkspace } from './components/SessionCalendarWorkspace';
 import { SessionHub } from './components/SessionHub';
 import { SettingsModal } from './components/SettingsModal';
 import { StatsStrip } from './components/StatsStrip';
+import { SyncConflictModal } from './components/SyncConflictModal';
 import { ToastContainer, type ToastItem, type ToastTone } from './components/ToastContainer';
+import { TutorialOverlay } from './components/TutorialOverlay';
+import { useAdminRole } from './hooks/useAdminRole';
+import { useClubPosts } from './hooks/useClubPosts';
 import { useSupabaseAuth } from './hooks/useSupabaseAuth';
 import { useSyncedAttendanceData } from './hooks/useSyncedAttendanceData';
 import type {
+  AccessScope,
   AttendanceSession,
   AttendanceStatus,
+  CalendarViewMode,
+  ClassLetter,
+  ClassYear,
   ClubMember,
   MemberProfileInput,
   NewSessionInput,
   SyncStatus,
   UserPreferences,
 } from './types/attendance';
+import type { TutorialStepConfig, TutorialStorageState } from './types/tutorial';
 import {
   generateId,
   getSessionAssignedMembers,
   isLegacyMember,
+  sortSessionsNewestFirst,
   type AnnualProgressionSummary,
 } from './utils/attendance';
 import { getCurrentPeriodLabel, toIsoDateString } from './utils/date';
@@ -38,6 +50,13 @@ import {
   parseWorkspaceBackupPayload,
   savePreferences,
 } from './utils/storage';
+import {
+  TUTORIAL_STEPS,
+  TUTORIAL_STORAGE_KEY,
+  buildTutorialDemoWorkspace,
+  loadTutorialState,
+  saveTutorialState,
+} from './utils/tutorial';
 
 /**
  * Unified Team SPIRIT SPA shell.
@@ -49,6 +68,67 @@ export function App() {
   const [activePage, navigateTo] = useAppRoute();
   const { authStatus, user, signIn, signOut } = useSupabaseAuth();
   const isCloudConnected = authStatus === 'authenticated' && Boolean(user?.id);
+  const {
+    userRole,
+    isAdmin,
+    linkedMemberId,
+    canViewAllAttendance,
+    isRoleLoading,
+    roleError,
+    profiles: adminProfiles,
+    isProfilesLoading,
+    profilesError,
+    refreshRoleAndProfiles,
+    updateUserAdminRole,
+    linkUserToMember,
+    updateUserVisibilityScope,
+  } = useAdminRole(isCloudConnected ? (user?.id ?? null) : null);
+  const canManageClubRecords = !isCloudConnected || isAdmin;
+  const isReadOnlyCloud = isCloudConnected && !isAdmin;
+  const isAuthResolving = isCloudConnected && (isRoleLoading || userRole === null);
+  const {
+    posts: clubPosts,
+    comments: clubPostComments,
+    permissions: memberVisibilityPermissions,
+    sharedIdeaVisibility,
+    isPostsLoading,
+    postsError,
+    isLiveConnected: isPostsLiveConnected,
+    isPublishing: isPublishingPost,
+    isUpdatingVisibility: isUpdatingSharedIdeaVisibility,
+    refreshPostsAndSettings,
+    publishPost: publishClubPost,
+    editPost: editClubPost,
+    togglePinPost: togglePinClubPost,
+    removePost: removeClubPost,
+    addComment: addClubPostComment,
+    removeComment: removeClubPostComment,
+    setSharedIdeaVisibility,
+    updatePermissions: updateMemberVisibilityPermissions,
+  } = useClubPosts();
+
+  const hasBroadPerUser = isAdmin || canViewAllAttendance;
+  const canBrowseFullRoster =
+    !isCloudConnected || hasBroadPerUser || memberVisibilityPermissions.memberCanViewRoster;
+  const canViewAttendanceRates =
+    !isCloudConnected ||
+    hasBroadPerUser ||
+    memberVisibilityPermissions.memberCanViewAttendanceRates;
+  const canViewCalendarDetails =
+    !isCloudConnected ||
+    hasBroadPerUser ||
+    memberVisibilityPermissions.memberCanViewCalendarDetails;
+
+  const accessScope: AccessScope = !isCloudConnected
+    ? 'local'
+    : isAdmin
+      ? 'admin'
+      : canViewAllAttendance
+        ? 'broad_viewer'
+        : linkedMemberId
+          ? 'member_self'
+          : 'member_unlinked';
+  const scopeVersionKey = `${userRole ?? 'none'}:${linkedMemberId ?? 'none'}:${String(canViewAllAttendance)}:${String(memberVisibilityPermissions.memberCanViewRoster)}:${String(memberVisibilityPermissions.memberCanViewAttendanceRates)}:${String(memberVisibilityPermissions.memberCanViewCalendarDetails)}`;
 
   const [preferences, setPreferences] = useState<UserPreferences>(() => loadPreferences());
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -58,7 +138,22 @@ export function App() {
     useState<AttendanceSession | null>(null);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [isCloudSyncModalOpen, setIsCloudSyncModalOpen] = useState(false);
+  const [isConflictModalOpen, setIsConflictModalOpen] = useState(false);
+  const [tutorialState, setTutorialState] = useState<TutorialStorageState>(() =>
+    loadTutorialState(),
+  );
+  const [isTutorialActive, setIsTutorialActive] = useState(false);
+  const [tutorialStepIndex, setTutorialStepIndex] = useState(0);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const hasAutoTriggeredTutorialRef = useRef(false);
+  const lastAppliedTutorialStepIdRef = useRef<string | null>(null);
+  const tutorialSnapshotRef = useRef<{
+    activePage: AppPage;
+    activeSessionId: string | null;
+    isMemberSidebarOpen: boolean;
+    selectedMemberId: string | null;
+    calendarViewMode: CalendarViewMode;
+  } | null>(null);
 
   const pushToast = useCallback(
     (options: { tone: ToastTone; tag: string; message: string; undoToken?: string | null }) => {
@@ -107,13 +202,24 @@ export function App() {
     members,
     sessions,
     syncStatus,
+    realtimeStatus,
     syncError,
     pendingCount,
+    conflicts,
+    conflictCount,
+    isEditingActive,
+    beginFieldEdit,
+    endFieldEdit,
+    resolveConflict,
+    resolveAllConflicts,
     createSession,
     deleteSession,
     addMember,
+    addMembersBulk,
     updateMember,
+    updateMembersClass,
     setMemberLegacyStatus,
+    setMembersLegacyStatus,
     deleteMembers,
     assignMemberToSession,
     assignMembersToSession,
@@ -129,9 +235,49 @@ export function App() {
     setMergeLocalOnNextConnect,
   } = useSyncedAttendanceData(isCloudConnected ? user?.id ?? null : null, {
     onAnnualProgression: handleAnnualProgression,
+    isReadOnlyCloud,
+    isAuthResolving,
+    scopeVersionKey,
   });
 
+  const linkedMember = useMemo(
+    () => (linkedMemberId ? members.find((member) => member.id === linkedMemberId) ?? null : null),
+    [linkedMemberId, members],
+  );
+
+  // Enforce member-linking privacy boundaries whenever scope or global permissions change.
+  useEffect(() => {
+    if (
+      accessScope === 'member_unlinked' &&
+      !canViewCalendarDetails &&
+      !canViewAttendanceRates
+    ) {
+      if (activeSessionId !== null) {
+        setActiveSessionId(null);
+      }
+      if (!canBrowseFullRoster && preferences.selectedMemberId !== null) {
+        setPreferences((prev) => ({ ...prev, selectedMemberId: null }));
+      }
+      return;
+    }
+
+    if (accessScope === 'member_self' && !canBrowseFullRoster) {
+      if (linkedMemberId && preferences.selectedMemberId !== linkedMemberId) {
+        setPreferences((prev) => ({ ...prev, selectedMemberId: linkedMemberId }));
+      }
+    }
+  }, [
+    accessScope,
+    activeSessionId,
+    canBrowseFullRoster,
+    canViewAttendanceRates,
+    canViewCalendarDetails,
+    linkedMemberId,
+    preferences.selectedMemberId,
+  ]);
+
   const prevSyncStatusRef = useRef<SyncStatus>(syncStatus);
+  const prevConflictCountRef = useRef<number>(conflictCount);
   const {
     preloaderPhase,
     containerRevealClass,
@@ -181,6 +327,24 @@ export function App() {
     }
   }, [isCloudConnected, pushToast, syncError, syncStatus, user?.email]);
 
+  useEffect(() => {
+    const prevCount = prevConflictCountRef.current;
+    prevConflictCountRef.current = conflictCount;
+    if (!isCloudConnected) return;
+
+    if (conflictCount > prevCount) {
+      pushToast({
+        tone: 'warning',
+        tag: 'Sync Conflict',
+        message: `${conflictCount} concurrent ${
+          conflictCount === 1 ? 'conflict needs' : 'conflicts need'
+        } review. Click Conflict (${conflictCount}) in the header to resolve.`,
+      });
+    } else if (conflictCount === 0 && prevCount > 0) {
+      setIsConflictModalOpen(false);
+    }
+  }, [conflictCount, isCloudConnected, pushToast]);
+
   const activeSession = activeSessionId
     ? sessions.find((session) => session.id === activeSessionId) ?? null
     : null;
@@ -192,11 +356,13 @@ export function App() {
     document.documentElement.dataset.density = preferences.rosterDensity;
   }, [preferences]);
 
-  // Keep UI preferences synchronized across open tabs.
+  // Keep UI preferences and tutorial state synchronized across open tabs.
   useEffect(() => {
     function handleStorageChange(event: StorageEvent) {
       if (event.key === PREFS_STORAGE_KEY) {
         setPreferences(loadPreferences());
+      } else if (event.key === TUTORIAL_STORAGE_KEY) {
+        setTutorialState(loadTutorialState());
       }
     }
 
@@ -208,6 +374,10 @@ export function App() {
     input: NewSessionInput,
     options?: { includeSourceMembers?: boolean },
   ) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('record sessions');
+      return;
+    }
     const wasDuplicate = Boolean(duplicateSourceSession);
     const initialMemberIds =
       duplicateSourceSession && options?.includeSourceMembers
@@ -242,16 +412,31 @@ export function App() {
   }
 
   function handleOpenCreateSessionModal() {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('record sessions');
+      return;
+    }
     setDuplicateSourceSession(null);
     setIsCreateModalOpen(true);
   }
 
   function handleDuplicateSession(session: AttendanceSession) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('duplicate sessions');
+      return;
+    }
     setDuplicateSourceSession(session);
     setIsCreateModalOpen(true);
   }
 
   function handleSelectSession(sessionId: string) {
+    if (
+      accessScope === 'member_unlinked' &&
+      !canViewCalendarDetails &&
+      !canViewAttendanceRates
+    ) {
+      return;
+    }
     setActiveSessionId(sessionId);
     setPreferences((prev) => ({
       ...prev,
@@ -264,7 +449,19 @@ export function App() {
     setActiveSessionId(null);
   }
 
+  function notifyAdminRequired(actionLabel: string) {
+    pushToast({
+      tone: 'warning',
+      tag: 'Admin Only',
+      message: `Administrator privileges are required to ${actionLabel} in Cloud Sync mode.`,
+    });
+  }
+
   function handleDeleteSession(sessionId: string) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('delete synced sessions');
+      return;
+    }
     const targetSession = sessions.find((session) => session.id === sessionId);
     deleteSession(sessionId);
     const undoToken = getLastUndoToken();
@@ -281,6 +478,10 @@ export function App() {
 
   function handleAddMember(input: string | MemberProfileInput): ClubMember {
     const created = addMember(input);
+    if (!canManageClubRecords) {
+      notifyAdminRequired('add club members');
+      return created;
+    }
     const undoToken = getLastUndoToken();
     pushToast({
       tone: 'success',
@@ -291,7 +492,34 @@ export function App() {
     return created;
   }
 
+  function handleAddMembersBulk(inputs: MemberProfileInput[]): ClubMember[] {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('add club members');
+      return [];
+    }
+    if (inputs.length === 0) return [];
+    const created = addMembersBulk(inputs);
+    const undoToken = getLastUndoToken();
+    const classLabel = created[0]?.className;
+    const allShareSameClass =
+      Boolean(classLabel) && created.every((member) => member.className === classLabel);
+
+    pushToast({
+      tone: 'success',
+      tag: 'Bulk Added',
+      message: allShareSameClass
+        ? `Added ${created.length} ${created.length === 1 ? 'member' : 'members'} to ${classLabel}.`
+        : `Added ${created.length} ${created.length === 1 ? 'member' : 'members'} to Member Manager.`,
+      undoToken,
+    });
+    return created;
+  }
+
   function handleUpdateMember(memberId: string, input: MemberProfileInput) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('edit member profiles');
+      return;
+    }
     updateMember(memberId, input);
     const undoToken = getLastUndoToken();
     pushToast({
@@ -302,7 +530,45 @@ export function App() {
     });
   }
 
+  function handleUpdateMembersClass(
+    memberIds: string[],
+    patch: { classYear?: ClassYear; classLetter?: ClassLetter },
+  ) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('bulk-update student classes');
+      return;
+    }
+    const updatedCount = updateMembersClass(memberIds, patch);
+    if (updatedCount === 0) return;
+    const undoToken = getLastUndoToken();
+    const isNaUpdate = patch.classLetter === 'N/A';
+    const labelParts: string[] = [];
+    if (isNaUpdate) {
+      labelParts.push('Class N/A');
+    } else {
+      if (patch.classYear) labelParts.push(`Year ${patch.classYear}`);
+      if (patch.classLetter) labelParts.push(`Class ${patch.classLetter}`);
+    }
+    const unit = isNaUpdate
+      ? updatedCount === 1
+        ? 'member'
+        : 'members'
+      : updatedCount === 1
+        ? 'student'
+        : 'students';
+    pushToast({
+      tone: 'success',
+      tag: 'Class Updated',
+      message: `Updated ${labelParts.join(' ')} for ${updatedCount} ${unit}.`,
+      undoToken,
+    });
+  }
+
   function handleSetMemberLegacyStatus(memberId: string, isLegacy: boolean) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('archive or restore club members');
+      return;
+    }
     const targetMember = members.find((member) => member.id === memberId);
     setMemberLegacyStatus(memberId, isLegacy);
     const undoToken = getLastUndoToken();
@@ -320,12 +586,42 @@ export function App() {
     });
   }
 
+  function handleSetMembersLegacyStatus(
+    memberIds: string[],
+    isLegacy: boolean,
+    options?: { fallbackClassYear?: ClassYear; fallbackClassLetter?: ClassLetter },
+  ) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('bulk-archive or restore club members');
+      return;
+    }
+    const updatedCount = setMembersLegacyStatus(memberIds, isLegacy, options);
+    if (updatedCount === 0) return;
+    const undoToken = getLastUndoToken();
+    pushToast({
+      tone: isLegacy ? 'warning' : 'success',
+      tag: isLegacy ? 'Moved to Legacy' : 'Restored',
+      message: isLegacy
+        ? `Moved ${updatedCount} ${updatedCount === 1 ? 'member' : 'members'} to Legacy / Retired (stats preserved).`
+        : `Restored ${updatedCount} ${updatedCount === 1 ? 'member' : 'members'} to the Active Roster.`,
+      undoToken,
+    });
+  }
+
   function handleAssignMemberToSession(memberId: string) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('assign members to sessions');
+      return;
+    }
     if (!activeSession) return;
     assignMemberToSession(activeSession.id, memberId, preferences.defaultAssignmentStatus);
   }
 
   function handleAssignMembersToSession(memberIds: string[]) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('assign members to sessions');
+      return;
+    }
     if (!activeSession || memberIds.length === 0) return;
     const assignedSet = new Set(activeSession.memberIds);
     const addedCount = memberIds.filter((id) => !assignedSet.has(id)).length;
@@ -342,6 +638,10 @@ export function App() {
   }
 
   function handleRemoveMemberFromSession(memberId: string) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('remove members from sessions');
+      return;
+    }
     if (!activeSession) return;
     const targetMember = members.find((member) => member.id === memberId);
     removeMemberFromSession(activeSession.id, memberId);
@@ -357,6 +657,10 @@ export function App() {
   }
 
   function handleDeleteMembers(memberIds: string[]) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('delete club members');
+      return;
+    }
     if (memberIds.length === 0) return;
     const idsToDelete = new Set(memberIds);
     const firstDeleted =
@@ -387,9 +691,21 @@ export function App() {
   }
 
   function handleOpenMemberProfile(memberId: string) {
+    if (!canBrowseFullRoster && accessScope === 'member_unlinked') {
+      setPreferences((prev) => ({
+        ...prev,
+        selectedMemberId: null,
+        isMemberSidebarOpen: true,
+      }));
+      return;
+    }
+    const targetMemberId =
+      !canBrowseFullRoster && accessScope === 'member_self' && linkedMemberId
+        ? linkedMemberId
+        : memberId;
     setPreferences((prev) => ({
       ...prev,
-      selectedMemberId: memberId,
+      selectedMemberId: targetMemberId,
       isMemberSidebarOpen: true,
     }));
   }
@@ -398,16 +714,28 @@ export function App() {
     memberId: string,
     targetStatus: Exclude<AttendanceStatus, 'unmarked'>,
   ) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('mark attendance');
+      return;
+    }
     if (!activeSession) return;
     toggleAttendanceStatus(activeSession.id, memberId, targetStatus);
   }
 
   function handleSetAbsenceReason(memberId: string, reason: string) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('edit absence reasons');
+      return;
+    }
     if (!activeSession) return;
     setAbsenceReason(activeSession.id, memberId, reason);
   }
 
   function handleResetSessionMarks() {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('reset all session marks');
+      return;
+    }
     if (!activeSession) return;
     resetSessionMarks(activeSession.id);
     const undoToken = getLastUndoToken();
@@ -451,7 +779,9 @@ export function App() {
     document.body.appendChild(anchor);
     anchor.click();
     document.body.removeChild(anchor);
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => {
+      URL.revokeObjectURL(url);
+    }, 1000);
     pushToast({
       tone: 'info',
       tag: 'Backup Exported',
@@ -462,6 +792,11 @@ export function App() {
   async function handleImportBackupFile(
     file: File,
   ): Promise<{ importedMembers: number; importedSessions: number }> {
+    if (!canManageClubRecords) {
+      throw new Error(
+        'Administrator privileges are required to import backup snapshots into Cloud Sync.',
+      );
+    }
     const text = await file.text();
     const parsed = parseWorkspaceBackupPayload(text);
     const counts = importBackupData(parsed.members, parsed.sessions);
@@ -488,6 +823,14 @@ export function App() {
   }
 
   function handleOpenSessionInTracker(sessionId: string) {
+    if (
+      accessScope === 'member_unlinked' &&
+      !canViewCalendarDetails &&
+      !canViewAttendanceRates
+    ) {
+      navigateTo('tracker');
+      return;
+    }
     setActiveSessionId(sessionId);
     setPreferences((prev) => ({
       ...prev,
@@ -514,6 +857,7 @@ export function App() {
     setIsCreateModalOpen(false);
     setIsSettingsModalOpen(false);
     setIsCloudSyncModalOpen(false);
+    setIsConflictModalOpen(false);
     setActiveSessionId(null);
     setPreferences((prev) => ({
       ...prev,
@@ -530,6 +874,230 @@ export function App() {
     });
   }
 
+  const canInspectSessionsInTour = !(
+    accessScope === 'member_unlinked' &&
+    !canViewCalendarDetails &&
+    !canViewAttendanceRates
+  );
+
+  const activeTutorialSteps = useMemo(
+    () =>
+      TUTORIAL_STEPS.filter((step) => {
+        if (step.id === 'attendance-assign' && !canManageClubRecords) {
+          return false;
+        }
+        if (step.id === 'attendance-checklist' && !canInspectSessionsInTour) {
+          return false;
+        }
+        return true;
+      }),
+    [canInspectSessionsInTour, canManageClubRecords],
+  );
+
+  const applyTutorialStepState = useCallback(
+    (step: TutorialStepConfig) => {
+      lastAppliedTutorialStepIdRef.current = step.id;
+      if (step.page !== activePage) {
+        navigateTo(step.page);
+      }
+
+      if (step.requiresSession) {
+        if (sessions.length > 0) {
+          const snapshotSessionId = tutorialSnapshotRef.current?.activeSessionId;
+          const preferredId =
+            snapshotSessionId && sessions.some((session) => session.id === snapshotSessionId)
+              ? snapshotSessionId
+              : sortSessionsNewestFirst(sessions)[0]?.id ?? null;
+          setActiveSessionId(preferredId);
+        } else {
+          setActiveSessionId(null);
+        }
+      } else {
+        setActiveSessionId(null);
+      }
+
+      setPreferences((prev) => ({
+        ...prev,
+        isMemberSidebarOpen: step.memberSidebarOpen,
+        calendarViewMode: step.calendarViewMode ?? prev.calendarViewMode,
+        ...(step.requiresSession ? { filter: 'all', searchQuery: '' } : {}),
+      }));
+    },
+    [activePage, navigateTo, sessions],
+  );
+
+  const handleStartTutorial = useCallback(() => {
+    hasAutoTriggeredTutorialRef.current = true;
+    setIsCreateModalOpen(false);
+    setDuplicateSourceSession(null);
+    setIsSettingsModalOpen(false);
+    setIsCloudSyncModalOpen(false);
+    setIsConflictModalOpen(false);
+
+    if (!isTutorialActive) {
+      tutorialSnapshotRef.current = {
+        activePage,
+        activeSessionId,
+        isMemberSidebarOpen: preferences.isMemberSidebarOpen,
+        selectedMemberId: preferences.selectedMemberId,
+        calendarViewMode: preferences.calendarViewMode,
+      };
+    }
+
+    setTutorialStepIndex(0);
+    setIsTutorialActive(true);
+    const firstStep = activeTutorialSteps[0];
+    if (firstStep) {
+      applyTutorialStepState(firstStep);
+    }
+  }, [
+    activePage,
+    activeSessionId,
+    activeTutorialSteps,
+    applyTutorialStepState,
+    isTutorialActive,
+    preferences.calendarViewMode,
+    preferences.isMemberSidebarOpen,
+    preferences.selectedMemberId,
+  ]);
+
+  const finishTutorial = useCallback(
+    (nextStatus: 'completed' | 'dismissed') => {
+      lastAppliedTutorialStepIdRef.current = null;
+      setIsTutorialActive(false);
+      setTutorialState(saveTutorialState(nextStatus));
+
+      const snapshot = tutorialSnapshotRef.current;
+      tutorialSnapshotRef.current = null;
+      if (snapshot) {
+        if (snapshot.activePage !== activePage) {
+          navigateTo(snapshot.activePage);
+        }
+        const restoredSessionId =
+          snapshot.activeSessionId &&
+          sessions.some((session) => session.id === snapshot.activeSessionId)
+            ? snapshot.activeSessionId
+            : null;
+        setActiveSessionId(restoredSessionId);
+        setPreferences((prev) => ({
+          ...prev,
+          isMemberSidebarOpen: snapshot.isMemberSidebarOpen,
+          selectedMemberId: snapshot.selectedMemberId,
+          calendarViewMode: snapshot.calendarViewMode,
+        }));
+      }
+
+      if (nextStatus === 'completed') {
+        pushToast({
+          tone: 'success',
+          tag: 'Tour Complete',
+          message: 'Walkthrough finished. Replay it anytime from the Tour button or Settings.',
+        });
+      }
+    },
+    [activePage, navigateTo, pushToast, sessions],
+  );
+
+  const handleTutorialNext = useCallback(() => {
+    const nextIndex = Math.min(tutorialStepIndex + 1, activeTutorialSteps.length - 1);
+    setTutorialStepIndex(nextIndex);
+    const step = activeTutorialSteps[nextIndex];
+    if (step) {
+      applyTutorialStepState(step);
+    }
+  }, [activeTutorialSteps, applyTutorialStepState, tutorialStepIndex]);
+
+  const handleTutorialBack = useCallback(() => {
+    const prevIndex = Math.max(tutorialStepIndex - 1, 0);
+    setTutorialStepIndex(prevIndex);
+    const step = activeTutorialSteps[prevIndex];
+    if (step) {
+      applyTutorialStepState(step);
+    }
+  }, [activeTutorialSteps, applyTutorialStepState, tutorialStepIndex]);
+
+  // Keep tutorial index clamped and workspace synchronized if user permissions change mid-tour.
+  useEffect(() => {
+    if (!isTutorialActive) return;
+    if (activeTutorialSteps.length === 0) {
+      finishTutorial('dismissed');
+      return;
+    }
+
+    const clampedIndex = Math.min(tutorialStepIndex, activeTutorialSteps.length - 1);
+    const resolvedStep = activeTutorialSteps[clampedIndex];
+    if (clampedIndex !== tutorialStepIndex) {
+      setTutorialStepIndex(clampedIndex);
+    }
+    if (resolvedStep && lastAppliedTutorialStepIdRef.current !== resolvedStep.id) {
+      applyTutorialStepState(resolvedStep);
+    }
+  }, [
+    activeTutorialSteps,
+    applyTutorialStepState,
+    finishTutorial,
+    isTutorialActive,
+    tutorialStepIndex,
+  ]);
+
+  // Launch the interactive walkthrough automatically on first visit once the preloader exits.
+  useEffect(() => {
+    if (preloaderPhase !== 'done') return;
+    if (hasAutoTriggeredTutorialRef.current) return;
+    if (tutorialState.status !== 'unseen') {
+      hasAutoTriggeredTutorialRef.current = true;
+      return;
+    }
+    if (
+      isTutorialActive ||
+      isCreateModalOpen ||
+      isSettingsModalOpen ||
+      isCloudSyncModalOpen ||
+      isConflictModalOpen
+    ) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      handleStartTutorial();
+    }, 120);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    handleStartTutorial,
+    isCloudSyncModalOpen,
+    isConflictModalOpen,
+    isCreateModalOpen,
+    isSettingsModalOpen,
+    isTutorialActive,
+    preloaderPhase,
+    tutorialState.status,
+  ]);
+
+  const clampedTutorialStepIndex =
+    activeTutorialSteps.length > 0
+      ? Math.min(tutorialStepIndex, activeTutorialSteps.length - 1)
+      : 0;
+  const activeTutorialStep = isTutorialActive
+    ? (activeTutorialSteps[clampedTutorialStepIndex] ?? null)
+    : null;
+  const isTutorialDemoSession = Boolean(
+    activeTutorialStep?.requiresSession && sessions.length === 0,
+  );
+  const tutorialDemoWorkspace = useMemo(() => {
+    if (!isTutorialDemoSession) return null;
+    const activeDirectoryMembers = members.filter((member) => !isLegacyMember(member));
+    return buildTutorialDemoWorkspace(activeDirectoryMembers);
+  }, [isTutorialDemoSession, members]);
+
+  const displayedMembers = tutorialDemoWorkspace ? tutorialDemoWorkspace.demoMembers : members;
+  const displayedSessions = tutorialDemoWorkspace
+    ? [tutorialDemoWorkspace.demoSession]
+    : sessions;
+  const displayedActiveSession = tutorialDemoWorkspace
+    ? tutorialDemoWorkspace.demoSession
+    : activeSession;
+
   const activeMemberCount = members.filter((member) => !isLegacyMember(member)).length;
   const hasLocalRecords = !isCloudConnected && (members.length > 0 || sessions.length > 0);
 
@@ -543,7 +1111,9 @@ export function App() {
           ariaLabel={
             activePage === 'calendar'
               ? 'Loading Team SPIRIT Session Calendar'
-              : 'Loading Team SPIRIT Attendance Dashboard'
+              : activePage === 'ideas'
+                ? 'Loading Team SPIRIT Updates & Ideas'
+                : 'Loading Team SPIRIT Attendance Dashboard'
           }
           onBeginExit={handlePreloaderBeginExit}
           onComplete={handlePreloaderComplete}
@@ -556,16 +1126,27 @@ export function App() {
           periodLabel={getCurrentPeriodLabel()}
           memberCount={activeMemberCount}
           isMemberSidebarOpen={preferences.isMemberSidebarOpen}
+          isTutorialActive={isTutorialActive}
           sidebarId={memberSidebarId}
           isCloudConnected={isCloudConnected}
+          accessScope={accessScope}
+          canBrowseFullRoster={canBrowseFullRoster}
+          isAdmin={isAdmin}
+          isRoleLoading={isAuthResolving}
           userEmail={user?.email}
+          linkedMemberName={linkedMember?.name}
           syncStatus={syncStatus}
+          realtimeStatus={realtimeStatus}
           pendingSyncCount={pendingCount}
+          conflictCount={conflictCount}
+          isEditingActive={isEditingActive}
           syncError={syncError}
           onNavigate={handleNavigate}
           onRetrySync={() => void flushPendingChanges()}
+          onOpenConflictModal={() => setIsConflictModalOpen(true)}
           onOpenCloudSync={() => setIsCloudSyncModalOpen(true)}
           onToggleMemberSidebar={handleToggleMemberSidebar}
+          onStartTutorial={handleStartTutorial}
           onOpenSettings={() => setIsSettingsModalOpen(true)}
           onOpenCreateSession={handleOpenCreateSessionModal}
         />
@@ -575,64 +1156,148 @@ export function App() {
             {activePage === 'tracker' ? (
               <>
                 <StatsStrip
-                  members={members}
-                  sessions={sessions}
-                  activeSession={activeSession}
+                  members={displayedMembers}
+                  sessions={displayedSessions}
+                  activeSession={displayedActiveSession}
+                  accessScope={accessScope}
+                  linkedMember={linkedMember}
+                  canViewAttendanceRates={canViewAttendanceRates}
                 />
-                {activeSession ? (
+                {displayedActiveSession ? (
                   <AttendanceWorkspace
-                    activeSession={activeSession}
-                    members={members}
+                    activeSession={displayedActiveSession}
+                    members={displayedMembers}
                     preferences={preferences}
-                    onBackToHub={handleBackToSessionHub}
+                    accessScope={accessScope}
+                    linkedMember={linkedMember}
+                    canViewAttendanceRates={canViewAttendanceRates}
+                    canBrowseFullRoster={canBrowseFullRoster}
+                    canManageClubRecords={canManageClubRecords}
+                    onBackToHub={
+                      isTutorialDemoSession ? () => undefined : handleBackToSessionHub
+                    }
                     onOpenMemberManager={() =>
                       handleUpdatePreferences({
                         isMemberSidebarOpen: true,
-                        selectedMemberId: null,
+                        selectedMemberId:
+                          !canBrowseFullRoster && accessScope === 'member_self'
+                            ? (linkedMemberId ?? null)
+                            : null,
                       })
                     }
-                    onOpenMemberProfile={handleOpenMemberProfile}
-                    onDeleteSession={handleDeleteSession}
-                    onAssignMemberToSession={handleAssignMemberToSession}
-                    onAssignMembersToSession={handleAssignMembersToSession}
-                    onRemoveMemberFromSession={handleRemoveMemberFromSession}
-                    onToggleAttendanceStatus={handleToggleAttendanceStatus}
-                    onSetAbsenceReason={handleSetAbsenceReason}
-                    onResetSessionMarks={handleResetSessionMarks}
+                    onOpenMemberProfile={
+                      isTutorialDemoSession ? () => undefined : handleOpenMemberProfile
+                    }
+                    onDeleteSession={
+                      isTutorialDemoSession ? () => undefined : handleDeleteSession
+                    }
+                    onAssignMemberToSession={
+                      isTutorialDemoSession ? () => undefined : handleAssignMemberToSession
+                    }
+                    onAssignMembersToSession={
+                      isTutorialDemoSession ? () => undefined : handleAssignMembersToSession
+                    }
+                    onRemoveMemberFromSession={
+                      isTutorialDemoSession ? () => undefined : handleRemoveMemberFromSession
+                    }
+                    onToggleAttendanceStatus={
+                      isTutorialDemoSession ? () => undefined : handleToggleAttendanceStatus
+                    }
+                    onSetAbsenceReason={
+                      isTutorialDemoSession ? () => undefined : handleSetAbsenceReason
+                    }
+                    onBeginFieldEdit={isTutorialDemoSession ? undefined : beginFieldEdit}
+                    onEndFieldEdit={isTutorialDemoSession ? undefined : endFieldEdit}
+                    onResetSessionMarks={
+                      isTutorialDemoSession ? () => undefined : handleResetSessionMarks
+                    }
                     onUpdatePreferences={handleUpdatePreferences}
                   />
                 ) : (
-                  <SessionHub
-                    sessions={sessions}
-                    members={members}
-                    viewMode={preferences.sessionHubViewMode}
-                    onChangeViewMode={(mode) =>
-                      handleUpdatePreferences({ sessionHubViewMode: mode })
-                    }
-                    onSelectSession={handleSelectSession}
-                    onDuplicateSession={handleDuplicateSession}
-                    onDeleteSession={handleDeleteSession}
-                    onOpenCreateSession={handleOpenCreateSessionModal}
-                  />
+                  <>
+                    <SessionHub
+                      sessions={sessions}
+                      members={members}
+                      viewMode={preferences.sessionHubViewMode}
+                      accessScope={accessScope}
+                      linkedMemberId={linkedMemberId}
+                      canViewAttendanceRates={canViewAttendanceRates}
+                      canViewCalendarDetails={canViewCalendarDetails}
+                      userEmail={user?.email}
+                      canManageClubRecords={canManageClubRecords}
+                      onRefreshRole={() => void refreshRoleAndProfiles()}
+                      onChangeViewMode={(mode) =>
+                        handleUpdatePreferences({ sessionHubViewMode: mode })
+                      }
+                      onSelectSession={handleSelectSession}
+                      onDuplicateSession={handleDuplicateSession}
+                      onDeleteSession={handleDeleteSession}
+                      onOpenCreateSession={handleOpenCreateSessionModal}
+                    />
+                    {canViewAttendanceRates && !isTutorialDemoSession && (
+                      <AttendanceLeaderboard
+                        members={members}
+                        sessions={sessions}
+                        currentMemberId={linkedMemberId}
+                        canOpenMemberProfile={canBrowseFullRoster}
+                        onOpenMemberProfile={handleOpenMemberProfile}
+                      />
+                    )}
+                  </>
                 )}
               </>
-            ) : (
+            ) : activePage === 'calendar' ? (
               <SessionCalendarWorkspace
                 sessions={sessions}
                 members={members}
                 selectedDateKey={selectedDateKey}
                 viewMode={preferences.calendarViewMode}
+                accessScope={accessScope}
+                linkedMemberId={linkedMemberId}
+                canViewAttendanceRates={canViewAttendanceRates}
+                canViewCalendarDetails={canViewCalendarDetails}
+                canBrowseFullRoster={canBrowseFullRoster}
                 onChangeViewMode={(mode) =>
                   handleUpdatePreferences({ calendarViewMode: mode })
                 }
                 onSelectDate={setSelectedDateKey}
                 onOpenCreateSessionForDate={(dateKey) => {
+                  if (!canManageClubRecords) {
+                    notifyAdminRequired('record sessions');
+                    return;
+                  }
                   setDuplicateSourceSession(null);
                   setSelectedDateKey(dateKey);
                   setIsCreateModalOpen(true);
                 }}
                 onOpenSessionInTracker={handleOpenSessionInTracker}
                 onOpenMemberProfile={handleOpenMemberProfile}
+              />
+            ) : (
+              <ProjectIdeasWorkspace
+                userId={isCloudConnected ? (user?.id ?? null) : null}
+                userEmail={user?.email}
+                linkedMember={linkedMember}
+                isAdmin={isAdmin}
+                posts={clubPosts}
+                comments={clubPostComments}
+                sharedIdeaVisibility={sharedIdeaVisibility}
+                memberCanCommentOnPosts={memberVisibilityPermissions.memberCanCommentOnPosts}
+                isPostsLoading={isPostsLoading}
+                postsError={postsError}
+                isPostsLiveConnected={isPostsLiveConnected}
+                isPublishingPost={isPublishingPost}
+                isUpdatingSharedVisibility={isUpdatingSharedIdeaVisibility}
+                onRefreshPostsAndSettings={refreshPostsAndSettings}
+                onPublishPost={publishClubPost}
+                onEditPost={editClubPost}
+                onTogglePinPost={togglePinClubPost}
+                onDeletePost={removeClubPost}
+                onAddComment={addClubPostComment}
+                onDeleteComment={removeClubPostComment}
+                onSetSharedIdeaVisibility={setSharedIdeaVisibility}
+                onOpenCloudSync={() => setIsCloudSyncModalOpen(true)}
+                onNotify={pushToast}
               />
             )}
           </div>
@@ -646,19 +1311,44 @@ export function App() {
         sessions={sessions}
         selectedMemberId={preferences.selectedMemberId}
         confirmDeleteMember={preferences.confirmDirectoryMemberDeletion}
+        canManageClubRecords={canManageClubRecords}
+        accessScope={accessScope}
+        linkedMemberId={linkedMemberId}
+        canBrowseFullRoster={canBrowseFullRoster}
+        canViewAttendanceRates={canViewAttendanceRates}
         onSelectMember={(memberId) => handleUpdatePreferences({ selectedMemberId: memberId })}
         onClose={() => handleUpdatePreferences({ isMemberSidebarOpen: false })}
         onAddMember={handleAddMember}
+        onAddMembersBulk={handleAddMembersBulk}
         onUpdateMember={handleUpdateMember}
+        onUpdateMembersClass={handleUpdateMembersClass}
         onSetMemberLegacyStatus={handleSetMemberLegacyStatus}
+        onSetMembersLegacyStatus={handleSetMembersLegacyStatus}
         onDeleteMember={(memberId) => handleDeleteMembers([memberId])}
+        onDeleteMembers={handleDeleteMembers}
+        onBeginFieldEdit={beginFieldEdit}
+        onEndFieldEdit={endFieldEdit}
       />
 
       <SettingsModal
         isOpen={isSettingsModalOpen}
         preferences={preferences}
+        tutorialStatus={tutorialState.status}
         isCloudConnected={isCloudConnected}
+        currentUserId={user?.id ?? null}
         userEmail={user?.email}
+        userRole={userRole}
+        isAdmin={isAdmin}
+        accessScope={accessScope}
+        linkedMember={linkedMember}
+        canViewAllAttendance={canViewAllAttendance}
+        members={members}
+        isRoleLoading={isRoleLoading}
+        roleError={roleError}
+        adminProfiles={adminProfiles}
+        isProfilesLoading={isProfilesLoading}
+        profilesError={profilesError}
+        canManageClubRecords={canManageClubRecords}
         syncStatus={syncStatus}
         pendingSyncCount={pendingCount}
         syncError={syncError}
@@ -666,8 +1356,16 @@ export function App() {
         sessionCount={sessions.length}
         onUpdatePreferences={handleUpdatePreferences}
         onResetPreferences={handleResetPreferences}
+        onStartTutorial={handleStartTutorial}
         onOpenCloudSync={() => setIsCloudSyncModalOpen(true)}
         onSignOut={handleDisconnectCloudSync}
+        onRefreshAdminProfiles={refreshRoleAndProfiles}
+        onUpdateUserAdminRole={updateUserAdminRole}
+        onLinkUserToMember={linkUserToMember}
+        onUpdateUserVisibilityScope={updateUserVisibilityScope}
+        memberVisibilityPermissions={memberVisibilityPermissions}
+        isUpdatingSharedIdeaVisibility={isUpdatingSharedIdeaVisibility}
+        onUpdateMemberVisibilityPermissions={updateMemberVisibilityPermissions}
         onExportBackup={handleExportBackup}
         onImportBackupFile={handleImportBackupFile}
         onClose={() => setIsSettingsModalOpen(false)}
@@ -700,10 +1398,29 @@ export function App() {
         onConnect={handleConnectCloudSync}
       />
 
+      <SyncConflictModal
+        isOpen={isConflictModalOpen}
+        conflicts={conflicts}
+        onResolveConflict={resolveConflict}
+        onResolveAll={resolveAllConflicts}
+        onClose={() => setIsConflictModalOpen(false)}
+      />
+
       <ToastContainer
         toasts={toasts}
         onDismiss={handleDismissToast}
         onUndo={handleUndoToast}
+      />
+
+      <TutorialOverlay
+        isOpen={isTutorialActive}
+        steps={activeTutorialSteps}
+        stepIndex={clampedTutorialStepIndex}
+        isDemoSessionActive={isTutorialDemoSession}
+        onNext={handleTutorialNext}
+        onBack={handleTutorialBack}
+        onSkip={() => finishTutorial('dismissed')}
+        onComplete={() => finishTutorial('completed')}
       />
     </div>
   );

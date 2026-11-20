@@ -1,11 +1,17 @@
 import { useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
-import type { AttendanceSession, ClubMember, ViewMode } from '../types/attendance';
+import type {
+  AccessScope,
+  AttendanceSession,
+  ClubMember,
+  ViewMode,
+} from '../types/attendance';
 import {
+  STATUS_LABELS,
   sortSessionsNewestFirst,
   summarizeSessionAttendance,
   type SessionAttendanceSummary,
 } from '../utils/attendance';
-import { formatSessionDate, formatSessionTime } from '../utils/date';
+import { formatSessionDate, formatSessionTime, formatTimestamp } from '../utils/date';
 import { ConfirmDialog } from './ConfirmDialog';
 import {
   PixelCalendarIcon,
@@ -15,8 +21,10 @@ import {
   PixelCopyIcon,
   PixelGridIcon,
   PixelListIcon,
+  PixelLockIcon,
   PixelPinIcon,
   PixelPlusIcon,
+  PixelRefreshIcon,
   PixelSearchIcon,
   PixelTerminalIcon,
   PixelTrashIcon,
@@ -26,6 +34,13 @@ interface SessionHubProps {
   sessions: AttendanceSession[];
   members: ClubMember[];
   viewMode: ViewMode;
+  accessScope?: AccessScope;
+  linkedMemberId?: string | null;
+  canViewAttendanceRates?: boolean;
+  canViewCalendarDetails?: boolean;
+  userEmail?: string;
+  canManageClubRecords?: boolean;
+  onRefreshRole?: () => void;
   onChangeViewMode: (mode: ViewMode) => void;
   onSelectSession: (sessionId: string) => void;
   onDuplicateSession: (session: AttendanceSession) => void;
@@ -33,11 +48,18 @@ interface SessionHubProps {
   onOpenCreateSession: () => void;
 }
 
-/** Primary session selection hub displaying all recorded meetings/events with live search & filtering. */
+/** Primary session selection hub displaying club sessions or personal participated sessions. */
 export function SessionHub({
   sessions,
   members,
   viewMode,
+  accessScope = 'local',
+  linkedMemberId = null,
+  canViewAttendanceRates = true,
+  canViewCalendarDetails = true,
+  userEmail,
+  canManageClubRecords = true,
+  onRefreshRole,
   onChangeViewMode,
   onSelectSession,
   onDuplicateSession,
@@ -120,11 +142,63 @@ export function SessionHub({
     setPendingDeleteSession(null);
   }
 
+  const isMemberSelfScope = accessScope === 'member_self';
+  const isUnlinkedMember = accessScope === 'member_unlinked';
+  const canCreateOrEditSessions = accessScope === 'local' || accessScope === 'admin';
+  const showPendingLinkEmptyState =
+    isUnlinkedMember && !canViewCalendarDetails && !canViewAttendanceRates;
+  const showClubRateStats =
+    accessScope === 'local' ||
+    accessScope === 'admin' ||
+    accessScope === 'broad_viewer' ||
+    canViewAttendanceRates;
+
+  if (showPendingLinkEmptyState) {
+    return (
+      <section
+        className="tracker-panel session-hub-panel"
+        aria-label="Account pending profile link"
+        data-tutorial-target="session-hub"
+      >
+        <div className="tracker-panel-header">
+          <div className="panel-title-group">
+            <h2 className="panel-title">My Attendance</h2>
+          </div>
+        </div>
+        <div className="tracker-body session-hub-body">
+          <div className="reserved-empty-state">
+            <div className="empty-badge">
+              <PixelLockIcon />
+              <span>Pending Profile Link</span>
+            </div>
+            <h3 className="empty-title">Your login is not linked to a club roster profile yet</h3>
+            <p className="empty-description">
+              You are signed in as <strong>{userEmail || 'a Member account'}</strong>. Ask a club
+              administrator to link your account to your Member Manager profile in{' '}
+              <strong>Settings → Admin Management</strong> so your personal attendance records and
+              sessions appear here.
+            </p>
+            {onRefreshRole && (
+              <button type="button" className="btn-primary" onClick={onRefreshRole}>
+                <PixelRefreshIcon />
+                <span>Check Again</span>
+              </button>
+            )}
+          </div>
+        </div>
+      </section>
+    );
+  }
+
   return (
-    <section className="tracker-panel session-hub-panel" aria-label="Session selection hub">
+    <section
+      className="tracker-panel session-hub-panel"
+      aria-label="Session selection hub"
+      data-tutorial-target="session-hub"
+    >
       <div className="tracker-panel-header">
         <div className="panel-title-group">
-          <h2 className="panel-title">Sessions Hub</h2>
+          <h2 className="panel-title">{isMemberSelfScope ? 'My Sessions' : 'Sessions Hub'}</h2>
           <span className="panel-count">
             {hasActiveFilters
               ? `${filteredSessions.length} / ${sessions.length}`
@@ -154,10 +228,12 @@ export function SessionHub({
             </div>
           )}
 
-          <button type="button" className="btn-primary" onClick={onOpenCreateSession}>
-            <PixelPlusIcon />
-            <span>Record Session</span>
-          </button>
+          {canCreateOrEditSessions && (
+            <button type="button" className="btn-primary" onClick={onOpenCreateSession}>
+              <PixelPlusIcon />
+              <span>Record Session</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -227,15 +303,22 @@ export function SessionHub({
               <PixelTerminalIcon />
               <span>No Sessions Logged</span>
             </div>
-            <h3 className="empty-title">Start your first Team SPIRIT session</h3>
+            <h3 className="empty-title">
+              {isMemberSelfScope
+                ? 'No sessions assigned to your profile yet'
+                : 'Start your first Team SPIRIT session'}
+            </h3>
             <p className="empty-description">
-              Record a meeting, practice, workshop, or event with its date, time, and optional
-              details. Click any session card here to open its attendance checklist.
+              {isMemberSelfScope
+                ? 'Sessions that include your roster profile will appear here automatically once an administrator assigns you.'
+                : 'Record a meeting, practice, workshop, or event with its date, time, and optional details. Click any session card here to open its attendance checklist.'}
             </p>
-            <button type="button" className="btn-primary" onClick={onOpenCreateSession}>
-              <PixelPlusIcon />
-              <span>Record First Session</span>
-            </button>
+            {canCreateOrEditSessions && (
+              <button type="button" className="btn-primary" onClick={onOpenCreateSession}>
+                <PixelPlusIcon />
+                <span>Record First Session</span>
+              </button>
+            )}
           </div>
         ) : filteredSessions.length === 0 ? (
           <div className="reserved-empty-state">
@@ -282,30 +365,37 @@ export function SessionHub({
                         )}
                       </div>
 
-                      <div
-                        className="session-hub-card-actions"
-                        onClick={(event) => event.stopPropagation()}
-                        onKeyDown={(event) => event.stopPropagation()}
-                      >
-                        <button
-                          type="button"
-                          className="icon-btn session-hub-duplicate-btn"
-                          onClick={() => onDuplicateSession(session)}
-                          aria-label={`Duplicate session ${session.name}`}
-                          title="Duplicate session for a new date"
+                      {canCreateOrEditSessions && (
+                        <div
+                          className="session-hub-card-actions"
+                          onClick={(event) => event.stopPropagation()}
+                          onKeyDown={(event) => event.stopPropagation()}
                         >
-                          <PixelCopyIcon width={12} height={12} />
-                        </button>
-                        <button
-                          type="button"
-                          className="icon-btn icon-btn-danger session-hub-delete-btn"
-                          onClick={() => setPendingDeleteSession(session)}
-                          aria-label={`Delete session ${session.name}`}
-                          title="Delete session"
-                        >
-                          <PixelTrashIcon width={12} height={12} />
-                        </button>
-                      </div>
+                          <button
+                            type="button"
+                            className="icon-btn session-hub-duplicate-btn"
+                            onClick={() => onDuplicateSession(session)}
+                            aria-label={`Duplicate session ${session.name}`}
+                            title="Duplicate session for a new date"
+                          >
+                            <PixelCopyIcon width={12} height={12} />
+                          </button>
+                          <button
+                            type="button"
+                            className="icon-btn icon-btn-danger session-hub-delete-btn"
+                            disabled={!canManageClubRecords}
+                            onClick={() => setPendingDeleteSession(session)}
+                            aria-label={`Delete session ${session.name}`}
+                            title={
+                              canManageClubRecords
+                                ? 'Delete session'
+                                : 'Admin privileges required to delete synced sessions'
+                            }
+                          >
+                            <PixelTrashIcon width={12} height={12} />
+                          </button>
+                        </div>
+                      )}
                     </div>
 
                     <div className="session-meta-pills">
@@ -329,48 +419,90 @@ export function SessionHub({
                       <p className="session-hub-card-desc">{session.description}</p>
                     )}
 
-                    <div className="session-hub-card-stats">
-                      <div className="session-hub-stat-row">
-                        <span className="mono-meta">
-                          {summary.totalMembers > 0
-                            ? `${summary.presentCount}/${summary.totalMembers} present`
-                            : '0 members assigned'}
-                        </span>
-                        <span className="member-rate-chip" title="Session attendance rate">
-                          {summary.rate !== null ? `${summary.rate}%` : '--%'}
-                        </span>
-                      </div>
+                    {!showClubRateStats ? (
+                      (() => {
+                        const myEntry = linkedMemberId
+                          ? session.attendance[linkedMemberId]
+                          : undefined;
+                        const isAssignedToSession = Boolean(
+                          linkedMemberId &&
+                            (session.memberIds.includes(linkedMemberId) || myEntry),
+                        );
+                        const myStatus = myEntry?.status ?? 'unmarked';
+                        return (
+                          <div className="session-hub-card-footer">
+                            <div className="session-hub-mini-chips">
+                              {linkedMemberId ? (
+                                isAssignedToSession ? (
+                                  <span className={`status-badge status-${myStatus}`}>
+                                    {STATUS_LABELS[myStatus]}
+                                  </span>
+                                ) : (
+                                  <span className="session-type-tag">Not Assigned</span>
+                                )
+                              ) : (
+                                <span className="session-type-tag">Scheduled Session</span>
+                              )}
+                              {isAssignedToSession && myEntry?.updatedAt && (
+                                <span className="mono-meta">
+                                  {formatTimestamp(myEntry.updatedAt)}
+                                </span>
+                              )}
+                            </div>
 
-                      <div
-                        className="calendar-mini-meter"
-                        aria-hidden="true"
-                        title={`${summary.presentCount}/${summary.totalMembers} present`}
-                      >
-                        <div
-                          className="calendar-mini-meter-fill"
-                          style={{ width: `${fillPercent}%` }}
-                        />
-                      </div>
-                    </div>
+                            <span className="session-hub-open-cue" aria-hidden="true">
+                              <span>Details</span>
+                              <PixelChevronIcon width={11} height={11} />
+                            </span>
+                          </div>
+                        );
+                      })()
+                    ) : (
+                      <>
+                        <div className="session-hub-card-stats">
+                          <div className="session-hub-stat-row">
+                            <span className="mono-meta">
+                              {summary.totalMembers > 0
+                                ? `${summary.presentCount}/${summary.totalMembers} present`
+                                : '0 members assigned'}
+                            </span>
+                            <span className="member-rate-chip" title="Session attendance rate">
+                              {summary.rate !== null ? `${summary.rate}%` : '--%'}
+                            </span>
+                          </div>
 
-                    <div className="session-hub-card-footer">
-                      <div className="session-hub-mini-chips">
-                        <span className="agenda-stat-chip is-present">
-                          Present {summary.presentCount}
-                        </span>
-                        <span className="agenda-stat-chip is-reason">
-                          Excused {summary.absentWithReasonCount}
-                        </span>
-                        <span className="agenda-stat-chip is-absent">
-                          Unexcused {summary.absentWithoutReasonCount}
-                        </span>
-                      </div>
+                          <div
+                            className="calendar-mini-meter"
+                            aria-hidden="true"
+                            title={`${summary.presentCount}/${summary.totalMembers} present`}
+                          >
+                            <div
+                              className="calendar-mini-meter-fill"
+                              style={{ width: `${fillPercent}%` }}
+                            />
+                          </div>
+                        </div>
 
-                      <span className="session-hub-open-cue" aria-hidden="true">
-                        <span>Open</span>
-                        <PixelChevronIcon width={11} height={11} />
-                      </span>
-                    </div>
+                        <div className="session-hub-card-footer">
+                          <div className="session-hub-mini-chips">
+                            <span className="agenda-stat-chip is-present">
+                              Present {summary.presentCount}
+                            </span>
+                            <span className="agenda-stat-chip is-reason">
+                              Excused {summary.absentWithReasonCount}
+                            </span>
+                            <span className="agenda-stat-chip is-absent">
+                              Unexcused {summary.absentWithoutReasonCount}
+                            </span>
+                          </div>
+
+                          <span className="session-hub-open-cue" aria-hidden="true">
+                            <span>Open</span>
+                            <PixelChevronIcon width={11} height={11} />
+                          </span>
+                        </div>
+                      </>
+                    )}
                   </div>
                 </article>
               );
@@ -419,55 +551,85 @@ export function SessionHub({
                       </div>
                     </div>
 
-                    <div className="session-hub-row-metrics">
-                      <div className="session-hub-stat-row">
-                        <span className="mono-meta">
-                          {summary.totalMembers > 0
-                            ? `${summary.presentCount}/${summary.totalMembers} present`
-                            : '0 assigned'}
-                        </span>
-                        <span className="member-rate-chip">
-                          {summary.rate !== null ? `${summary.rate}%` : '--%'}
-                        </span>
+                    {!showClubRateStats ? (
+                      <div className="session-hub-row-metrics">
+                        {linkedMemberId ? (
+                          (() => {
+                            const myEntry = session.attendance[linkedMemberId];
+                            const isAssignedToSession =
+                              session.memberIds.includes(linkedMemberId) || Boolean(myEntry);
+                            if (!isAssignedToSession) {
+                              return <span className="session-type-tag">Not Assigned</span>;
+                            }
+                            const myStatus = myEntry?.status ?? 'unmarked';
+                            return (
+                              <span className={`status-badge status-${myStatus}`}>
+                                {STATUS_LABELS[myStatus]}
+                              </span>
+                            );
+                          })()
+                        ) : (
+                          <span className="session-type-tag">Scheduled</span>
+                        )}
                       </div>
-                      <div className="calendar-mini-meter" aria-hidden="true">
-                        <div
-                          className="calendar-mini-meter-fill"
-                          style={{ width: `${fillPercent}%` }}
-                        />
+                    ) : (
+                      <div className="session-hub-row-metrics">
+                        <div className="session-hub-stat-row">
+                          <span className="mono-meta">
+                            {summary.totalMembers > 0
+                              ? `${summary.presentCount}/${summary.totalMembers} present`
+                              : '0 assigned'}
+                          </span>
+                          <span className="member-rate-chip">
+                            {summary.rate !== null ? `${summary.rate}%` : '--%'}
+                          </span>
+                        </div>
+                        <div className="calendar-mini-meter" aria-hidden="true">
+                          <div
+                            className="calendar-mini-meter-fill"
+                            style={{ width: `${fillPercent}%` }}
+                          />
+                        </div>
                       </div>
-                    </div>
+                    )}
 
                     <div className="session-hub-row-right">
                       <span className="session-hub-open-cue" aria-hidden="true">
-                        <span>Checklist</span>
+                        <span>{!showClubRateStats ? 'Details' : 'Checklist'}</span>
                         <PixelChevronIcon width={11} height={11} />
                       </span>
 
-                      <div
-                        className="session-hub-card-actions"
-                        onClick={(event) => event.stopPropagation()}
-                        onKeyDown={(event) => event.stopPropagation()}
-                      >
-                        <button
-                          type="button"
-                          className="icon-btn session-hub-duplicate-btn"
-                          onClick={() => onDuplicateSession(session)}
-                          aria-label={`Duplicate session ${session.name}`}
-                          title="Duplicate session for a new date"
+                      {canCreateOrEditSessions && (
+                        <div
+                          className="session-hub-card-actions"
+                          onClick={(event) => event.stopPropagation()}
+                          onKeyDown={(event) => event.stopPropagation()}
                         >
-                          <PixelCopyIcon width={12} height={12} />
-                        </button>
-                        <button
-                          type="button"
-                          className="icon-btn icon-btn-danger session-hub-delete-btn"
-                          onClick={() => setPendingDeleteSession(session)}
-                          aria-label={`Delete session ${session.name}`}
-                          title="Delete session"
-                        >
-                          <PixelTrashIcon width={12} height={12} />
-                        </button>
-                      </div>
+                          <button
+                            type="button"
+                            className="icon-btn session-hub-duplicate-btn"
+                            onClick={() => onDuplicateSession(session)}
+                            aria-label={`Duplicate session ${session.name}`}
+                            title="Duplicate session for a new date"
+                          >
+                            <PixelCopyIcon width={12} height={12} />
+                          </button>
+                          <button
+                            type="button"
+                            className="icon-btn icon-btn-danger session-hub-delete-btn"
+                            disabled={!canManageClubRecords}
+                            onClick={() => setPendingDeleteSession(session)}
+                            aria-label={`Delete session ${session.name}`}
+                            title={
+                              canManageClubRecords
+                                ? 'Delete session'
+                                : 'Admin privileges required to delete synced sessions'
+                            }
+                          >
+                            <PixelTrashIcon width={12} height={12} />
+                          </button>
+                        </div>
+                      )}
                     </div>
                   </div>
                 </article>

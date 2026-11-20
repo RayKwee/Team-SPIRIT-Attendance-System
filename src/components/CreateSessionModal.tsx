@@ -92,6 +92,14 @@ export function CreateSessionModal({
       nameInputRef.current?.focus();
     }, 0);
 
+    return () => {
+      window.clearTimeout(focusTimer);
+    };
+  }, [isOpen, defaultDate, duplicateSource]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === 'Escape') {
         onClose();
@@ -100,10 +108,9 @@ export function CreateSessionModal({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => {
-      window.clearTimeout(focusTimer);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [isOpen, defaultDate, duplicateSource, onClose]);
+  }, [isOpen, onClose]);
 
   if (!isOpen) {
     return null;

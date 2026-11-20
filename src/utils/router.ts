@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState, type MouseEvent } from 'react';
 
-export type AppPage = 'tracker' | 'calendar';
+export type AppPage = 'tracker' | 'calendar' | 'ideas';
 
 const ROUTE_TITLES: Record<AppPage, string> = {
   tracker: 'Team SPIRIT — Personal Attendance Tracker',
   calendar: 'Team SPIRIT — Session Calendar',
+  ideas: 'Team SPIRIT — Updates & Ideas',
 };
 
 const ROUTE_CHANGE_EVENT = 'team-spirit:route-change';
@@ -19,6 +20,14 @@ export function getPageFromPathname(pathname: string): AppPage {
   if (normalized.endsWith('/calendar') || normalized.endsWith('/calendar.html')) {
     return 'calendar';
   }
+  if (
+    normalized.endsWith('/ideas') ||
+    normalized.endsWith('/ideas.html') ||
+    normalized.endsWith('/updates') ||
+    normalized.endsWith('/updates.html')
+  ) {
+    return 'ideas';
+  }
   return 'tracker';
 }
 
@@ -26,7 +35,9 @@ export function getPageFromPathname(pathname: string): AppPage {
 export function getRouteHref(page: AppPage): string {
   const baseUrl = import.meta.env.BASE_URL || '/';
   const normalizedBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
-  return page === 'calendar' ? `${normalizedBase}calendar` : normalizedBase;
+  if (page === 'calendar') return `${normalizedBase}calendar`;
+  if (page === 'ideas') return `${normalizedBase}ideas`;
+  return normalizedBase;
 }
 
 /** Returns true when an anchor click represents a standard unmodified primary-button click. */
@@ -77,7 +88,11 @@ export function useAppRoute(): [AppPage, (page: AppPage) => void] {
 
     function handleCustomRoute(event: Event) {
       const customEvent = event as CustomEvent<AppPage>;
-      if (customEvent.detail === 'tracker' || customEvent.detail === 'calendar') {
+      if (
+        customEvent.detail === 'tracker' ||
+        customEvent.detail === 'calendar' ||
+        customEvent.detail === 'ideas'
+      ) {
         setActivePage(customEvent.detail);
       } else {
         syncFromLocation();

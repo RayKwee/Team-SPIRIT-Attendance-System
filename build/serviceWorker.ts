@@ -203,12 +203,21 @@ async function handleGoogleFontAsset(request) {
 
 async function handleNavigationRequest(request, url) {
   const cache = await caches.open(STATIC_CACHE);
+  const normalizedPathname = url.pathname.replace(/\\/+$/, '').toLowerCase() || '/';
   const isCalendarRoute =
-    url.pathname.endsWith('/calendar') || url.pathname.endsWith('/calendar.html');
+    normalizedPathname.endsWith('/calendar') || normalizedPathname.endsWith('/calendar.html');
+  const isUpdatesRoute =
+    normalizedPathname.endsWith('/updates') || normalizedPathname.endsWith('/updates.html');
+  const isIdeasRoute =
+    normalizedPathname.endsWith('/ideas') || normalizedPathname.endsWith('/ideas.html');
 
   const candidatePaths = isCalendarRoute
     ? ['./calendar.html', './index.html']
-    : ['./index.html'];
+    : isUpdatesRoute
+      ? ['./updates.html', './ideas.html', './index.html']
+      : isIdeasRoute
+        ? ['./ideas.html', './index.html']
+        : ['./index.html'];
 
   for (const candidate of candidatePaths) {
     const cached = await cache.match(resolveFromScope(candidate));
@@ -295,8 +304,11 @@ export function teamSpiritStaticCachePlugin(): Plugin {
     configurePreviewServer(server) {
       server.middlewares.use((req, _res, next) => {
         const incoming = req as { url?: string };
-        if (incoming.url === '/calendar' || incoming.url?.startsWith('/calendar?')) {
-          incoming.url = incoming.url.replace(/^\/calendar/, '/calendar.html');
+        if (incoming.url) {
+          const match = /^\/(calendar|ideas|updates)\/?(\?.*)?$/i.exec(incoming.url);
+          if (match) {
+            incoming.url = `/${match[1].toLowerCase()}.html${match[2] ?? ''}`;
+          }
         }
         next();
       });
@@ -307,6 +319,8 @@ export function teamSpiritStaticCachePlugin(): Plugin {
         './',
         './index.html',
         './calendar.html',
+        './ideas.html',
+        './updates.html',
         './team-spirit-emblem.png',
       ]);
       const fingerprintInputs: string[] = [];

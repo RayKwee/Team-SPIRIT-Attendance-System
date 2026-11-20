@@ -7,6 +7,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import type {
+  AccessScope,
   AttendanceSession,
   AttendanceStatus,
   ClubMember,
@@ -53,6 +54,11 @@ interface AttendanceWorkspaceProps {
   activeSession: AttendanceSession;
   members: ClubMember[];
   preferences: UserPreferences;
+  accessScope?: AccessScope;
+  linkedMember?: ClubMember | null;
+  canViewAttendanceRates?: boolean;
+  canBrowseFullRoster?: boolean;
+  canManageClubRecords?: boolean;
   onBackToHub: () => void;
   onOpenMemberManager: () => void;
   onOpenMemberProfile: (memberId: string) => void;
@@ -65,6 +71,8 @@ interface AttendanceWorkspaceProps {
     targetStatus: Exclude<AttendanceStatus, 'unmarked'>,
   ) => void;
   onSetAbsenceReason: (memberId: string, reason: string) => void;
+  onBeginFieldEdit?: (fieldKey: string) => void;
+  onEndFieldEdit?: (fieldKey: string) => void;
   onResetSessionMarks: () => void;
   onUpdatePreferences: (patch: Partial<UserPreferences>) => void;
 }
@@ -96,21 +104,55 @@ const STATUS_BUTTONS: {
 ];
 
 interface MemberControlsProps {
+  sessionId: string;
   member: ClubMember;
   entry: SessionAttendanceEntry;
   compact?: boolean;
   onToggleStatus: (memberId: string, target: Exclude<AttendanceStatus, 'unmarked'>) => void;
   onReasonChange: (memberId: string, reason: string) => void;
+  onBeginFieldEdit?: (fieldKey: string) => void;
+  onEndFieldEdit?: (fieldKey: string) => void;
 }
 
-/** Shared status buttons and conditional reason field used across both list and grid layouts. */
+/** Shared status buttons and conditional reason field with focus-protected draft state. */
 function MemberAttendanceControls({
+  sessionId,
   member,
   entry,
   compact = false,
   onToggleStatus,
   onReasonChange,
+  onBeginFieldEdit,
+  onEndFieldEdit,
 }: MemberControlsProps) {
+  const fieldKey = `attendance:${sessionId}::${member.id}`;
+  const [isFocused, setIsFocused] = useState(false);
+  const [draftReason, setDraftReason] = useState(entry.reason ?? '');
+  const [hasRemoteChangeWhileFocused, setHasRemoteChangeWhileFocused] = useState(false);
+  const isFocusedRef = useRef(false);
+  const fieldKeyRef = useRef(fieldKey);
+  const onEndFieldEditRef = useRef(onEndFieldEdit);
+  fieldKeyRef.current = fieldKey;
+  onEndFieldEditRef.current = onEndFieldEdit;
+
+  useEffect(() => {
+    if (!isFocused) {
+      setDraftReason(entry.reason ?? '');
+      setHasRemoteChangeWhileFocused(false);
+    } else if ((entry.reason ?? '').trim() !== draftReason.trim()) {
+      setHasRemoteChangeWhileFocused(true);
+    }
+  }, [entry.reason, isFocused, draftReason]);
+
+  useEffect(() => {
+    return () => {
+      if (isFocusedRef.current) {
+        isFocusedRef.current = false;
+        onEndFieldEditRef.current?.(fieldKeyRef.current);
+      }
+    };
+  }, []);
+
   return (
     <div className="member-controls-stack">
       <div
@@ -145,9 +187,31 @@ function MemberAttendanceControls({
             type="text"
             className="form-control absence-reason-input"
             placeholder="Optional reason (e.g. sick, class conflict, transit)..."
-            value={entry.reason ?? ''}
-            onChange={(event) => onReasonChange(member.id, event.target.value)}
+            value={isFocused ? draftReason : (entry.reason ?? '')}
+            onFocus={() => {
+              isFocusedRef.current = true;
+              setIsFocused(true);
+              setDraftReason(entry.reason ?? '');
+              setHasRemoteChangeWhileFocused(false);
+              onBeginFieldEdit?.(fieldKey);
+            }}
+            onChange={(event) => {
+              const nextValue = event.target.value;
+              setDraftReason(nextValue);
+              onReasonChange(member.id, nextValue);
+            }}
+            onBlur={() => {
+              isFocusedRef.current = false;
+              setIsFocused(false);
+              setHasRemoteChangeWhileFocused(false);
+              onEndFieldEdit?.(fieldKey);
+            }}
           />
+          {hasRemoteChangeWhileFocused && (
+            <span className="draft-paused-hint" role="status">
+              Live update paused while typing
+            </span>
+          )}
         </div>
       )}
     </div>
@@ -159,6 +223,11 @@ export function AttendanceWorkspace({
   activeSession,
   members,
   preferences,
+  accessScope = 'local',
+  linkedMember = null,
+  canViewAttendanceRates = true,
+  canBrowseFullRoster = true,
+  canManageClubRecords = true,
   onBackToHub,
   onOpenMemberManager,
   onOpenMemberProfile,
@@ -168,6 +237,8 @@ export function AttendanceWorkspace({
   onRemoveMemberFromSession,
   onToggleAttendanceStatus,
   onSetAbsenceReason,
+  onBeginFieldEdit,
+  onEndFieldEdit,
   onResetSessionMarks,
   onUpdatePreferences,
 }: AttendanceWorkspaceProps) {
@@ -240,7 +311,6 @@ export function AttendanceWorkspace({
   const unassignedClassGroups = useMemo(() => {
     const groups = new Map<string, string[]>();
     for (const member of unassignedMembers) {
-      if (normalizeMemberType(member.memberType) !== 'student') continue;
       const cls = member.className?.trim();
       if (!cls) continue;
       const list = groups.get(cls);
@@ -262,7 +332,7 @@ export function AttendanceWorkspace({
       const memberType = normalizeMemberType(member.memberType);
       return [
         member.name,
-        memberType === 'student' ? member.className : undefined,
+        member.className,
         MEMBER_TYPE_LABELS[memberType],
         member.role,
         member.handle,
@@ -327,7 +397,7 @@ export function AttendanceWorkspace({
     const matchesQuery =
       trimmedQuery.length === 0 ||
       member.name.toLowerCase().includes(trimmedQuery) ||
-      (memberType === 'student' && Boolean(member.className?.toLowerCase().includes(trimmedQuery))) ||
+      Boolean(member.className?.toLowerCase().includes(trimmedQuery)) ||
       MEMBER_TYPE_LABELS[memberType].toLowerCase().includes(trimmedQuery) ||
       Boolean(member.role?.toLowerCase().includes(trimmedQuery));
     return matchesStatus && matchesQuery;
@@ -402,8 +472,194 @@ export function AttendanceWorkspace({
     onUpdatePreferences({ viewMode: nextView });
   }
 
+  const isReadOnlyBroadViewer =
+    accessScope === 'broad_viewer' ||
+    (accessScope !== 'local' &&
+      accessScope !== 'admin' &&
+      canViewAttendanceRates &&
+      canBrowseFullRoster);
+  const canEditSessionChecklist = accessScope === 'local' || accessScope === 'admin';
+
+  if (!canEditSessionChecklist && !isReadOnlyBroadViewer) {
+    if (!linkedMember) {
+      return (
+        <section
+          className="tracker-panel"
+          aria-label="Session overview"
+          data-tutorial-target="attendance-checklist"
+        >
+          <div className="tracker-panel-header">
+            <div className="panel-title-group">
+              <button
+                type="button"
+                className="btn-secondary btn-compact checklist-back-btn"
+                onClick={onBackToHub}
+                title="Return to Sessions Hub"
+              >
+                <PixelArrowLeftIcon />
+                <span>All Sessions</span>
+              </button>
+              <h2 className="panel-title">Session Overview</h2>
+            </div>
+          </div>
+
+          <div className="session-banner">
+            <div className="session-banner-main">
+              <div className="session-banner-title-row">
+                <h3 className="session-banner-name">{activeSession.name}</h3>
+                {activeSession.eventType && (
+                  <span className="session-type-tag">{activeSession.eventType}</span>
+                )}
+              </div>
+              {activeSession.description && (
+                <p className="session-banner-description">{activeSession.description}</p>
+              )}
+            </div>
+
+            <div className="session-meta-pills">
+              <span className="session-meta-pill">
+                <PixelCalendarIcon />
+                <span>{formatSessionDate(activeSession.date)}</span>
+              </span>
+              <span className="session-meta-pill">
+                <PixelClockIcon />
+                <span>{formatSessionTime(activeSession.time)}</span>
+              </span>
+              {activeSession.location && (
+                <span className="session-meta-pill">
+                  <PixelPinIcon />
+                  <span>{activeSession.location}</span>
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div className="tracker-body">
+            <div className="personal-attendance-card">
+              <div className="personal-attendance-head">
+                <div>
+                  <span className="personal-attendance-label">Read-Only Schedule View</span>
+                  <h3 className="personal-attendance-name">Member Attendance Hidden</h3>
+                </div>
+              </div>
+              <span className="personal-attendance-hint">
+                Club roster &amp; peer attendance marks are restricted under current Member
+                Visibility Permissions.
+              </span>
+            </div>
+          </div>
+        </section>
+      );
+    }
+
+    const personalEntry = activeSession.attendance[linkedMember.id];
+    const isAssignedToSession =
+      activeSession.memberIds.includes(linkedMember.id) || Boolean(personalEntry);
+    const personalStatus = personalEntry?.status ?? 'unmarked';
+    const personalReason = personalEntry?.reason?.trim();
+
+    return (
+      <section
+        className="tracker-panel"
+        aria-label="Personal session attendance record"
+        data-tutorial-target="attendance-checklist"
+      >
+        <div className="tracker-panel-header">
+          <div className="panel-title-group">
+            <button
+              type="button"
+              className="btn-secondary btn-compact checklist-back-btn"
+              onClick={onBackToHub}
+              title="Return to My Sessions"
+            >
+              <PixelArrowLeftIcon />
+              <span>All My Sessions</span>
+            </button>
+            <h2 className="panel-title">My Attendance Record</h2>
+          </div>
+        </div>
+
+        <div className="session-banner">
+          <div className="session-banner-main">
+            <div className="session-banner-title-row">
+              <h3 className="session-banner-name">{activeSession.name}</h3>
+              {activeSession.eventType && (
+                <span className="session-type-tag">{activeSession.eventType}</span>
+              )}
+            </div>
+            {activeSession.description && (
+              <p className="session-banner-description">{activeSession.description}</p>
+            )}
+          </div>
+
+          <div className="session-meta-pills">
+            <span className="session-meta-pill">
+              <PixelCalendarIcon />
+              <span>{formatSessionDate(activeSession.date)}</span>
+            </span>
+            <span className="session-meta-pill">
+              <PixelClockIcon />
+              <span>{formatSessionTime(activeSession.time)}</span>
+            </span>
+            {activeSession.location && (
+              <span className="session-meta-pill">
+                <PixelPinIcon />
+                <span>{activeSession.location}</span>
+              </span>
+            )}
+          </div>
+        </div>
+
+        <div className="tracker-body">
+          <div className="personal-attendance-card">
+            <div className="personal-attendance-head">
+              <div>
+                <span className="personal-attendance-label">Recorded Member</span>
+                <h3 className="personal-attendance-name">{linkedMember.name}</h3>
+                {linkedMember.className && (
+                  <span className="member-class-pill">{linkedMember.className}</span>
+                )}
+              </div>
+              {isAssignedToSession ? (
+                <span className={`status-badge status-${personalStatus}`}>
+                  {STATUS_LABELS[personalStatus]}
+                </span>
+              ) : (
+                <span className="session-type-tag">Not Assigned</span>
+              )}
+            </div>
+
+            {isAssignedToSession && personalStatus === 'absent_with_reason' && (
+              <div className="personal-attendance-reason">
+                <strong>Absence Reason / Note:</strong>{' '}
+                <span>{personalReason || 'No reason note recorded.'}</span>
+              </div>
+            )}
+
+            <div className="personal-attendance-meta">
+              <span className="mono-meta">
+                {!isAssignedToSession
+                  ? 'You are not assigned to this session’s roster.'
+                  : personalEntry?.updatedAt
+                    ? `Last updated: ${formatTimestamp(personalEntry.updatedAt)}`
+                    : 'Attendance not yet marked for this session.'}
+              </span>
+              <span className="personal-attendance-hint">
+                Read-only student view — attendance marks are managed by club administrators.
+              </span>
+            </div>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
   return (
-    <section className="tracker-panel" aria-label="Attendance session workspace">
+    <section
+      className="tracker-panel"
+      aria-label="Attendance session workspace"
+      data-tutorial-target="attendance-checklist"
+    >
       <div className="tracker-panel-header">
         <div className="panel-title-group">
           <button
@@ -422,13 +678,17 @@ export function AttendanceWorkspace({
         </div>
 
         <div className="panel-header-actions">
-          {assignedMembers.length > 0 && (
+          {canEditSessionChecklist && assignedMembers.length > 0 && (
             <button
               type="button"
               className="btn-secondary"
               onClick={onResetSessionMarks}
-              disabled={!hasAnyMarked}
-              title="Reset all assigned member statuses in this session to Unmarked"
+              disabled={!hasAnyMarked || !canManageClubRecords}
+              title={
+                canManageClubRecords
+                  ? 'Reset all assigned member statuses in this session to Unmarked'
+                  : 'Admin privileges required to reset all session marks'
+              }
             >
               <PixelRefreshIcon />
               <span>Reset Marks</span>
@@ -479,16 +739,23 @@ export function AttendanceWorkspace({
             )}
           </div>
 
-          <button
-            type="button"
-            className="icon-btn icon-btn-danger"
-            onClick={() => setPendingAction({ kind: 'session', session: activeSession })}
-            title="Delete current session"
-            aria-label={`Delete session ${activeSession.name}`}
-          >
-            <PixelTrashIcon />
-            <span>Delete Session</span>
-          </button>
+          {canEditSessionChecklist && (
+            <button
+              type="button"
+              className="icon-btn icon-btn-danger"
+              disabled={!canManageClubRecords}
+              onClick={() => setPendingAction({ kind: 'session', session: activeSession })}
+              title={
+                canManageClubRecords
+                  ? 'Delete current session'
+                  : 'Admin privileges required to delete synced sessions'
+              }
+              aria-label={`Delete session ${activeSession.name}`}
+            >
+              <PixelTrashIcon />
+              <span>Delete Session</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -523,7 +790,12 @@ export function AttendanceWorkspace({
         </div>
       </div>
 
-      <div className="session-assign-bar" ref={suggestWrapRef}>
+      {canEditSessionChecklist && (
+        <div
+          className="session-assign-bar"
+          ref={suggestWrapRef}
+          data-tutorial-target="attendance-assign-bar"
+        >
         <div className="session-suggest-combobox">
           <span className="session-suggest-icon" aria-hidden="true">
             <PixelSearchIcon />
@@ -631,15 +903,14 @@ export function AttendanceWorkspace({
                         <span className="session-suggest-info">
                           <span className="session-suggest-name-row">
                             <span className="session-suggest-name">{member.name}</span>
-                            {memberType === 'student'
-                              ? member.className && (
-                                  <span className="member-class-pill">{member.className}</span>
-                                )
-                              : (
-                                  <span className={`member-type-pill is-${memberType}`}>
-                                    {MEMBER_TYPE_LABELS[memberType]}
-                                  </span>
-                                )}
+                            {memberType !== 'student' && (
+                              <span className={`member-type-pill is-${memberType}`}>
+                                {MEMBER_TYPE_LABELS[memberType]}
+                              </span>
+                            )}
+                            {member.className && (
+                              <span className="member-class-pill">{member.className}</span>
+                            )}
                           </span>
                           {(member.role || member.handle) && (
                             <span className="session-suggest-sub">
@@ -669,15 +940,14 @@ export function AttendanceWorkspace({
                         <span className="session-suggest-info">
                           <span className="session-suggest-name-row">
                             <span className="session-suggest-name">{member.name}</span>
-                            {memberType === 'student'
-                              ? member.className && (
-                                  <span className="member-class-pill">{member.className}</span>
-                                )
-                              : (
-                                  <span className={`member-type-pill is-${memberType}`}>
-                                    {MEMBER_TYPE_LABELS[memberType]}
-                                  </span>
-                                )}
+                            {memberType !== 'student' && (
+                              <span className={`member-type-pill is-${memberType}`}>
+                                {MEMBER_TYPE_LABELS[memberType]}
+                              </span>
+                            )}
+                            {member.className && (
+                              <span className="member-class-pill">{member.className}</span>
+                            )}
                           </span>
                           {member.role && <span className="session-suggest-sub">{member.role}</span>}
                         </span>
@@ -778,6 +1048,7 @@ export function AttendanceWorkspace({
           </button>
         </div>
       </div>
+      )}
 
       <div className="tracker-toolbar">
         <div className="filter-pills" role="tablist" aria-label="Filter session checklist by status">
@@ -840,17 +1111,21 @@ export function AttendanceWorkspace({
             </div>
             <h3 className="empty-title">
               {assignedMembers.length === 0
-                ? 'Assign members to this session'
+                ? canEditSessionChecklist
+                  ? 'Assign members to this session'
+                  : 'No members assigned yet'
                 : 'No matching members in this session'}
             </h3>
             <p className="empty-description">
               {assignedMembers.length === 0
-                ? activeMembers.length === 0
-                  ? 'First add or restore active club members in the Member Manager, then search and click their names above to add them to this session.'
-                  : 'Type an active member name in the search bar above and click a suggestion to add them to this session’s attendance checklist.'
+                ? !canEditSessionChecklist
+                  ? 'No club members have been assigned to this session by an administrator yet.'
+                  : activeMembers.length === 0
+                    ? 'First add or restore active club members in the Member Manager, then search and click their names above to add them to this session.'
+                    : 'Type an active member name in the search bar above and click a suggestion to add them to this session’s attendance checklist.'
                 : 'Try clearing your checklist filter or switching the status tab.'}
             </p>
-            {assignedMembers.length === 0 && activeMembers.length === 0 && (
+            {canEditSessionChecklist && assignedMembers.length === 0 && activeMembers.length === 0 && (
               <button type="button" className="btn-primary" onClick={onOpenMemberManager}>
                 <PixelUsersIcon />
                 <span>Open Member Manager</span>
@@ -880,20 +1155,19 @@ export function AttendanceWorkspace({
                           Legacy
                         </span>
                       )}
-                      {memberType === 'student'
-                        ? member.className && (
-                            <span
-                              className="member-class-pill"
-                              title={`Class: ${member.className}`}
-                            >
-                              {member.className}
-                            </span>
-                          )
-                        : (
-                            <span className={`member-type-pill is-${memberType}`}>
-                              {MEMBER_TYPE_LABELS[memberType]}
-                            </span>
-                          )}
+                      {memberType !== 'student' && (
+                        <span className={`member-type-pill is-${memberType}`}>
+                          {MEMBER_TYPE_LABELS[memberType]}
+                        </span>
+                      )}
+                      {member.className && (
+                        <span
+                          className="member-class-pill"
+                          title={`Class: ${member.className}`}
+                        >
+                          {member.className}
+                        </span>
+                      )}
                       {member.role && <span className="member-role-pill">{member.role}</span>}
                       <span className={`status-badge status-${entry.status}`}>
                         {STATUS_LABELS[entry.status]}
@@ -905,26 +1179,42 @@ export function AttendanceWorkspace({
                   </div>
 
                   <div className="roster-line-controls">
-                    <MemberAttendanceControls
-                      member={member}
-                      entry={entry}
-                      onToggleStatus={onToggleAttendanceStatus}
-                      onReasonChange={onSetAbsenceReason}
-                    />
+                    {isReadOnlyBroadViewer ? (
+                      <div className="personal-attendance-readonly-pill">
+                        <span className={`status-badge status-${entry.status}`}>
+                          {STATUS_LABELS[entry.status]}
+                        </span>
+                        {entry.status === 'absent_with_reason' && entry.reason && (
+                          <span className="mono-meta">({entry.reason})</span>
+                        )}
+                      </div>
+                    ) : (
+                      <MemberAttendanceControls
+                        sessionId={activeSession.id}
+                        member={member}
+                        entry={entry}
+                        onToggleStatus={onToggleAttendanceStatus}
+                        onReasonChange={onSetAbsenceReason}
+                        onBeginFieldEdit={onBeginFieldEdit}
+                        onEndFieldEdit={onEndFieldEdit}
+                      />
+                    )}
                   </div>
 
-                  <div className="roster-line-manage">
-                    <button
-                      type="button"
-                      className="icon-btn icon-btn-danger"
-                      onClick={() => handleRequestRemoveMember(member)}
-                      aria-label={`Remove ${member.name} from this session`}
-                      title="Remove from this session"
-                    >
-                      <PixelCloseIcon width={12} height={12} />
-                      <span>Remove</span>
-                    </button>
-                  </div>
+                  {canEditSessionChecklist && (
+                    <div className="roster-line-manage">
+                      <button
+                        type="button"
+                        className="icon-btn icon-btn-danger"
+                        onClick={() => handleRequestRemoveMember(member)}
+                        aria-label={`Remove ${member.name} from this session`}
+                        title="Remove from this session"
+                      >
+                        <PixelCloseIcon width={12} height={12} />
+                        <span>Remove</span>
+                      </button>
+                    </div>
+                  )}
                 </article>
               );
             })}
@@ -943,17 +1233,19 @@ export function AttendanceWorkspace({
                         {STATUS_LABELS[entry.status]}
                       </span>
                     </div>
-                    <div className="block-card-actions">
-                      <button
-                        type="button"
-                        className="icon-btn icon-btn-danger"
-                        onClick={() => handleRequestRemoveMember(member)}
-                        aria-label={`Remove ${member.name} from this session`}
-                        title="Remove from this session"
-                      >
-                        <PixelCloseIcon width={12} height={12} />
-                      </button>
-                    </div>
+                    {canEditSessionChecklist && (
+                      <div className="block-card-actions">
+                        <button
+                          type="button"
+                          className="icon-btn icon-btn-danger"
+                          onClick={() => handleRequestRemoveMember(member)}
+                          aria-label={`Remove ${member.name} from this session`}
+                          title="Remove from this session"
+                        >
+                          <PixelCloseIcon width={12} height={12} />
+                        </button>
+                      </div>
+                    )}
                   </div>
 
                   <div className="block-card-identity">
@@ -972,30 +1264,38 @@ export function AttendanceWorkspace({
                         Legacy
                       </span>
                     )}
-                    {memberType === 'student'
-                      ? member.className && (
-                          <span
-                            className="member-class-pill"
-                            title={`Class: ${member.className}`}
-                          >
-                            {member.className}
-                          </span>
-                        )
-                      : (
-                          <span className={`member-type-pill is-${memberType}`}>
-                            {MEMBER_TYPE_LABELS[memberType]}
-                          </span>
-                        )}
+                    {memberType !== 'student' && (
+                      <span className={`member-type-pill is-${memberType}`}>
+                        {MEMBER_TYPE_LABELS[memberType]}
+                      </span>
+                    )}
+                    {member.className && (
+                      <span
+                        className="member-class-pill"
+                        title={`Class: ${member.className}`}
+                      >
+                        {member.className}
+                      </span>
+                    )}
                     {member.role && <span className="member-role-pill">{member.role}</span>}
                   </div>
 
-                  <MemberAttendanceControls
-                    member={member}
-                    entry={entry}
-                    compact
-                    onToggleStatus={onToggleAttendanceStatus}
-                    onReasonChange={onSetAbsenceReason}
-                  />
+                  {isReadOnlyBroadViewer ? (
+                    entry.status === 'absent_with_reason' && entry.reason ? (
+                      <p className="day-member-reason">Reason: {entry.reason}</p>
+                    ) : null
+                  ) : (
+                    <MemberAttendanceControls
+                      sessionId={activeSession.id}
+                      member={member}
+                      entry={entry}
+                      compact
+                      onToggleStatus={onToggleAttendanceStatus}
+                      onReasonChange={onSetAbsenceReason}
+                      onBeginFieldEdit={onBeginFieldEdit}
+                      onEndFieldEdit={onEndFieldEdit}
+                    />
+                  )}
 
                   <div className="block-card-meta mono-cell">
                     {formatTimestamp(entry.updatedAt)}

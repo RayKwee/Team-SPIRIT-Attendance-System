@@ -1,21 +1,33 @@
 import { useEffect, useId, useRef, useState, type ChangeEvent } from 'react';
+import { DEFAULT_MEMBER_VISIBILITY_PERMISSIONS } from '../lib/clubPostsApi';
 import type {
+  AccessScope,
+  AccountRole,
+  ClubMember,
   DefaultAssignmentStatus,
   RosterDensity,
   SyncStatus,
   ThemeAccent,
   UserPreferences,
+  UserProfileRecord,
   ViewMode,
 } from '../types/attendance';
+import type { MemberVisibilityPermissions } from '../types/projectIdeas';
+import type { TutorialStatus } from '../types/tutorial';
+import { formatTimestamp } from '../utils/date';
+import { ConfirmDialog } from './ConfirmDialog';
 import {
   PixelAlertIcon,
   PixelCheckIcon,
   PixelCloseIcon,
   PixelDownloadIcon,
+  PixelHelpIcon,
   PixelLockIcon,
   PixelLogOutIcon,
   PixelRefreshIcon,
+  PixelSearchIcon,
   PixelSettingsIcon,
+  PixelStarIcon,
   PixelUploadIcon,
   PixelUserIcon,
 } from './PixelIcons';
@@ -23,8 +35,22 @@ import {
 interface SettingsModalProps {
   isOpen: boolean;
   preferences: UserPreferences;
+  tutorialStatus: TutorialStatus;
   isCloudConnected: boolean;
+  currentUserId?: string | null;
   userEmail?: string;
+  userRole?: AccountRole | null;
+  isAdmin: boolean;
+  accessScope?: AccessScope;
+  linkedMember?: ClubMember | null;
+  canViewAllAttendance?: boolean;
+  members?: ClubMember[];
+  isRoleLoading?: boolean;
+  roleError?: string | null;
+  adminProfiles?: UserProfileRecord[];
+  isProfilesLoading?: boolean;
+  profilesError?: string | null;
+  canManageClubRecords: boolean;
   syncStatus: SyncStatus;
   pendingSyncCount: number;
   syncError?: string | null;
@@ -32,8 +58,24 @@ interface SettingsModalProps {
   sessionCount: number;
   onUpdatePreferences: (patch: Partial<UserPreferences>) => void;
   onResetPreferences: () => void;
+  onStartTutorial: () => void;
   onOpenCloudSync: () => void;
   onSignOut: () => Promise<void>;
+  onRefreshAdminProfiles?: () => Promise<void>;
+  onUpdateUserAdminRole?: (targetUserId: string, makeAdmin: boolean) => Promise<UserProfileRecord>;
+  onLinkUserToMember?: (
+    targetUserId: string,
+    targetMemberId: string | null,
+  ) => Promise<UserProfileRecord>;
+  onUpdateUserVisibilityScope?: (
+    targetUserId: string,
+    allowBroadView: boolean,
+  ) => Promise<UserProfileRecord>;
+  memberVisibilityPermissions?: MemberVisibilityPermissions;
+  isUpdatingSharedIdeaVisibility?: boolean;
+  onUpdateMemberVisibilityPermissions?: (
+    patch: Partial<MemberVisibilityPermissions>,
+  ) => Promise<MemberVisibilityPermissions>;
   onExportBackup: () => void;
   onImportBackupFile: (
     file: File,
@@ -63,11 +105,54 @@ const CHECKLIST_VIEW_OPTIONS: { value: ViewMode; label: string }[] = [
   { value: 'grid', label: 'Grid' },
 ];
 
+const MEMBER_PERMISSION_TOGGLES: {
+  key: keyof MemberVisibilityPermissions;
+  title: string;
+  description: string;
+}[] = [
+  {
+    key: 'memberCanViewRoster',
+    title: "Full Club Roster & Other Members' Profiles",
+    description:
+      'Allow standard members to open the full Member Manager directory and inspect peer profiles (read-only).',
+  },
+  {
+    key: 'memberCanViewAttendanceRates',
+    title: "Other Members' Attendance Rates & Leaderboard",
+    description:
+      'Allow standard members to view club-wide attendance totals, peer percentages, streaks, and the Attendance Leaderboard.',
+  },
+  {
+    key: 'memberCanViewCalendarDetails',
+    title: 'Club-Wide Calendar Details',
+    description:
+      'Allow standard members to view all scheduled club meetings, dates, times, and locations on the Calendar.',
+  },
+  {
+    key: 'sharedIdeaVisibility',
+    title: "Other Members' Submitted Project Ideas",
+    description:
+      'Allow standard members to browse all club project proposals (personal admin feedback stays private).',
+  },
+  {
+    key: 'memberCanCommentOnPosts',
+    title: 'Comment/Reply Permissions on Posts',
+    description:
+      'Allow logged-in standard members to post comments and replies under official club updates.',
+  },
+];
+
 function getSyncSummaryLabel(
   syncStatus: SyncStatus,
   pendingSyncCount: number,
   syncError?: string | null,
 ): string {
+  if (syncStatus === 'conflict') {
+    return 'Concurrent edit conflict detected — review from the header Conflict pill';
+  }
+  if (syncStatus === 'reconnecting') {
+    return 'Reconnecting live sync channel — background sync active';
+  }
   if (syncStatus === 'loading' || syncStatus === 'syncing') {
     return 'Syncing changes with Supabase...';
   }
@@ -86,8 +171,22 @@ function getSyncSummaryLabel(
 export function SettingsModal({
   isOpen,
   preferences,
+  tutorialStatus,
   isCloudConnected,
+  currentUserId,
   userEmail,
+  userRole,
+  isAdmin,
+  accessScope = 'local',
+  linkedMember = null,
+  canViewAllAttendance = false,
+  members = [],
+  isRoleLoading = false,
+  roleError,
+  adminProfiles = [],
+  isProfilesLoading = false,
+  profilesError,
+  canManageClubRecords,
   syncStatus,
   pendingSyncCount,
   syncError,
@@ -95,8 +194,16 @@ export function SettingsModal({
   sessionCount,
   onUpdatePreferences,
   onResetPreferences,
+  onStartTutorial,
   onOpenCloudSync,
   onSignOut,
+  onRefreshAdminProfiles,
+  onUpdateUserAdminRole,
+  onLinkUserToMember,
+  onUpdateUserVisibilityScope,
+  memberVisibilityPermissions = DEFAULT_MEMBER_VISIBILITY_PERMISSIONS,
+  isUpdatingSharedIdeaVisibility = false,
+  onUpdateMemberVisibilityPermissions,
   onExportBackup,
   onImportBackupFile,
   onClose,
@@ -109,6 +216,21 @@ export function SettingsModal({
 
   const [isSigningOut, setIsSigningOut] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
+  const [adminSearchQuery, setAdminSearchQuery] = useState('');
+  const [adminRoleFilter, setAdminRoleFilter] = useState<'all' | 'admin' | 'member'>('all');
+  const [busyRoleUserId, setBusyRoleUserId] = useState<string | null>(null);
+  const [permissionsNotice, setPermissionsNotice] = useState<{
+    tone: 'success' | 'error';
+    message: string;
+  } | null>(null);
+  const [adminNotice, setAdminNotice] = useState<{
+    tone: 'success' | 'error';
+    message: string;
+  } | null>(null);
+  const [pendingRoleChange, setPendingRoleChange] = useState<{
+    profile: UserProfileRecord;
+    makeAdmin: boolean;
+  } | null>(null);
   const [backupNotice, setBackupNotice] = useState<{
     tone: 'success' | 'error';
     message: string;
@@ -119,24 +241,43 @@ export function SettingsModal({
 
     setIsSigningOut(false);
     setIsImporting(false);
+    setAdminSearchQuery('');
+    setAdminRoleFilter('all');
+    setBusyRoleUserId(null);
+    setAdminNotice(null);
+    setPermissionsNotice(null);
+    setPendingRoleChange(null);
     setBackupNotice(null);
 
     const focusTimer = window.setTimeout(() => {
       closeButtonRef.current?.focus();
     }, 0);
 
+    return () => {
+      window.clearTimeout(focusTimer);
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+
     function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === 'Escape' && !isSigningOut && !isImporting) {
+      if (
+        event.key === 'Escape' &&
+        !isSigningOut &&
+        !isImporting &&
+        !busyRoleUserId &&
+        !pendingRoleChange
+      ) {
         onClose();
       }
     }
 
     window.addEventListener('keydown', handleKeyDown);
     return () => {
-      window.clearTimeout(focusTimer);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [isOpen, isSigningOut, isImporting, onClose]);
+  }, [isOpen, isSigningOut, isImporting, busyRoleUserId, pendingRoleChange, onClose]);
 
   if (!isOpen) {
     return null;
@@ -190,12 +331,151 @@ export function SettingsModal({
     });
   }
 
+  async function handleConfirmRoleChange() {
+    if (!pendingRoleChange || !onUpdateUserAdminRole || busyRoleUserId) return;
+    const { profile, makeAdmin } = pendingRoleChange;
+    setBusyRoleUserId(profile.userId);
+    setAdminNotice(null);
+    try {
+      await onUpdateUserAdminRole(profile.userId, makeAdmin);
+      setAdminNotice({
+        tone: 'success',
+        message: makeAdmin
+          ? `Promoted ${profile.email || 'user'} to Administrator.`
+          : `Removed admin privileges from ${profile.email || 'user'}.`,
+      });
+      setPendingRoleChange(null);
+    } catch (error) {
+      setAdminNotice({
+        tone: 'error',
+        message: error instanceof Error ? error.message : 'Unable to update administrator role.',
+      });
+      setPendingRoleChange(null);
+    } finally {
+      setBusyRoleUserId(null);
+    }
+  }
+
+  async function handleLinkMemberChange(profile: UserProfileRecord, targetMemberId: string) {
+    if (!onLinkUserToMember || busyRoleUserId) return;
+    const nextMemberId = targetMemberId.trim() || null;
+    setBusyRoleUserId(profile.userId);
+    setAdminNotice(null);
+    try {
+      await onLinkUserToMember(profile.userId, nextMemberId);
+      const linkedName = nextMemberId
+        ? members.find((member) => member.id === nextMemberId)?.name ?? 'roster profile'
+        : null;
+      setAdminNotice({
+        tone: 'success',
+        message: linkedName
+          ? `Linked ${profile.email || 'account'} to ${linkedName}.`
+          : `Unlinked ${profile.email || 'account'} from its roster profile.`,
+      });
+    } catch (error) {
+      setAdminNotice({
+        tone: 'error',
+        message:
+          error instanceof Error ? error.message : 'Unable to update linked roster profile.',
+      });
+    } finally {
+      setBusyRoleUserId(null);
+    }
+  }
+
+  async function handleToggleBroadVisibility(profile: UserProfileRecord) {
+    if (!onUpdateUserVisibilityScope || busyRoleUserId) return;
+    const nextBroadView = !profile.canViewAllAttendance;
+    setBusyRoleUserId(profile.userId);
+    setAdminNotice(null);
+    try {
+      await onUpdateUserVisibilityScope(profile.userId, nextBroadView);
+      setAdminNotice({
+        tone: 'success',
+        message: nextBroadView
+          ? `Granted broad club-wide attendance visibility to ${profile.email || 'user'}.`
+          : `Restricted ${profile.email || 'user'} back to personal-only attendance visibility.`,
+      });
+    } catch (error) {
+      setAdminNotice({
+        tone: 'error',
+        message:
+          error instanceof Error ? error.message : 'Unable to update attendance visibility scope.',
+      });
+    } finally {
+      setBusyRoleUserId(null);
+    }
+  }
+
+  async function handleTogglePermission(
+    key: keyof MemberVisibilityPermissions,
+    label: string,
+  ) {
+    if (!onUpdateMemberVisibilityPermissions || isUpdatingSharedIdeaVisibility) return;
+    const nextValue = !memberVisibilityPermissions[key];
+    setPermissionsNotice(null);
+    try {
+      await onUpdateMemberVisibilityPermissions({ [key]: nextValue });
+      setPermissionsNotice({
+        tone: 'success',
+        message: `${nextValue ? 'Enabled' : 'Restricted'} "${label}" for all logged-in standard members.`,
+      });
+    } catch (error) {
+      setPermissionsNotice({
+        tone: 'error',
+        message:
+          error instanceof Error ? error.message : 'Unable to save member visibility permissions.',
+      });
+    }
+  }
+
+  async function handleRestrictAllPermissions() {
+    if (!onUpdateMemberVisibilityPermissions || isUpdatingSharedIdeaVisibility) return;
+    setPermissionsNotice(null);
+    try {
+      await onUpdateMemberVisibilityPermissions(DEFAULT_MEMBER_VISIBILITY_PERMISSIONS);
+      setPermissionsNotice({
+        tone: 'success',
+        message: 'Reset all 5 global member visibility permissions to Restricted (Strict Privacy).',
+      });
+    } catch (error) {
+      setPermissionsNotice({
+        tone: 'error',
+        message:
+          error instanceof Error ? error.message : 'Unable to reset member visibility permissions.',
+      });
+    }
+  }
+
+  const adminCount = adminProfiles.filter((profile) => profile.role === 'admin').length;
+  const standardMemberCount = adminProfiles.length - adminCount;
+  const enabledPermissionsCount = Object.values(memberVisibilityPermissions).filter(Boolean).length;
+  const memberNameById = new Map(members.map((member) => [member.id, member]));
+  const sortedMembersForLinking = [...members].sort((a, b) => a.name.localeCompare(b.name));
+  const filteredAdminProfiles = adminProfiles.filter((profile) => {
+    if (adminRoleFilter === 'admin' && profile.role !== 'admin') return false;
+    if (adminRoleFilter === 'member' && profile.role !== 'member') return false;
+    const q = adminSearchQuery.trim().toLowerCase();
+    if (!q) return true;
+    const linkedName = profile.linkedMemberId
+      ? memberNameById.get(profile.linkedMemberId)?.name.toLowerCase() ?? ''
+      : '';
+    return (
+      profile.email.toLowerCase().includes(q) ||
+      profile.role.toLowerCase().includes(q) ||
+      linkedName.includes(q)
+    );
+  });
+
+  const isModalBusy = isSigningOut || isImporting || Boolean(busyRoleUserId);
+  const isRoleVerifying = isRoleLoading || userRole === null;
+
   return (
     <div
       className="modal-backdrop"
       role="presentation"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget && !isSigningOut && !isImporting) {
+        if (event.target === event.currentTarget && !isModalBusy && !pendingRoleChange) {
           onClose();
         }
       }}
@@ -222,7 +502,7 @@ export function SettingsModal({
             type="button"
             className="modal-close-btn"
             onClick={onClose}
-            disabled={isSigningOut || isImporting}
+            disabled={isModalBusy || pendingRoleChange !== null}
             aria-label="Close settings"
             title="Close (Esc)"
           >
@@ -241,32 +521,84 @@ export function SettingsModal({
             </div>
 
             {isCloudConnected ? (
-              <div className="settings-account-card is-connected">
-                <div className="settings-account-info">
-                  <div className="settings-account-avatar" aria-hidden="true">
-                    <PixelUserIcon />
+              <>
+                <div className="settings-account-card is-connected">
+                  <div className="settings-account-info">
+                    <div className="settings-account-avatar" aria-hidden="true">
+                      <PixelUserIcon />
+                    </div>
+                    <div className="settings-account-copy">
+                      <div className="settings-account-role-row">
+                        <span className="settings-account-label">Signed in as</span>
+                        <span
+                          className={`admin-role-pill ${
+                            isRoleVerifying
+                              ? 'is-loading'
+                              : isAdmin
+                                ? 'is-admin'
+                                : canViewAllAttendance
+                                  ? 'is-viewer'
+                                  : 'is-member'
+                          }`}
+                        >
+                          {isRoleVerifying
+                            ? 'Verifying Role...'
+                            : userRole === 'admin'
+                              ? 'Administrator'
+                              : canViewAllAttendance
+                                ? 'Broad Viewer'
+                                : 'Standard Member'}
+                        </span>
+                      </div>
+                      <strong className="settings-account-email" title={userEmail}>
+                        {userEmail || 'Authenticated Supabase Account'}
+                      </strong>
+                      {linkedMember && (
+                        <span className="settings-account-sync-meta">
+                          Linked Profile: <strong>{linkedMember.name}</strong>
+                          {linkedMember.className ? ` (${linkedMember.className})` : ''}
+                        </span>
+                      )}
+                      {!isRoleVerifying && !isAdmin && !linkedMember && !canViewAllAttendance && (
+                        <span className="settings-account-sync-meta">
+                          Roster link pending — ask an admin to link your login to your club
+                          profile.
+                        </span>
+                      )}
+                      <span className="settings-account-sync-meta">
+                        {getSyncSummaryLabel(syncStatus, pendingSyncCount, syncError)}
+                      </span>
+                    </div>
                   </div>
-                  <div className="settings-account-copy">
-                    <span className="settings-account-label">Signed in as</span>
-                    <strong className="settings-account-email" title={userEmail}>
-                      {userEmail || 'Authenticated Supabase Account'}
-                    </strong>
-                    <span className="settings-account-sync-meta">
-                      {getSyncSummaryLabel(syncStatus, pendingSyncCount, syncError)}
-                    </span>
-                  </div>
+
+                  <button
+                    type="button"
+                    className="settings-signout-btn"
+                    onClick={() => void handleSignOutClick()}
+                    disabled={isSigningOut}
+                  >
+                    <PixelLogOutIcon />
+                    <span>{isSigningOut ? 'Signing Out...' : 'Sign Out'}</span>
+                  </button>
                 </div>
 
-                <button
-                  type="button"
-                  className="settings-signout-btn"
-                  onClick={() => void handleSignOutClick()}
-                  disabled={isSigningOut}
-                >
-                  <PixelLogOutIcon />
-                  <span>{isSigningOut ? 'Signing Out...' : 'Sign Out'}</span>
-                </button>
-              </div>
+                {roleError && (
+                  <div className="settings-backup-notice is-error" role="alert">
+                    <PixelAlertIcon width={13} height={13} />
+                    <span>{roleError}</span>
+                  </div>
+                )}
+
+                {!isRoleVerifying && !isAdmin && !roleError && (
+                  <p className="settings-role-note">
+                    {accessScope === 'broad_viewer'
+                      ? 'Your account has read-only broad visibility across all club sessions and attendance stats, granted by an administrator.'
+                      : accessScope === 'member_self'
+                        ? 'Your account is restricted to viewing only your own attendance records, attendance rate, and sessions you participated in.'
+                        : 'Your account is signed in, but waiting for an administrator to link it to a club roster profile (or grant broader visibility).'}
+                  </p>
+                )}
+              </>
             ) : (
               <div className="settings-account-card is-local">
                 <div className="settings-account-copy">
@@ -291,6 +623,342 @@ export function SettingsModal({
               </div>
             )}
           </section>
+
+          {/* Section 1b: Admin Management (Visible exclusively to verified Admins) */}
+          {isCloudConnected && isAdmin && (
+            <section className="settings-section" aria-label="Admin Management">
+              <div className="settings-section-header">
+                <h3 className="settings-section-title">Admin Management</h3>
+                <span className="settings-mode-tag is-cloud">
+                  {adminCount} {adminCount === 1 ? 'Admin' : 'Admins'} • {adminProfiles.length}{' '}
+                  {adminProfiles.length === 1 ? 'Account' : 'Accounts'}
+                </span>
+              </div>
+
+              <div className="admin-management-panel">
+                <div className="admin-search-row">
+                  <div className="session-hub-search-wrap admin-search-wrap">
+                    <span className="session-suggest-icon" aria-hidden="true">
+                      <PixelSearchIcon />
+                    </span>
+                    <input
+                      type="text"
+                      className="form-control session-hub-search-input"
+                      placeholder="Filter accounts by email, role, or linked member..."
+                      value={adminSearchQuery}
+                      onChange={(event) => setAdminSearchQuery(event.target.value)}
+                      aria-label="Filter registered accounts"
+                    />
+                  </div>
+
+                  {onRefreshAdminProfiles && (
+                    <button
+                      type="button"
+                      className="btn-secondary btn-compact"
+                      onClick={() => void onRefreshAdminProfiles()}
+                      disabled={isProfilesLoading || Boolean(busyRoleUserId)}
+                      title="Refresh registered accounts"
+                    >
+                      <PixelRefreshIcon />
+                      <span>{isProfilesLoading ? 'Loading...' : 'Refresh'}</span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="filter-pills admin-role-filter-pills" role="tablist" aria-label="Filter accounts by role">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={adminRoleFilter === 'all'}
+                    className={`filter-pill ${adminRoleFilter === 'all' ? 'is-active' : ''}`}
+                    onClick={() => setAdminRoleFilter('all')}
+                  >
+                    All Accounts ({adminProfiles.length})
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={adminRoleFilter === 'admin'}
+                    className={`filter-pill ${adminRoleFilter === 'admin' ? 'is-active' : ''}`}
+                    onClick={() => setAdminRoleFilter('admin')}
+                  >
+                    Admins ({adminCount})
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={adminRoleFilter === 'member'}
+                    className={`filter-pill ${adminRoleFilter === 'member' ? 'is-active' : ''}`}
+                    onClick={() => setAdminRoleFilter('member')}
+                  >
+                    Members ({standardMemberCount})
+                  </button>
+                </div>
+
+                {profilesError && (
+                  <div className="settings-backup-notice is-error" role="alert">
+                    <PixelAlertIcon width={13} height={13} />
+                    <span>{profilesError}</span>
+                  </div>
+                )}
+
+                {adminNotice && (
+                  <div
+                    className={`settings-backup-notice is-${adminNotice.tone}`}
+                    role={adminNotice.tone === 'error' ? 'alert' : 'status'}
+                  >
+                    {adminNotice.tone === 'error' ? (
+                      <PixelAlertIcon width={13} height={13} />
+                    ) : (
+                      <PixelCheckIcon width={13} height={13} />
+                    )}
+                    <span>{adminNotice.message}</span>
+                  </div>
+                )}
+
+                {isProfilesLoading && adminProfiles.length === 0 ? (
+                  <p className="settings-toggle-desc">Loading registered Supabase accounts...</p>
+                ) : filteredAdminProfiles.length === 0 ? (
+                  <p className="settings-toggle-desc">
+                    {adminProfiles.length === 0
+                      ? 'No registered accounts found in user_profiles.'
+                      : 'No accounts match your filter.'}
+                  </p>
+                ) : (
+                  <div className="admin-management-list" role="list" aria-label="Registered accounts">
+                    {filteredAdminProfiles.map((profile) => {
+                      const isTargetAdmin = profile.role === 'admin';
+                      const isSelf = Boolean(currentUserId && profile.userId === currentUserId);
+                      const isLastRemainingAdmin = isTargetAdmin && adminCount <= 1;
+                      const isBusy = busyRoleUserId === profile.userId;
+                      const isAnyAccountBusy = Boolean(busyRoleUserId);
+                      const linkedProfileMember = profile.linkedMemberId
+                        ? memberNameById.get(profile.linkedMemberId) ?? null
+                        : null;
+                      const hasUnavailableLinkedMember = Boolean(
+                        profile.linkedMemberId && !linkedProfileMember,
+                      );
+
+                      return (
+                        <div key={profile.userId} role="listitem" className="admin-account-row">
+                          <div className="admin-account-info">
+                            <div className="admin-account-title-row">
+                              <strong className="admin-account-email" title={profile.email}>
+                                {profile.email || profile.userId}
+                              </strong>
+                              {isSelf && <span className="admin-self-tag">You</span>}
+                              <span
+                                className={`admin-role-pill ${
+                                  isTargetAdmin
+                                    ? 'is-admin'
+                                    : profile.canViewAllAttendance
+                                      ? 'is-viewer'
+                                      : 'is-member'
+                                }`}
+                              >
+                                {isTargetAdmin && <PixelStarIcon width={10} height={10} />}
+                                <span>
+                                  {isTargetAdmin
+                                    ? 'Admin'
+                                    : profile.canViewAllAttendance
+                                      ? 'Broad Viewer'
+                                      : 'Member'}
+                                </span>
+                              </span>
+                            </div>
+                            <span className="admin-account-meta">
+                              {isTargetAdmin && profile.promotedAt
+                                ? `Admin since ${formatTimestamp(profile.promotedAt)}`
+                                : `Registered ${formatTimestamp(profile.createdAt)}`}
+                              {linkedProfileMember
+                                ? ` • Linked: ${linkedProfileMember.name}`
+                                : hasUnavailableLinkedMember
+                                  ? ' • Linked profile unavailable'
+                                  : ' • Unlinked'}
+                            </span>
+
+                            <div className="admin-link-controls">
+                              <label className="admin-link-field">
+                                <span className="admin-link-label">Roster Profile</span>
+                                <select
+                                  className="form-control admin-link-select"
+                                  value={profile.linkedMemberId ?? ''}
+                                  disabled={isAnyAccountBusy || !onLinkUserToMember}
+                                  onChange={(event) =>
+                                    void handleLinkMemberChange(profile, event.target.value)
+                                  }
+                                  aria-label={`Link ${profile.email || profile.userId} to club member`}
+                                >
+                                  <option value="">Unlinked (No roster profile)</option>
+                                  {hasUnavailableLinkedMember && profile.linkedMemberId && (
+                                    <option value={profile.linkedMemberId}>
+                                      Unavailable / deleted member ({profile.linkedMemberId})
+                                    </option>
+                                  )}
+                                  {sortedMembersForLinking.map((member) => {
+                                    const claimedByOther = adminProfiles.find(
+                                      (other) =>
+                                        other.userId !== profile.userId &&
+                                        other.linkedMemberId === member.id,
+                                    );
+                                    const classSuffix = member.className
+                                      ? ` (${member.className})`
+                                      : '';
+                                    const claimedSuffix = claimedByOther
+                                      ? ` — linked to ${claimedByOther.email}`
+                                      : '';
+                                    return (
+                                      <option
+                                        key={member.id}
+                                        value={member.id}
+                                        disabled={Boolean(claimedByOther)}
+                                      >
+                                        {member.name}
+                                        {classSuffix}
+                                        {claimedSuffix}
+                                      </option>
+                                    );
+                                  })}
+                                </select>
+                              </label>
+                            </div>
+                          </div>
+
+                          <div className="admin-account-actions">
+                            {!isTargetAdmin && (
+                              <button
+                                type="button"
+                                className={`btn-secondary btn-compact admin-visibility-btn ${
+                                  profile.canViewAllAttendance ? 'is-broad' : ''
+                                }`}
+                                disabled={isAnyAccountBusy || !onUpdateUserVisibilityScope}
+                                title={
+                                  profile.canViewAllAttendance
+                                    ? 'Currently sees all club members & sessions (read-only). Click to restrict to personal attendance only.'
+                                    : 'Currently restricted to personal attendance only. Click to allow broad read-only visibility across all club stats.'
+                                }
+                                onClick={() => void handleToggleBroadVisibility(profile)}
+                              >
+                                <span>
+                                  {profile.canViewAllAttendance ? 'Broad View: ON' : 'Self-Only View'}
+                                </span>
+                              </button>
+                            )}
+
+                            {isTargetAdmin ? (
+                              <button
+                                type="button"
+                                className="btn-secondary btn-compact"
+                                disabled={
+                                  isAnyAccountBusy || isLastRemainingAdmin || !onUpdateUserAdminRole
+                                }
+                                title={
+                                  isLastRemainingAdmin
+                                    ? 'You are the last remaining admin and cannot remove yourself'
+                                    : isSelf
+                                      ? 'Step down from Admin to Standard Member'
+                                      : `Demote ${profile.email} back to Standard Member`
+                                }
+                                onClick={() =>
+                                  setPendingRoleChange({ profile, makeAdmin: false })
+                                }
+                              >
+                                <span>{isBusy ? 'Updating...' : 'Demote to Member'}</span>
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                className="btn-primary btn-compact"
+                                disabled={isAnyAccountBusy || !onUpdateUserAdminRole}
+                                title={`Elevate ${profile.email} to Administrator`}
+                                onClick={() =>
+                                  setPendingRoleChange({ profile, makeAdmin: true })
+                                }
+                              >
+                                <PixelStarIcon width={11} height={11} />
+                                <span>{isBusy ? 'Updating...' : 'Elevate to Admin'}</span>
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {onUpdateMemberVisibilityPermissions && (
+                <div className="admin-permissions-panel" aria-label="Member Visibility Permissions">
+                  <div className="settings-section-header">
+                    <div className="admin-permissions-heading">
+                      <h4 className="admin-permissions-title">Member Visibility Permissions</h4>
+                      <span className="settings-toggle-desc">
+                        Global switches controlling what standard Member accounts can view &amp;
+                        interact with across Team SPIRIT (synced live via Supabase).
+                      </span>
+                    </div>
+                    <div className="admin-permissions-header-right">
+                      <span className="settings-mode-tag is-cloud">
+                        {enabledPermissionsCount} / {MEMBER_PERMISSION_TOGGLES.length} Enabled
+                      </span>
+                      {enabledPermissionsCount > 0 && (
+                        <button
+                          type="button"
+                          className="btn-secondary btn-compact"
+                          disabled={isUpdatingSharedIdeaVisibility}
+                          onClick={() => void handleRestrictAllPermissions()}
+                        >
+                          <span>Restrict All</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {permissionsNotice && (
+                    <div
+                      className={`settings-backup-notice is-${permissionsNotice.tone}`}
+                      role={permissionsNotice.tone === 'error' ? 'alert' : 'status'}
+                    >
+                      {permissionsNotice.tone === 'error' ? (
+                        <PixelAlertIcon width={13} height={13} />
+                      ) : (
+                        <PixelCheckIcon width={13} height={13} />
+                      )}
+                      <span>{permissionsNotice.message}</span>
+                    </div>
+                  )}
+
+                  <div className="settings-list">
+                    {MEMBER_PERMISSION_TOGGLES.map((perm) => {
+                      const isChecked = memberVisibilityPermissions[perm.key];
+                      const switchId = `perm-switch-${perm.key}`;
+                      return (
+                        <label key={perm.key} htmlFor={switchId} className="settings-toggle-row">
+                          <div className="settings-toggle-copy">
+                            <span className="settings-toggle-title">{perm.title}</span>
+                            <span className="settings-toggle-desc">{perm.description}</span>
+                          </div>
+                          <span className="voxel-switch">
+                            <input
+                              id={switchId}
+                              type="checkbox"
+                              role="switch"
+                              checked={isChecked}
+                              disabled={isUpdatingSharedIdeaVisibility}
+                              onChange={() => void handleTogglePermission(perm.key, perm.title)}
+                            />
+                            <span className="voxel-switch-track" aria-hidden="true">
+                              <span className="voxel-switch-thumb" />
+                            </span>
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
 
           {/* Section 2: Appearance & Layout */}
           <section className="settings-section" aria-label="Appearance and Layout">
@@ -483,7 +1151,48 @@ export function SettingsModal({
             </div>
           </section>
 
-          {/* Section 4: Local Data Backups */}
+          {/* Section 4: Interactive Tutorial Mode */}
+          <section className="settings-section" aria-label="Interactive Tutorial Mode">
+            <div className="settings-section-header">
+              <h3 className="settings-section-title">Interactive Tutorial</h3>
+              <span
+                className={`settings-mode-tag ${
+                  tutorialStatus === 'completed' ? 'is-cloud' : 'is-local'
+                }`}
+              >
+                {tutorialStatus === 'completed'
+                  ? 'Completed'
+                  : tutorialStatus === 'dismissed'
+                    ? 'Dismissed'
+                    : 'Not Completed'}
+              </span>
+            </div>
+
+            <div className="settings-account-card is-local">
+              <div className="settings-account-copy">
+                <span className="settings-toggle-title">Guided Feature Walkthrough</span>
+                <span className="settings-toggle-desc">
+                  Step through the Session Hub, recording attendance, Calendar views, Member
+                  Manager sidebar, and Project Ideas board with interactive spotlight tips.
+                </span>
+              </div>
+
+              <button
+                type="button"
+                className="btn-secondary settings-tutorial-btn"
+                onClick={() => {
+                  onClose();
+                  onStartTutorial();
+                }}
+                disabled={isModalBusy}
+              >
+                <PixelHelpIcon />
+                <span>{tutorialStatus === 'unseen' ? 'Start Tutorial' : 'Replay Tutorial'}</span>
+              </button>
+            </div>
+          </section>
+
+          {/* Section 5: Local Data Backups */}
           <section className="settings-section" aria-label="Local Data Backups">
             <div className="settings-section-header">
               <h3 className="settings-section-title">Local Data Backups</h3>
@@ -514,7 +1223,12 @@ export function SettingsModal({
                   type="button"
                   className="btn-secondary"
                   onClick={() => fileInputRef.current?.click()}
-                  disabled={isImporting}
+                  disabled={isImporting || !canManageClubRecords}
+                  title={
+                    canManageClubRecords
+                      ? 'Merge members and sessions from a JSON backup file'
+                      : 'Admin privileges required to import backup snapshots into Cloud Sync'
+                  }
                 >
                   <PixelUploadIcon />
                   <span>{isImporting ? 'Importing...' : 'Import Backup'}</span>
@@ -562,13 +1276,39 @@ export function SettingsModal({
               type="button"
               className="btn-secondary"
               onClick={onClose}
-              disabled={isSigningOut || isImporting}
+              disabled={isModalBusy || pendingRoleChange !== null}
             >
               Done
             </button>
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        isOpen={pendingRoleChange !== null}
+        badgeLabel={pendingRoleChange?.makeAdmin ? 'Promote Admin' : 'Remove Admin'}
+        title={
+          pendingRoleChange
+            ? pendingRoleChange.makeAdmin
+              ? `Promote "${pendingRoleChange.profile.email}" to Administrator?`
+              : `Remove admin privileges from "${pendingRoleChange.profile.email}"?`
+            : 'Update role?'
+        }
+        message={
+          pendingRoleChange
+            ? pendingRoleChange.makeAdmin
+              ? 'Administrators can manage other admins, moderate the public Project Ideas board, and delete or bulk-update synced club records.'
+              : 'This account will become a Standard Member and lose access to Admin Management, Project Ideas moderation, and club-wide delete/bulk controls.'
+            : ''
+        }
+        confirmLabel={pendingRoleChange?.makeAdmin ? 'Promote to Admin' : 'Remove Admin'}
+        onConfirm={() => void handleConfirmRoleChange()}
+        onCancel={() => {
+          if (!busyRoleUserId) {
+            setPendingRoleChange(null);
+          }
+        }}
+      />
     </div>
   );
 }

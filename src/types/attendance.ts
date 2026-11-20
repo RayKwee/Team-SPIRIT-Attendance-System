@@ -14,7 +14,7 @@ export type MemberType = 'student' | 'teacher' | 'visitor';
 
 export type ClassYear = 7 | 8 | 9 | 10 | 11;
 
-export type ClassLetter = 'T' | 'E' | 'N' | 'B';
+export type ClassLetter = 'T' | 'E' | 'N' | 'B' | 'N/A';
 
 /** Individual club member record keyed by a unique primary key (`id`). */
 export interface ClubMember {
@@ -83,21 +83,25 @@ export interface AttendanceSession extends NewSessionInput {
   attendance: Record<string, SessionAttendanceEntry>;
 }
 
-/** Synchronized member record carrying timestamped modification & soft-delete metadata. */
+/** Synchronized member record carrying timestamped modification, CAS version & soft-delete metadata. */
 export interface SyncedMemberRecord extends ClubMember {
   updatedAt: string;
   deletedAt: string | null;
+  syncVersion?: number;
+  lastEditedBy?: string;
 }
 
-/** Synchronized session record carrying timestamped modification & soft-delete metadata. */
+/** Synchronized session record carrying timestamped modification, CAS version & soft-delete metadata. */
 export interface SyncedSessionRecord extends NewSessionInput {
   id: string;
   createdAt: string;
   updatedAt: string;
   deletedAt: string | null;
+  syncVersion?: number;
+  lastEditedBy?: string;
 }
 
-/** Synchronized per-session member assignment & attendance mark with tombstone support. */
+/** Synchronized per-session member assignment & attendance mark with tombstone & CAS version support. */
 export interface SyncedAttendanceRecord {
   sessionId: string;
   memberId: string;
@@ -106,20 +110,54 @@ export interface SyncedAttendanceRecord {
   sortOrder: number;
   updatedAt: string;
   deletedAt: string | null;
+  syncVersion?: number;
+  lastEditedBy?: string;
 }
 
-/** Timestamped local sync cache persisted per user to resolve offline edits & deletions. */
+export type SyncConflictEntityType = 'member' | 'session' | 'attendance';
+export type SyncConflictResolution = 'keep_local' | 'use_remote';
+
+/** Preserved same-field or edit-vs-delete conflict awaiting explicit user choice. */
+export interface SyncConflictItem {
+  id: string;
+  entityType: SyncConflictEntityType;
+  entityId: string;
+  label: string;
+  sublabel?: string;
+  conflictingFields: string[];
+  baseRecord?: SyncedMemberRecord | SyncedSessionRecord | SyncedAttendanceRecord;
+  localRecord: SyncedMemberRecord | SyncedSessionRecord | SyncedAttendanceRecord;
+  remoteRecord: SyncedMemberRecord | SyncedSessionRecord | SyncedAttendanceRecord;
+  detectedAt: string;
+}
+
+/** Timestamped local sync cache persisted per user with base snapshots to enable 3-way merge & CAS. */
 export interface LocalSyncStore {
   members: Record<string, SyncedMemberRecord>;
   sessions: Record<string, SyncedSessionRecord>;
   attendance: Record<string, SyncedAttendanceRecord>;
+  baseMembers: Record<string, SyncedMemberRecord>;
+  baseSessions: Record<string, SyncedSessionRecord>;
+  baseAttendance: Record<string, SyncedAttendanceRecord>;
   dirtyMemberIds: string[];
   dirtySessionIds: string[];
   dirtyAttendanceKeys: string[];
+  conflicts: SyncConflictItem[];
   legacyImported: boolean;
 }
 
-export type SyncStatus = 'local' | 'idle' | 'loading' | 'synced' | 'syncing' | 'pending' | 'error';
+export type SyncStatus =
+  | 'local'
+  | 'idle'
+  | 'loading'
+  | 'synced'
+  | 'syncing'
+  | 'pending'
+  | 'reconnecting'
+  | 'conflict'
+  | 'error';
+
+export type RealtimeStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
 
 export type ThemeAccent = 'cyan' | 'gold' | 'green' | 'red';
 
@@ -142,6 +180,28 @@ export interface UserPreferences {
   themeAccent: ThemeAccent;
   rosterDensity: RosterDensity;
   defaultAssignmentStatus: DefaultAssignmentStatus;
+}
+
+export type AccountRole = 'admin' | 'member';
+
+export type AccessScope =
+  | 'local'
+  | 'admin'
+  | 'broad_viewer'
+  | 'member_self'
+  | 'member_unlinked';
+
+/** Server-verified user profile, role, visibility scope & linked roster member record stored in `public.user_profiles`. */
+export interface UserProfileRecord {
+  userId: string;
+  email: string;
+  role: AccountRole;
+  linkedMemberId?: string;
+  canViewAllAttendance: boolean;
+  promotedBy?: string;
+  promotedAt?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 /** Portable JSON backup payload for exporting and restoring local attendance data. */

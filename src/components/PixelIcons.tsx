@@ -242,3 +242,51 @@ export function PixelRestoreIcon(props: IconProps) {
     </svg>
   );
 }
+
+export function PixelCheckSquareIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M2 2h12v2H2V2zm0 2h2v8H2V4zm10 0h2v8h-2V4zM2 12h12v2H2v-2zm8-6h2v2h-2V6zM8 8h2v2H8V8zM6 9h2v2H6V9zM4 7h2v2H4V7z" />
+    </svg>
+  );
+}
+
+export function PixelHelpIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M5 2h6v2H5V2zM3 4h2v2H3V4zm8 0h2v3h-2V4zM9 7h2v2H9V7zM7 9h2v2H7V9zm0 3h2v2H7v-2z" />
+    </svg>
+  );
+}
+
+export function PixelIdeaIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M5 1h6v2H5V1zM3 3h2v4H3V3zm8 0h2v4h-2V3zM5 7h6v2H5V7zm1 3h4v2H6v-2zm1 3h2v2H7v-2z" />
+    </svg>
+  );
+}
+
+export function PixelStarIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M7 1h2v3h2v2h4v2h-3v2h-1v4H9v-2H7v2H5v-4H4V8H1V6h4V4h2V1z" />
+    </svg>
+  );
+}
+
+export function PixelMegaphoneIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M11 2h2v11h-2V2zM9 4h2v7H9V4zM6 5h3v5H6V5zM2 6h4v3H2V6zm3 4h2v4H5v-4zM14 5h1v5h-1V5z" />
+    </svg>
+  );
+}
+
+export function PixelLinkIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M9 2h5v5h-2V5h-2V3H9V2zm1 3h2v2h-2V5zM8 7h2v2H8V7zM6 9h2v2H6V9zM2 5h5v2H4v5h5V9h2v5H2V5z" />
+    </svg>
+  );
+}

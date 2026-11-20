@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { User } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
 
@@ -147,14 +147,17 @@ export function classifySupabaseAuthError(error: unknown): AuthLoginError {
 export function useSupabaseAuth(): UseSupabaseAuthResult {
   const [authStatus, setAuthStatus] = useState<AuthStatus>('loading');
   const [user, setUser] = useState<User | null>(null);
+  const authVersionRef = useRef(0);
 
   useEffect(() => {
     let mounted = true;
+    const initialVersion = authVersionRef.current;
 
     supabase.auth
       .getSession()
       .then(({ data, error }) => {
-        if (!mounted) return;
+        if (!mounted || authVersionRef.current !== initialVersion) return;
+        authVersionRef.current += 1;
         if (error || !data.session?.user) {
           setUser(null);
           setAuthStatus('unauthenticated');
@@ -164,7 +167,8 @@ export function useSupabaseAuth(): UseSupabaseAuthResult {
         setAuthStatus('authenticated');
       })
       .catch(() => {
-        if (!mounted) return;
+        if (!mounted || authVersionRef.current !== initialVersion) return;
+        authVersionRef.current += 1;
         setUser(null);
         setAuthStatus('unauthenticated');
       });
@@ -173,6 +177,7 @@ export function useSupabaseAuth(): UseSupabaseAuthResult {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!mounted) return;
+      authVersionRef.current += 1;
       const nextUser = session?.user ?? null;
       setUser(nextUser);
       setAuthStatus(nextUser ? 'authenticated' : 'unauthenticated');
@@ -198,6 +203,7 @@ export function useSupabaseAuth(): UseSupabaseAuthResult {
 
         const nextUser = data.session?.user ?? data.user ?? null;
         if (!nextUser) {
+          authVersionRef.current += 1;
           setUser(null);
           setAuthStatus('unauthenticated');
           return {
@@ -212,6 +218,7 @@ export function useSupabaseAuth(): UseSupabaseAuthResult {
           };
         }
 
+        authVersionRef.current += 1;
         setUser(nextUser);
         setAuthStatus('authenticated');
         return { error: null };
@@ -224,10 +231,13 @@ export function useSupabaseAuth(): UseSupabaseAuthResult {
 
   const signOut = useCallback(async () => {
     try {
-      await supabase.auth.signOut();
+      // `scope: 'local'` clears localStorage tokens immediately before attempting
+      // server-side refresh token revocation, preventing offline sign-out resurrection.
+      await supabase.auth.signOut({ scope: 'local' });
     } catch {
       // Clear local auth state even if network sign-out fails.
     } finally {
+      authVersionRef.current += 1;
       setUser(null);
       setAuthStatus('unauthenticated');
     }

@@ -9,6 +9,8 @@ export default defineConfig({
       input: {
         main: 'index.html',
         calendar: 'calendar.html',
+        ideas: 'ideas.html',
+        updates: 'updates.html',
       },
     },
   },

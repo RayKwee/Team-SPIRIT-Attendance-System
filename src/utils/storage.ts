@@ -126,6 +126,7 @@ function normalizeMember(raw: ClubMember): ClubMember {
     joinedDate: cleanOptionalString(raw.joinedDate),
     notes: cleanOptionalString(raw.notes),
     createdAt: raw.createdAt,
+    updatedAt: cleanOptionalString(raw.updatedAt),
   };
 }
 
@@ -214,6 +215,7 @@ function normalizeSession(raw: AttendanceSession): AttendanceSession {
     eventType:
       typeof raw.eventType === 'string' && raw.eventType.trim() ? raw.eventType.trim() : undefined,
     createdAt: raw.createdAt,
+    updatedAt: cleanOptionalString(raw.updatedAt),
     memberIds: sanitizeMemberIds(raw.memberIds, attendance),
     attendance,
   };

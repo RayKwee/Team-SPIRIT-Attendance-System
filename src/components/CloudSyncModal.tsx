@@ -279,8 +279,9 @@ export function CloudSyncModal({
           </div>
 
           <p className="auth-gate-subtitle">
-            Local-only mode stores records solely on this device at your own risk. Sign in to save
-            and sync members, sessions, and attendance online with Supabase across devices.
+            Sign in with your admin-provisioned Team SPIRIT account to view your linked personal
+            attendance record—or unlock full club management if your account is an Administrator.
+            Local-only mode stores records solely on this device.
           </p>
         </div>
 
@@ -347,7 +348,7 @@ export function CloudSyncModal({
               <span>
                 Upload &amp; merge current local-device data ({localMemberCount}{' '}
                 {localMemberCount === 1 ? 'member' : 'members'}, {localSessionCount}{' '}
-                {localSessionCount === 1 ? 'session' : 'sessions'}) into cloud sync
+                {localSessionCount === 1 ? 'session' : 'sessions'}) if signing in as an Admin
               </span>
             </label>
           )}
