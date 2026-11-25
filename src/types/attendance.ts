@@ -172,7 +172,7 @@ export interface UserPreferences {
   viewMode: ViewMode;
   sessionHubViewMode: ViewMode;
   calendarViewMode: CalendarViewMode;
-  filter: FilterStatus;
+  statusFilters: AttendanceStatus[];
   searchQuery: string;
   isMemberSidebarOpen: boolean;
   confirmSessionMemberRemoval: boolean;
@@ -198,6 +198,9 @@ export interface UserProfileRecord {
   role: AccountRole;
   linkedMemberId?: string;
   canViewAllAttendance: boolean;
+  isDisabled?: boolean;
+  disabledAt?: string;
+  disabledBy?: string;
   promotedBy?: string;
   promotedAt?: string;
   createdAt: string;

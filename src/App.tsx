@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { AccountsLeftPanel } from './components/AccountsLeftPanel';
 import { AttendanceLeaderboard } from './components/AttendanceLeaderboard';
 import { AttendanceWorkspace } from './components/AttendanceWorkspace';
 import { CloudSyncModal } from './components/CloudSyncModal';
@@ -32,6 +33,7 @@ import type {
   UserPreferences,
 } from './types/attendance';
 import type { TutorialStepConfig, TutorialStorageState } from './types/tutorial';
+import { canUserDeleteContent } from './types/projectIdeas';
 import {
   generateId,
   getSessionAssignedMembers,
@@ -65,12 +67,14 @@ import {
  */
 export function App() {
   const memberSidebarId = useId();
+  const accountsPanelId = useId();
   const [activePage, navigateTo] = useAppRoute();
-  const { authStatus, user, signIn, signOut } = useSupabaseAuth();
+  const { authStatus, user, signIn, signOut, changePassword } = useSupabaseAuth();
   const isCloudConnected = authStatus === 'authenticated' && Boolean(user?.id);
   const {
     userRole,
     isAdmin,
+    isAccountDisabled,
     linkedMemberId,
     canViewAllAttendance,
     isRoleLoading,
@@ -79,9 +83,14 @@ export function App() {
     isProfilesLoading,
     profilesError,
     refreshRoleAndProfiles,
+    syncAdminProfiles,
     updateUserAdminRole,
     linkUserToMember,
+    createAndLinkMemberAccount,
+    syncAndLinkMemberAccount,
     updateUserVisibilityScope,
+    setAccountDisabled,
+    removeAccount,
   } = useAdminRole(isCloudConnected ? (user?.id ?? null) : null);
   const canManageClubRecords = !isCloudConnected || isAdmin;
   const isReadOnlyCloud = isCloudConnected && !isAdmin;
@@ -90,12 +99,14 @@ export function App() {
     posts: clubPosts,
     comments: clubPostComments,
     permissions: memberVisibilityPermissions,
+    contentDeletionMode,
     sharedIdeaVisibility,
     isPostsLoading,
     postsError,
     isLiveConnected: isPostsLiveConnected,
     isPublishing: isPublishingPost,
     isUpdatingVisibility: isUpdatingSharedIdeaVisibility,
+    isUpdatingDeletionMode: isUpdatingContentDeletionMode,
     refreshPostsAndSettings,
     publishPost: publishClubPost,
     editPost: editClubPost,
@@ -104,6 +115,7 @@ export function App() {
     addComment: addClubPostComment,
     removeComment: removeClubPostComment,
     setSharedIdeaVisibility,
+    setContentDeletionMode,
     updatePermissions: updateMemberVisibilityPermissions,
   } = useClubPosts();
 
@@ -137,6 +149,7 @@ export function App() {
   const [duplicateSourceSession, setDuplicateSourceSession] =
     useState<AttendanceSession | null>(null);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [isAccountsPanelOpen, setIsAccountsPanelOpen] = useState(false);
   const [isCloudSyncModalOpen, setIsCloudSyncModalOpen] = useState(false);
   const [isConflictModalOpen, setIsConflictModalOpen] = useState(false);
   const [tutorialState, setTutorialState] = useState<TutorialStorageState>(() =>
@@ -278,6 +291,41 @@ export function App() {
 
   const prevSyncStatusRef = useRef<SyncStatus>(syncStatus);
   const prevConflictCountRef = useRef<number>(conflictCount);
+  const handledDisabledUserRef = useRef<string | null>(null);
+
+  // Immediately close the Admin Accounts panel if the user signs out or loses Admin privileges.
+  useEffect(() => {
+    if (!isCloudConnected || !isAdmin) {
+      setIsAccountsPanelOpen(false);
+    }
+  }, [isAdmin, isCloudConnected]);
+
+  // Immediately revoke & sign out any session whose account has been disabled by an Admin.
+  useEffect(() => {
+    if (!isCloudConnected || !user?.id) {
+      handledDisabledUserRef.current = null;
+      return;
+    }
+    if (!isAccountDisabled) return;
+    if (handledDisabledUserRef.current === user.id) return;
+    handledDisabledUserRef.current = user.id;
+
+    setIsAccountsPanelOpen(false);
+    setIsSettingsModalOpen(false);
+    setIsCreateModalOpen(false);
+    setIsConflictModalOpen(false);
+    setActiveSessionId(null);
+
+    void (async () => {
+      await prepareForSignOut();
+      await signOut();
+      pushToast({
+        tone: 'error',
+        tag: 'Access Disabled',
+        message: 'Your Team SPIRIT account access has been disabled by an administrator.',
+      });
+    })();
+  }, [isAccountDisabled, isCloudConnected, prepareForSignOut, pushToast, signOut, user?.id]);
   const {
     preloaderPhase,
     containerRevealClass,
@@ -397,7 +445,7 @@ export function App() {
       setActiveSessionId(newSession.id);
       setPreferences((prev) => ({
         ...prev,
-        filter: 'all',
+        statusFilters: [],
         searchQuery: '',
       }));
     }
@@ -440,7 +488,7 @@ export function App() {
     setActiveSessionId(sessionId);
     setPreferences((prev) => ({
       ...prev,
-      filter: 'all',
+      statusFilters: [],
       searchQuery: '',
     }));
   }
@@ -683,14 +731,36 @@ export function App() {
     });
   }
 
+  function handleToggleAccountsPanel() {
+    if (!isCloudConnected || !isAdmin) return;
+    setIsAccountsPanelOpen((prev) => {
+      const next = !prev;
+      if (next && typeof window !== 'undefined' && window.innerWidth < 1440) {
+        setPreferences((current) =>
+          current.isMemberSidebarOpen ? { ...current, isMemberSidebarOpen: false } : current,
+        );
+      }
+      return next;
+    });
+  }
+
   function handleToggleMemberSidebar() {
-    setPreferences((prev) => ({
-      ...prev,
-      isMemberSidebarOpen: !prev.isMemberSidebarOpen,
-    }));
+    setPreferences((prev) => {
+      const nextOpen = !prev.isMemberSidebarOpen;
+      if (nextOpen && typeof window !== 'undefined' && window.innerWidth < 1440) {
+        setIsAccountsPanelOpen(false);
+      }
+      return {
+        ...prev,
+        isMemberSidebarOpen: nextOpen,
+      };
+    });
   }
 
   function handleOpenMemberProfile(memberId: string) {
+    if (typeof window !== 'undefined' && window.innerWidth < 1440) {
+      setIsAccountsPanelOpen(false);
+    }
     if (!canBrowseFullRoster && accessScope === 'member_unlinked') {
       setPreferences((prev) => ({
         ...prev,
@@ -834,7 +904,7 @@ export function App() {
     setActiveSessionId(sessionId);
     setPreferences((prev) => ({
       ...prev,
-      filter: 'all',
+      statusFilters: [],
       searchQuery: '',
     }));
     navigateTo('tracker');
@@ -853,9 +923,54 @@ export function App() {
     return result;
   }
 
+  async function handleChangePassword(currentPassword: string, newPassword: string) {
+    const result = await changePassword(currentPassword, newPassword);
+    if (!result.error) {
+      pushToast({
+        tone: 'success',
+        tag: 'Password Updated',
+        message: 'Your account password has been updated.',
+      });
+    }
+    return result;
+  }
+
+  async function handleDeleteClubPost(postId: string) {
+    const target = clubPosts.find((post) => post.id === postId);
+    if (
+      !canUserDeleteContent({
+        isAdmin,
+        userId: isCloudConnected ? (user?.id ?? null) : null,
+        authorUserId: target?.authorUserId,
+        mode: contentDeletionMode,
+      })
+    ) {
+      throw new Error('You do not have permission to delete this post under the current policy.');
+    }
+    await removeClubPost(postId);
+  }
+
+  async function handleDeleteClubPostComment(commentId: string) {
+    const target = clubPostComments.find((comment) => comment.id === commentId);
+    if (
+      !canUserDeleteContent({
+        isAdmin,
+        userId: isCloudConnected ? (user?.id ?? null) : null,
+        authorUserId: target?.authorUserId,
+        mode: contentDeletionMode,
+      })
+    ) {
+      throw new Error(
+        'You do not have permission to delete this comment under the current policy.',
+      );
+    }
+    await removeClubPostComment(commentId);
+  }
+
   async function handleDisconnectCloudSync() {
     setIsCreateModalOpen(false);
     setIsSettingsModalOpen(false);
+    setIsAccountsPanelOpen(false);
     setIsCloudSyncModalOpen(false);
     setIsConflictModalOpen(false);
     setActiveSessionId(null);
@@ -920,7 +1035,7 @@ export function App() {
         ...prev,
         isMemberSidebarOpen: step.memberSidebarOpen,
         calendarViewMode: step.calendarViewMode ?? prev.calendarViewMode,
-        ...(step.requiresSession ? { filter: 'all', searchQuery: '' } : {}),
+        ...(step.requiresSession ? { statusFilters: [], searchQuery: '' } : {}),
       }));
     },
     [activePage, navigateTo, sessions],
@@ -931,6 +1046,7 @@ export function App() {
     setIsCreateModalOpen(false);
     setDuplicateSourceSession(null);
     setIsSettingsModalOpen(false);
+    setIsAccountsPanelOpen(false);
     setIsCloudSyncModalOpen(false);
     setIsConflictModalOpen(false);
 
@@ -1103,7 +1219,9 @@ export function App() {
 
   return (
     <div
-      className={`app-shell ${preferences.isMemberSidebarOpen ? 'is-sidebar-open' : ''}`}
+      className={`app-shell ${preferences.isMemberSidebarOpen ? 'is-sidebar-open' : ''} ${
+        isCloudConnected && isAdmin && isAccountsPanelOpen ? 'is-accounts-panel-open' : ''
+      }`}
       data-density={preferences.rosterDensity}
     >
       {preloaderPhase !== 'done' && (
@@ -1126,6 +1244,9 @@ export function App() {
           periodLabel={getCurrentPeriodLabel()}
           memberCount={activeMemberCount}
           isMemberSidebarOpen={preferences.isMemberSidebarOpen}
+          isAccountsPanelOpen={isCloudConnected && isAdmin && isAccountsPanelOpen}
+          accountsPanelId={accountsPanelId}
+          accountsCount={isCloudConnected && isAdmin ? adminProfiles.length : 0}
           isTutorialActive={isTutorialActive}
           sidebarId={memberSidebarId}
           isCloudConnected={isCloudConnected}
@@ -1146,6 +1267,9 @@ export function App() {
           onOpenConflictModal={() => setIsConflictModalOpen(true)}
           onOpenCloudSync={() => setIsCloudSyncModalOpen(true)}
           onToggleMemberSidebar={handleToggleMemberSidebar}
+          onToggleAccountsPanel={
+            isCloudConnected && isAdmin ? handleToggleAccountsPanel : undefined
+          }
           onStartTutorial={handleStartTutorial}
           onOpenSettings={() => setIsSettingsModalOpen(true)}
           onOpenCreateSession={handleOpenCreateSessionModal}
@@ -1283,6 +1407,7 @@ export function App() {
                 comments={clubPostComments}
                 sharedIdeaVisibility={sharedIdeaVisibility}
                 memberCanCommentOnPosts={memberVisibilityPermissions.memberCanCommentOnPosts}
+                contentDeletionMode={contentDeletionMode}
                 isPostsLoading={isPostsLoading}
                 postsError={postsError}
                 isPostsLiveConnected={isPostsLiveConnected}
@@ -1292,9 +1417,9 @@ export function App() {
                 onPublishPost={publishClubPost}
                 onEditPost={editClubPost}
                 onTogglePinPost={togglePinClubPost}
-                onDeletePost={removeClubPost}
+                onDeletePost={handleDeleteClubPost}
                 onAddComment={addClubPostComment}
-                onDeleteComment={removeClubPostComment}
+                onDeleteComment={handleDeleteClubPostComment}
                 onSetSharedIdeaVisibility={setSharedIdeaVisibility}
                 onOpenCloudSync={() => setIsCloudSyncModalOpen(true)}
                 onNotify={pushToast}
@@ -1303,6 +1428,26 @@ export function App() {
           </div>
         </main>
       </div>
+
+      {isCloudConnected && isAdmin && accessScope === 'admin' && (
+        <AccountsLeftPanel
+          id={accountsPanelId}
+          isOpen={isAccountsPanelOpen}
+          currentUserId={user?.id ?? null}
+          profiles={adminProfiles}
+          members={members}
+          isProfilesLoading={isProfilesLoading}
+          profilesError={profilesError}
+          onClose={() => setIsAccountsPanelOpen(false)}
+          onSyncProfiles={syncAdminProfiles}
+          onUpdateUserAdminRole={updateUserAdminRole}
+          onLinkUserToMember={linkUserToMember}
+          onSetAccountDisabled={setAccountDisabled}
+          onRemoveAccount={removeAccount}
+          onOpenMemberProfile={handleOpenMemberProfile}
+          onNotify={pushToast}
+        />
+      )}
 
       <MemberManagerSidebar
         id={memberSidebarId}
@@ -1316,6 +1461,20 @@ export function App() {
         linkedMemberId={linkedMemberId}
         canBrowseFullRoster={canBrowseFullRoster}
         canViewAttendanceRates={canViewAttendanceRates}
+        isCloudConnected={isCloudConnected}
+        isAdmin={isAdmin}
+        adminProfiles={isCloudConnected && isAdmin ? adminProfiles : undefined}
+        isProfilesLoading={isProfilesLoading}
+        onEnsureMemberSynced={flushPendingChanges}
+        onSyncAdminProfiles={isCloudConnected && isAdmin ? syncAdminProfiles : undefined}
+        onCreateAndLinkMemberAccount={
+          isCloudConnected && isAdmin ? createAndLinkMemberAccount : undefined
+        }
+        onSyncAndLinkMemberAccount={
+          isCloudConnected && isAdmin ? syncAndLinkMemberAccount : undefined
+        }
+        onLinkUserToMember={isCloudConnected && isAdmin ? linkUserToMember : undefined}
+        onNotify={pushToast}
         onSelectMember={(memberId) => handleUpdatePreferences({ selectedMemberId: memberId })}
         onClose={() => handleUpdatePreferences({ isMemberSidebarOpen: false })}
         onAddMember={handleAddMember}
@@ -1358,6 +1517,7 @@ export function App() {
         onResetPreferences={handleResetPreferences}
         onStartTutorial={handleStartTutorial}
         onOpenCloudSync={() => setIsCloudSyncModalOpen(true)}
+        onChangePassword={handleChangePassword}
         onSignOut={handleDisconnectCloudSync}
         onRefreshAdminProfiles={refreshRoleAndProfiles}
         onUpdateUserAdminRole={updateUserAdminRole}
@@ -1366,6 +1526,9 @@ export function App() {
         memberVisibilityPermissions={memberVisibilityPermissions}
         isUpdatingSharedIdeaVisibility={isUpdatingSharedIdeaVisibility}
         onUpdateMemberVisibilityPermissions={updateMemberVisibilityPermissions}
+        contentDeletionMode={contentDeletionMode}
+        isUpdatingContentDeletionMode={isUpdatingContentDeletionMode}
+        onSetContentDeletionMode={setContentDeletionMode}
         onExportBackup={handleExportBackup}
         onImportBackupFile={handleImportBackupFile}
         onClose={() => setIsSettingsModalOpen(false)}

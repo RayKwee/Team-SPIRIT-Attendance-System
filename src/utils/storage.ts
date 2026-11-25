@@ -4,7 +4,6 @@ import type {
   CalendarViewMode,
   ClubMember,
   DefaultAssignmentStatus,
-  FilterStatus,
   RosterDensity,
   SessionAttendanceEntry,
   ThemeAccent,
@@ -24,14 +23,6 @@ export const PREFS_STORAGE_KEY = 'team-spirit:prefs:v1';
 const LEGACY_ROSTER_STORAGE_KEY = 'team-spirit:roster:v1';
 
 const VALID_STATUSES: ReadonlySet<AttendanceStatus> = new Set([
-  'present',
-  'absent_with_reason',
-  'absent_without_reason',
-  'unmarked',
-]);
-
-const VALID_FILTERS: ReadonlySet<FilterStatus> = new Set([
-  'all',
   'present',
   'absent_with_reason',
   'absent_without_reason',
@@ -70,7 +61,7 @@ export const DEFAULT_PREFERENCES: UserPreferences = {
   viewMode: 'list',
   sessionHubViewMode: 'grid',
   calendarViewMode: 'month',
-  filter: 'all',
+  statusFilters: [],
   searchQuery: '',
   isMemberSidebarOpen: false,
   confirmSessionMemberRemoval: false,
@@ -290,6 +281,34 @@ export function saveMembers(members: ClubMember[]): void {
   }
 }
 
+function sanitizeStatusFilters(
+  rawStatusFilters: unknown,
+  legacyFilter: unknown,
+): AttendanceStatus[] {
+  if (Array.isArray(rawStatusFilters)) {
+    const seen = new Set<AttendanceStatus>();
+    const result: AttendanceStatus[] = [];
+    for (const item of rawStatusFilters) {
+      if (
+        typeof item === 'string' &&
+        VALID_STATUSES.has(item as AttendanceStatus) &&
+        !seen.has(item as AttendanceStatus)
+      ) {
+        const status = item as AttendanceStatus;
+        seen.add(status);
+        result.push(status);
+      }
+    }
+    return result;
+  }
+
+  if (typeof legacyFilter === 'string' && VALID_STATUSES.has(legacyFilter as AttendanceStatus)) {
+    return [legacyFilter as AttendanceStatus];
+  }
+
+  return DEFAULT_PREFERENCES.statusFilters;
+}
+
 /** Loads persisted user preferences from localStorage with safe defaults. */
 export function loadPreferences(): UserPreferences {
   try {
@@ -325,10 +344,7 @@ export function loadPreferences(): UserPreferences {
         ? (parsed.calendarViewMode as CalendarViewMode)
         : DEFAULT_PREFERENCES.calendarViewMode;
 
-    const filter =
-      typeof parsed.filter === 'string' && VALID_FILTERS.has(parsed.filter as FilterStatus)
-        ? (parsed.filter as FilterStatus)
-        : DEFAULT_PREFERENCES.filter;
+    const statusFilters = sanitizeStatusFilters(parsed.statusFilters, parsed.filter);
 
     const searchQuery =
       typeof parsed.searchQuery === 'string' ? parsed.searchQuery : DEFAULT_PREFERENCES.searchQuery;
@@ -374,7 +390,7 @@ export function loadPreferences(): UserPreferences {
       viewMode,
       sessionHubViewMode,
       calendarViewMode,
-      filter,
+      statusFilters,
       searchQuery,
       isMemberSidebarOpen,
       confirmSessionMemberRemoval,

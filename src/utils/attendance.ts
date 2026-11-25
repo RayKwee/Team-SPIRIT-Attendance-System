@@ -895,3 +895,66 @@ export function summarizeMemberAttendance(
     recentAbsenceReasons,
   };
 }
+
+export const CLUB_LOGIN_EMAIL_DOMAIN = 'teamspirit.club';
+
+/**
+ * Formats a member's display name into the canonical Team SPIRIT login email:
+ * all lowercase, whitespace collapsed and replaced by dots, followed by `@teamspirit.club`.
+ * Example: `"Jun Yuen"` -> `"jun.yuen@teamspirit.club"`.
+ */
+export function formatClubLoginEmail(memberName: string): string {
+  const normalized = memberName
+    .trim()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, '.')
+    .replace(/[^a-z0-9._-]/g, '')
+    .replace(/\.{2,}/g, '.')
+    .replace(/^\.+|\.+$/g, '');
+
+  if (!normalized) {
+    return '';
+  }
+
+  return `${normalized}@${CLUB_LOGIN_EMAIL_DOMAIN}`;
+}
+
+const PASSWORD_UPPER = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+const PASSWORD_LOWER = 'abcdefghjkmnpqrstuvwxyz';
+const PASSWORD_DIGITS = '23456789';
+const PASSWORD_ALL = `${PASSWORD_UPPER}${PASSWORD_LOWER}${PASSWORD_DIGITS}`;
+
+/** Generates a readable, cryptographically random initial password (default 10 characters). */
+export function generateInitialPassword(length = 10): string {
+  const targetLength = Math.max(8, Math.min(32, Math.floor(length)));
+  const bytes = new Uint32Array(targetLength);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < targetLength; i += 1) {
+      bytes[i] = Math.floor(Math.random() * 0xffffffff);
+    }
+  }
+
+  const chars: string[] = [
+    PASSWORD_UPPER[bytes[0] % PASSWORD_UPPER.length],
+    PASSWORD_LOWER[bytes[1] % PASSWORD_LOWER.length],
+    PASSWORD_DIGITS[bytes[2] % PASSWORD_DIGITS.length],
+  ];
+
+  for (let i = 3; i < targetLength; i += 1) {
+    chars.push(PASSWORD_ALL[bytes[i] % PASSWORD_ALL.length]);
+  }
+
+  // Fisher-Yates shuffle using remaining randomness so required character classes aren't always upfront.
+  for (let i = chars.length - 1; i > 0; i -= 1) {
+    const j = bytes[i] % (i + 1);
+    const tmp = chars[i];
+    chars[i] = chars[j];
+    chars[j] = tmp;
+  }
+
+  return chars.join('');
+}

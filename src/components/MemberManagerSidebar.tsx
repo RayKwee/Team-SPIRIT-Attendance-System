@@ -18,7 +18,9 @@ import type {
   ClubMember,
   MemberProfileInput,
   MemberType,
+  UserProfileRecord,
 } from '../types/attendance';
+import type { AdminCreateAccountResult } from '../lib/adminApi';
 import {
   CLASS_LETTERS,
   CLASS_YEARS,
@@ -48,6 +50,7 @@ import {
   printMemberProfileReport,
 } from '../utils/export';
 import { ConfirmDialog } from './ConfirmDialog';
+import { MemberAccountCard } from './MemberAccountCard';
 import {
   PixelAlertIcon,
   PixelArchiveIcon,
@@ -59,6 +62,7 @@ import {
   PixelDownloadIcon,
   PixelEditIcon,
   PixelFlameIcon,
+  PixelKeyIcon,
   PixelPlusIcon,
   PixelPrinterIcon,
   PixelRestoreIcon,
@@ -81,6 +85,32 @@ interface MemberManagerSidebarProps {
   linkedMemberId?: string | null;
   canBrowseFullRoster?: boolean;
   canViewAttendanceRates?: boolean;
+  isCloudConnected?: boolean;
+  isAdmin?: boolean;
+  adminProfiles?: UserProfileRecord[];
+  isProfilesLoading?: boolean;
+  onEnsureMemberSynced?: () => Promise<boolean>;
+  onSyncAdminProfiles?: () => Promise<UserProfileRecord[]>;
+  onCreateAndLinkMemberAccount?: (params: {
+    memberId: string;
+    memberName: string;
+    email: string;
+    password: string;
+  }) => Promise<AdminCreateAccountResult>;
+  onSyncAndLinkMemberAccount?: (params: {
+    memberId: string;
+    email?: string;
+    userId?: string;
+  }) => Promise<UserProfileRecord>;
+  onLinkUserToMember?: (
+    targetUserId: string,
+    targetMemberId: string | null,
+  ) => Promise<UserProfileRecord>;
+  onNotify?: (options: {
+    tone: 'success' | 'info' | 'warning' | 'error';
+    tag: string;
+    message: string;
+  }) => void;
   onSelectMember: (memberId: string | null) => void;
   onClose: () => void;
   onAddMember: (input: MemberProfileInput) => ClubMember;
@@ -433,6 +463,16 @@ export function MemberManagerSidebar({
   linkedMemberId = null,
   canBrowseFullRoster = true,
   canViewAttendanceRates = true,
+  isCloudConnected = false,
+  isAdmin = false,
+  adminProfiles = [],
+  isProfilesLoading = false,
+  onEnsureMemberSynced,
+  onSyncAdminProfiles,
+  onCreateAndLinkMemberAccount,
+  onSyncAndLinkMemberAccount,
+  onLinkUserToMember,
+  onNotify,
   onSelectMember,
   onClose,
   onAddMember,
@@ -525,11 +565,55 @@ export function MemberManagerSidebar({
   const isUnlinkedMemberScope = !canBrowseFullRoster && accessScope === 'member_unlinked';
   const canEditRoster =
     canManageClubRecords && accessScope !== 'broad_viewer' && !isRestrictedMemberAccount;
+  const canManageMemberAccounts = Boolean(
+    isCloudConnected &&
+      isAdmin &&
+      accessScope === 'admin' &&
+      onCreateAndLinkMemberAccount &&
+      onSyncAndLinkMemberAccount &&
+      onLinkUserToMember,
+  );
   const canViewPeerAttendanceStats =
     accessScope === 'local' ||
     accessScope === 'admin' ||
     accessScope === 'broad_viewer' ||
     canViewAttendanceRates;
+
+  const linkedProfileByMemberId = useMemo(() => {
+    const map = new Map<string, UserProfileRecord>();
+    if (!canManageMemberAccounts) return map;
+    for (const profile of adminProfiles) {
+      if (profile.linkedMemberId) {
+        map.set(profile.linkedMemberId, profile);
+      }
+    }
+    return map;
+  }, [adminProfiles, canManageMemberAccounts]);
+
+  const handleSyncMemberEmailToRoster = useCallback(
+    (targetMember: ClubMember, nextEmail: string) => {
+      const normalizedEmail = nextEmail.trim().toLowerCase();
+      if (!normalizedEmail) return;
+      onUpdateMember(targetMember.id, {
+        name: targetMember.name,
+        memberType: targetMember.memberType,
+        classYear: targetMember.classYear,
+        classLetter: targetMember.classLetter,
+        className: targetMember.className,
+        isLegacy: targetMember.isLegacy,
+        retiredAt: targetMember.retiredAt,
+        lastPromotedYear: targetMember.lastPromotedYear,
+        graduationYear: targetMember.graduationYear,
+        role: targetMember.role,
+        email: normalizedEmail,
+        phone: targetMember.phone,
+        handle: targetMember.handle,
+        joinedDate: targetMember.joinedDate,
+        notes: targetMember.notes,
+      });
+    },
+    [onUpdateMember],
+  );
 
   const selectedMember = useMemo(
     () => members.find((member) => member.id === selectedMemberId) ?? null,
@@ -2067,6 +2151,15 @@ export function MemberManagerSidebar({
                                 {member.handle && (
                                   <span className="member-contact-chip">{member.handle}</span>
                                 )}
+                                {canManageMemberAccounts && linkedProfileByMemberId.has(member.id) && (
+                                  <span
+                                    className="member-account-linked-pill"
+                                    title={`Login linked: ${linkedProfileByMemberId.get(member.id)?.email ?? ''}`}
+                                  >
+                                    <PixelKeyIcon width={10} height={10} />
+                                    <span>Login Linked</span>
+                                  </span>
+                                )}
                               </div>
                             </div>
 
@@ -2343,6 +2436,25 @@ export function MemberManagerSidebar({
                     </dl>
                   )}
                 </section>
+
+                {canManageMemberAccounts &&
+                  onCreateAndLinkMemberAccount &&
+                  onSyncAndLinkMemberAccount &&
+                  onLinkUserToMember && (
+                    <MemberAccountCard
+                      member={selectedMember}
+                      members={members}
+                      adminProfiles={adminProfiles}
+                      isProfilesLoading={isProfilesLoading}
+                      onEnsureMemberSynced={onEnsureMemberSynced}
+                      onSyncAdminProfiles={onSyncAdminProfiles}
+                      onCreateAndLinkAccount={onCreateAndLinkMemberAccount}
+                      onSyncAndLinkAccount={onSyncAndLinkMemberAccount}
+                      onLinkUserToMember={onLinkUserToMember}
+                      onSyncMemberEmailToRoster={handleSyncMemberEmailToRoster}
+                      onNotify={onNotify}
+                    />
+                  )}
 
                 {canShowSelectedMemberRates ? (
                   <>

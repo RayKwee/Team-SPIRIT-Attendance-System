@@ -12,10 +12,12 @@ import type { ClubMember, ViewMode } from '../types/attendance';
 import {
   PROJECT_IDEA_CATEGORIES,
   PROJECT_IDEA_STATUS_LABELS,
+  canUserDeleteContent,
   type ClubPost,
   type ClubPostComment,
   type ClubPostCommentInput,
   type ClubPostInput,
+  type ContentDeletionMode,
   type ProjectIdea,
   type ProjectIdeaReviewStatus,
   type ProjectIdeasFilter,
@@ -58,6 +60,7 @@ interface ProjectIdeasWorkspaceProps {
   comments: ClubPostComment[];
   sharedIdeaVisibility: boolean;
   memberCanCommentOnPosts: boolean;
+  contentDeletionMode: ContentDeletionMode;
   isPostsLoading: boolean;
   postsError: string | null;
   isPostsLiveConnected: boolean;
@@ -123,6 +126,7 @@ export function ProjectIdeasWorkspace({
   comments,
   sharedIdeaVisibility,
   memberCanCommentOnPosts,
+  contentDeletionMode,
   isPostsLoading,
   postsError,
   isPostsLiveConnected,
@@ -168,6 +172,7 @@ export function ProjectIdeasWorkspace({
     userId,
     isAdmin,
     sharedIdeaVisibility,
+    contentDeletionMode,
     responderName: profileAuthorName,
   });
 
@@ -444,13 +449,45 @@ export function ProjectIdeasWorkspace({
   }
 
   const activePendingDeleteIdea =
-    isAdmin && pendingDeleteIdea && ideas.some((item) => item.id === pendingDeleteIdea.id)
+    pendingDeleteIdea &&
+    canUserDeleteContent({
+      isAdmin,
+      userId,
+      authorUserId: pendingDeleteIdea.submittedByUserId,
+      mode: contentDeletionMode,
+    }) &&
+    ideas.some((item) => item.id === pendingDeleteIdea.id)
       ? pendingDeleteIdea
       : null;
 
+  const canDeleteSelectedIdea = selectedIdea
+    ? canUserDeleteContent({
+        isAdmin,
+        userId,
+        authorUserId: selectedIdea.submittedByUserId,
+        mode: contentDeletionMode,
+      })
+    : false;
+
   async function handleConfirmDelete() {
-    if (!isAdmin || !activePendingDeleteIdea || busyActionId) return;
+    if (!activePendingDeleteIdea || busyActionId) return;
     const target = activePendingDeleteIdea;
+    if (
+      !canUserDeleteContent({
+        isAdmin,
+        userId,
+        authorUserId: target.submittedByUserId,
+        mode: contentDeletionMode,
+      })
+    ) {
+      setPendingDeleteIdea(null);
+      onNotify?.({
+        tone: 'error',
+        tag: 'Deletion Disabled',
+        message: 'You do not have permission to delete this idea under the active policy.',
+      });
+      return;
+    }
     setBusyActionId(target.id);
     try {
       await removeIdea(target.id);
@@ -466,7 +503,7 @@ export function ProjectIdeasWorkspace({
     } catch (err) {
       onNotify?.({
         tone: 'error',
-        tag: 'Moderation Error',
+        tag: isAdmin ? 'Moderation Error' : 'Delete Error',
         message: err instanceof Error ? err.message : 'Unable to delete project idea.',
       });
     } finally {
@@ -618,6 +655,7 @@ export function ProjectIdeasWorkspace({
             isPublishing={isPublishingPost}
             isAdmin={isAdmin}
             memberCanCommentOnPosts={memberCanCommentOnPosts}
+            contentDeletionMode={contentDeletionMode}
             authorDisplayName={profileAuthorName}
             onRefresh={onRefreshPostsAndSettings}
             onPublishPost={onPublishPost}
@@ -1094,6 +1132,12 @@ export function ProjectIdeasWorkspace({
                       {filteredIdeas.map((idea) => {
                         const isBusy = Boolean(busyActionId);
                         const isMine = Boolean(userId && idea.submittedByUserId === userId);
+                        const canDeleteIdea = canUserDeleteContent({
+                          isAdmin,
+                          userId,
+                          authorUserId: idea.submittedByUserId,
+                          mode: contentDeletionMode,
+                        });
                         return (
                           <article
                             key={idea.id}
@@ -1129,42 +1173,52 @@ export function ProjectIdeasWorkspace({
                                   {isMine && <span className="admin-self-tag">Yours</span>}
                                 </div>
 
-                                {isAdmin && (
+                                {(isAdmin || canDeleteIdea) && (
                                   <div
                                     className="idea-admin-actions"
                                     onClick={(event) => event.stopPropagation()}
                                     onKeyDown={(event) => event.stopPropagation()}
                                   >
-                                    <button
-                                      type="button"
-                                      className={`icon-btn idea-highlight-btn ${
-                                        idea.isHighlighted ? 'is-active' : ''
-                                      }`}
-                                      disabled={isBusy}
-                                      onClick={() => void handleToggleHighlight(idea)}
-                                      aria-label={
-                                        idea.isHighlighted
-                                          ? `Remove highlight from ${idea.title}`
-                                          : `Highlight ${idea.title}`
-                                      }
-                                      title={
-                                        idea.isHighlighted
-                                          ? 'Remove highlight'
-                                          : 'Highlight / feature idea'
-                                      }
-                                    >
-                                      <PixelStarIcon width={12} height={12} />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="icon-btn icon-btn-danger"
-                                      disabled={isBusy}
-                                      onClick={() => setPendingDeleteIdea(idea)}
-                                      aria-label={`Delete idea ${idea.title}`}
-                                      title="Delete idea (Admin)"
-                                    >
-                                      <PixelTrashIcon width={12} height={12} />
-                                    </button>
+                                    {isAdmin && (
+                                      <button
+                                        type="button"
+                                        className={`icon-btn idea-highlight-btn ${
+                                          idea.isHighlighted ? 'is-active' : ''
+                                        }`}
+                                        disabled={isBusy}
+                                        onClick={() => void handleToggleHighlight(idea)}
+                                        aria-label={
+                                          idea.isHighlighted
+                                            ? `Remove highlight from ${idea.title}`
+                                            : `Highlight ${idea.title}`
+                                        }
+                                        title={
+                                          idea.isHighlighted
+                                            ? 'Remove highlight'
+                                            : 'Highlight / feature idea'
+                                        }
+                                      >
+                                        <PixelStarIcon width={12} height={12} />
+                                      </button>
+                                    )}
+                                    {canDeleteIdea && (
+                                      <button
+                                        type="button"
+                                        className="icon-btn icon-btn-danger"
+                                        disabled={isBusy}
+                                        onClick={() => setPendingDeleteIdea(idea)}
+                                        aria-label={`Delete idea ${idea.title}`}
+                                        title={
+                                          isAdmin
+                                            ? 'Delete idea (Admin)'
+                                            : isMine
+                                              ? 'Delete your idea'
+                                              : 'Delete idea'
+                                        }
+                                      >
+                                        <PixelTrashIcon width={12} height={12} />
+                                      </button>
+                                    )}
                                   </div>
                                 )}
                               </div>
@@ -1200,6 +1254,12 @@ export function ProjectIdeasWorkspace({
                       {filteredIdeas.map((idea) => {
                         const isBusy = Boolean(busyActionId);
                         const isMine = Boolean(userId && idea.submittedByUserId === userId);
+                        const canDeleteIdea = canUserDeleteContent({
+                          isAdmin,
+                          userId,
+                          authorUserId: idea.submittedByUserId,
+                          mode: contentDeletionMode,
+                        });
                         return (
                           <article
                             key={idea.id}
@@ -1253,34 +1313,45 @@ export function ProjectIdeasWorkspace({
                                 <span className="idea-date-meta mono-cell">
                                   {formatTimestamp(idea.createdAt)}
                                 </span>
-                                {isAdmin && (
+                                {(isAdmin || canDeleteIdea) && (
                                   <div
                                     className="idea-admin-actions"
                                     onClick={(event) => event.stopPropagation()}
                                     onKeyDown={(event) => event.stopPropagation()}
                                   >
-                                    <button
-                                      type="button"
-                                      className={`icon-btn idea-highlight-btn ${
-                                        idea.isHighlighted ? 'is-active' : ''
-                                      }`}
-                                      disabled={isBusy}
-                                      onClick={() => void handleToggleHighlight(idea)}
-                                      title={
-                                        idea.isHighlighted ? 'Remove highlight' : 'Highlight idea'
-                                      }
-                                    >
-                                      <PixelStarIcon width={12} height={12} />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="icon-btn icon-btn-danger"
-                                      disabled={isBusy}
-                                      onClick={() => setPendingDeleteIdea(idea)}
-                                      title="Delete idea (Admin)"
-                                    >
-                                      <PixelTrashIcon width={12} height={12} />
-                                    </button>
+                                    {isAdmin && (
+                                      <button
+                                        type="button"
+                                        className={`icon-btn idea-highlight-btn ${
+                                          idea.isHighlighted ? 'is-active' : ''
+                                        }`}
+                                        disabled={isBusy}
+                                        onClick={() => void handleToggleHighlight(idea)}
+                                        title={
+                                          idea.isHighlighted ? 'Remove highlight' : 'Highlight idea'
+                                        }
+                                      >
+                                        <PixelStarIcon width={12} height={12} />
+                                      </button>
+                                    )}
+                                    {canDeleteIdea && (
+                                      <button
+                                        type="button"
+                                        className="icon-btn icon-btn-danger"
+                                        disabled={isBusy}
+                                        onClick={() => setPendingDeleteIdea(idea)}
+                                        aria-label={`Delete idea ${idea.title}`}
+                                        title={
+                                          isAdmin
+                                            ? 'Delete idea (Admin)'
+                                            : isMine
+                                              ? 'Delete your idea'
+                                              : 'Delete idea'
+                                        }
+                                      >
+                                        <PixelTrashIcon width={12} height={12} />
+                                      </button>
+                                    )}
                                   </div>
                                 )}
                               </div>
@@ -1468,7 +1539,22 @@ export function ProjectIdeasWorkspace({
                 </div>
               )}
 
-              <div className="modal-footer">
+              <div
+                className={`modal-footer ${
+                  !isAdmin && canDeleteSelectedIdea ? 'idea-detail-footer-with-delete' : ''
+                }`}
+              >
+                {!isAdmin && canDeleteSelectedIdea && (
+                  <button
+                    type="button"
+                    className="icon-btn icon-btn-danger"
+                    disabled={Boolean(busyActionId)}
+                    onClick={() => setPendingDeleteIdea(selectedIdea)}
+                  >
+                    <PixelTrashIcon width={12} height={12} />
+                    <span>Delete Idea</span>
+                  </button>
+                )}
                 <button
                   type="button"
                   className="btn-secondary"
@@ -1485,7 +1571,7 @@ export function ProjectIdeasWorkspace({
 
       <ConfirmDialog
         isOpen={activePendingDeleteIdea !== null}
-        badgeLabel="Moderate Idea"
+        badgeLabel={isAdmin ? 'Moderate Idea' : 'Delete Idea'}
         title={
           activePendingDeleteIdea ? `Delete "${activePendingDeleteIdea.title}"?` : 'Delete idea?'
         }

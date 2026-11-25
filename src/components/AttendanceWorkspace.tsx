@@ -378,8 +378,10 @@ export function AttendanceWorkspace({
           : null
         : null;
 
-  const { filter, viewMode, searchQuery, confirmSessionMemberRemoval } = preferences;
+  const { statusFilters, viewMode, searchQuery, confirmSessionMemberRemoval } = preferences;
   const trimmedQuery = searchQuery.trim().toLowerCase();
+  const selectedStatusSet = useMemo(() => new Set(statusFilters), [statusFilters]);
+  const isAllStatusesSelected = selectedStatusSet.size === 0;
 
   function getEntry(memberId: string): SessionAttendanceEntry {
     return (
@@ -392,7 +394,7 @@ export function AttendanceWorkspace({
 
   const filteredMembers = assignedMembers.filter((member) => {
     const entry = getEntry(member.id);
-    const matchesStatus = filter === 'all' || entry.status === filter;
+    const matchesStatus = isAllStatusesSelected || selectedStatusSet.has(entry.status);
     const memberType = normalizeMemberType(member.memberType);
     const matchesQuery =
       trimmedQuery.length === 0 ||
@@ -402,6 +404,25 @@ export function AttendanceWorkspace({
       Boolean(member.role?.toLowerCase().includes(trimmedQuery));
     return matchesStatus && matchesQuery;
   });
+
+  function handleSelectAllStatuses() {
+    if (!isAllStatusesSelected) {
+      onUpdatePreferences({ statusFilters: [] });
+    }
+  }
+
+  function handleToggleStatusFilter(status: AttendanceStatus) {
+    if (isAllStatusesSelected) {
+      onUpdatePreferences({ statusFilters: [status] });
+      return;
+    }
+
+    const nextFilters = selectedStatusSet.has(status)
+      ? statusFilters.filter((item) => item !== status)
+      : [...statusFilters, status];
+
+    onUpdatePreferences({ statusFilters: nextFilters });
+  }
 
   const hasAnyMarked = assignedMembers.some((member) => getEntry(member.id).status !== 'unmarked');
 
@@ -1051,19 +1072,41 @@ export function AttendanceWorkspace({
       )}
 
       <div className="tracker-toolbar">
-        <div className="filter-pills" role="tablist" aria-label="Filter session checklist by status">
-          {FILTER_OPTIONS.map((option) => (
-            <button
-              key={option.value}
-              type="button"
-              role="tab"
-              aria-selected={filter === option.value}
-              className={`filter-pill ${filter === option.value ? 'is-active' : ''}`}
-              onClick={() => onUpdatePreferences({ filter: option.value })}
-            >
-              {option.label}
-            </button>
-          ))}
+        <div
+          className="filter-pills status-filter-pills"
+          role="group"
+          aria-label="Filter session checklist by attendance status"
+        >
+          {FILTER_OPTIONS.map((option) => {
+            const isActive =
+              option.value === 'all'
+                ? isAllStatusesSelected
+                : selectedStatusSet.has(option.value);
+            return (
+              <button
+                key={option.value}
+                type="button"
+                aria-pressed={isActive}
+                className={`filter-pill ${isActive ? 'is-active' : ''}`}
+                title={
+                  option.value === 'all'
+                    ? 'Show all attendance statuses'
+                    : isActive
+                      ? `Hide ${option.label} members`
+                      : `Show ${option.label} members`
+                }
+                onClick={() => {
+                  if (option.value === 'all') {
+                    handleSelectAllStatuses();
+                  } else {
+                    handleToggleStatusFilter(option.value);
+                  }
+                }}
+              >
+                {option.label}
+              </button>
+            );
+          })}
         </div>
 
         <div className="toolbar-right">
@@ -1123,8 +1166,28 @@ export function AttendanceWorkspace({
                   : activeMembers.length === 0
                     ? 'First add or restore active club members in the Member Manager, then search and click their names above to add them to this session.'
                     : 'Type an active member name in the search bar above and click a suggestion to add them to this session’s attendance checklist.'
-                : 'Try clearing your checklist filter or switching the status tab.'}
+                : 'Try clearing your search query or adjusting the active status filters.'}
             </p>
+            {assignedMembers.length > 0 && (!isAllStatusesSelected || trimmedQuery.length > 0) && (
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() =>
+                  onUpdatePreferences({
+                    statusFilters: [],
+                    searchQuery: '',
+                  })
+                }
+              >
+                <span>
+                  {!isAllStatusesSelected && trimmedQuery.length > 0
+                    ? 'Reset Filters'
+                    : !isAllStatusesSelected
+                      ? 'Show All Statuses'
+                      : 'Clear Search'}
+                </span>
+              </button>
+            )}
             {canEditSessionChecklist && assignedMembers.length === 0 && activeMembers.length === 0 && (
               <button type="button" className="btn-primary" onClick={onOpenMemberManager}>
                 <PixelUsersIcon />

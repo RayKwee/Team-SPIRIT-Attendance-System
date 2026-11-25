@@ -254,11 +254,20 @@ export async function upsertProjectIdeaFeedback(
   return feedbackFromDbRow(data as DbProjectIdeaFeedbackRow);
 }
 
-/** Admin-only: permanently deletes a project idea (cascading any feedback). */
+/** Permanently deletes a project idea (cascading any feedback; RLS enforces the active deletion policy). */
 export async function deleteProjectIdea(ideaId: string): Promise<void> {
-  const { error, status } = await supabase.from('project_ideas').delete().eq('id', ideaId);
+  const { data, error, status } = await supabase
+    .from('project_ideas')
+    .delete()
+    .eq('id', ideaId)
+    .select('id');
 
   if (error) {
     throw normalizeIdeasError(error, 'Failed to delete project idea.', status);
+  }
+  if (!data || data.length === 0) {
+    throw new Error(
+      'Deletion is not permitted under the current content deletion policy (or the idea was already removed).',
+    );
   }
 }

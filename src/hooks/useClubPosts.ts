@@ -13,6 +13,7 @@ import {
   fetchClubSettings,
   toggleClubPostPin,
   updateClubPost,
+  updateContentDeletionMode,
   updateMemberVisibilityPermissions,
   updateSharedIdeaVisibility,
   type DbClubPostCommentRow,
@@ -20,24 +21,28 @@ import {
   type DbClubSettingsRow,
 } from '../lib/clubPostsApi';
 import { supabase } from '../lib/supabase';
-import type {
-  ClubPost,
-  ClubPostComment,
-  ClubPostCommentInput,
-  ClubPostInput,
-  MemberVisibilityPermissions,
+import {
+  DEFAULT_CONTENT_DELETION_MODE,
+  type ClubPost,
+  type ClubPostComment,
+  type ClubPostCommentInput,
+  type ClubPostInput,
+  type ContentDeletionMode,
+  type MemberVisibilityPermissions,
 } from '../types/projectIdeas';
 
 export interface UseClubPostsResult {
   posts: ClubPost[];
   comments: ClubPostComment[];
   permissions: MemberVisibilityPermissions;
+  contentDeletionMode: ContentDeletionMode;
   sharedIdeaVisibility: boolean;
   isPostsLoading: boolean;
   postsError: string | null;
   isLiveConnected: boolean;
   isPublishing: boolean;
   isUpdatingVisibility: boolean;
+  isUpdatingDeletionMode: boolean;
   refreshPostsAndSettings: () => Promise<void>;
   publishPost: (input: ClubPostInput) => Promise<ClubPost>;
   editPost: (postId: string, input: ClubPostInput) => Promise<ClubPost>;
@@ -46,6 +51,7 @@ export interface UseClubPostsResult {
   addComment: (input: ClubPostCommentInput) => Promise<ClubPostComment>;
   removeComment: (commentId: string) => Promise<void>;
   setSharedIdeaVisibility: (allowShared: boolean) => Promise<boolean>;
+  setContentDeletionMode: (mode: ContentDeletionMode) => Promise<ContentDeletionMode>;
   updatePermissions: (
     patch: Partial<MemberVisibilityPermissions>,
   ) => Promise<MemberVisibilityPermissions>;
@@ -76,11 +82,15 @@ export function useClubPosts(): UseClubPostsResult {
   const [permissions, setPermissions] = useState<MemberVisibilityPermissions>(
     DEFAULT_MEMBER_VISIBILITY_PERMISSIONS,
   );
+  const [contentDeletionMode, setContentDeletionModeState] = useState<ContentDeletionMode>(
+    DEFAULT_CONTENT_DELETION_MODE,
+  );
   const [isPostsLoading, setIsPostsLoading] = useState(true);
   const [postsError, setPostsError] = useState<string | null>(null);
   const [isLiveConnected, setIsLiveConnected] = useState(false);
   const [isPublishing, setIsPublishing] = useState(false);
   const [isUpdatingVisibility, setIsUpdatingVisibility] = useState(false);
+  const [isUpdatingDeletionMode, setIsUpdatingDeletionMode] = useState(false);
 
   const mountedRef = useRef(true);
   const permissionsRef = useRef<MemberVisibilityPermissions>(permissions);
@@ -105,6 +115,7 @@ export function useClubPosts(): UseClubPostsResult {
         sharedIdeaVisibility: settings.sharedIdeaVisibility,
         memberCanCommentOnPosts: settings.memberCanCommentOnPosts,
       });
+      setContentDeletionModeState(settings.contentDeletionMode);
     } catch (err) {
       if (!mountedRef.current) return;
       setPostsError(err instanceof Error ? err.message : 'Unable to load Posts & Updates.');
@@ -183,6 +194,7 @@ export function useClubPosts(): UseClubPostsResult {
             sharedIdeaVisibility: next.sharedIdeaVisibility,
             memberCanCommentOnPosts: next.memberCanCommentOnPosts,
           });
+          setContentDeletionModeState(next.contentDeletionMode);
         },
       )
       .subscribe((status) => {
@@ -319,16 +331,36 @@ export function useClubPosts(): UseClubPostsResult {
     }
   }, []);
 
+  const setContentDeletionMode = useCallback(
+    async (mode: ContentDeletionMode): Promise<ContentDeletionMode> => {
+      setIsUpdatingDeletionMode(true);
+      try {
+        const updated = await updateContentDeletionMode(mode);
+        if (mountedRef.current) {
+          setContentDeletionModeState(updated.contentDeletionMode);
+        }
+        return updated.contentDeletionMode;
+      } finally {
+        if (mountedRef.current) {
+          setIsUpdatingDeletionMode(false);
+        }
+      }
+    },
+    [],
+  );
+
   return {
     posts,
     comments,
     permissions,
+    contentDeletionMode,
     sharedIdeaVisibility: permissions.sharedIdeaVisibility,
     isPostsLoading,
     postsError,
     isLiveConnected,
     isPublishing,
     isUpdatingVisibility,
+    isUpdatingDeletionMode,
     refreshPostsAndSettings: loadAll,
     publishPost,
     editPost,
@@ -337,6 +369,7 @@ export function useClubPosts(): UseClubPostsResult {
     addComment,
     removeComment,
     setSharedIdeaVisibility,
+    setContentDeletionMode,
     updatePermissions,
   };
 }

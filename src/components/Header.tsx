@@ -9,6 +9,7 @@ import {
   PixelListIcon,
   PixelPlusIcon,
   PixelSettingsIcon,
+  PixelShieldIcon,
   PixelUserIcon,
   PixelUsersIcon,
 } from './PixelIcons';
@@ -21,6 +22,9 @@ interface HeaderProps {
   periodLabel: string;
   memberCount: number;
   isMemberSidebarOpen: boolean;
+  isAccountsPanelOpen?: boolean;
+  accountsPanelId?: string;
+  accountsCount?: number;
   isTutorialActive?: boolean;
   sidebarId?: string;
   isCloudConnected: boolean;
@@ -41,6 +45,7 @@ interface HeaderProps {
   onOpenConflictModal?: () => void;
   onOpenCloudSync: () => void;
   onToggleMemberSidebar: () => void;
+  onToggleAccountsPanel?: () => void;
   onStartTutorial: () => void;
   onOpenSettings: () => void;
   onOpenCreateSession: () => void;
@@ -127,6 +132,9 @@ export function Header({
   periodLabel,
   memberCount,
   isMemberSidebarOpen,
+  isAccountsPanelOpen = false,
+  accountsPanelId,
+  accountsCount = 0,
   isTutorialActive = false,
   sidebarId,
   isCloudConnected,
@@ -147,6 +155,7 @@ export function Header({
   onOpenConflictModal,
   onOpenCloudSync,
   onToggleMemberSidebar,
+  onToggleAccountsPanel,
   onStartTutorial,
   onOpenSettings,
   onOpenCreateSession,
@@ -192,6 +201,25 @@ export function Header({
         aria-label="Primary navigation"
         data-tutorial-target="header-nav"
       >
+        {isCloudConnected && isAdmin && onToggleAccountsPanel && (
+          <button
+            type="button"
+            className={`nav-link accounts-nav-trigger ${isAccountsPanelOpen ? 'is-active' : ''}`}
+            aria-expanded={isAccountsPanelOpen}
+            aria-controls={accountsPanelId}
+            onClick={onToggleAccountsPanel}
+            title={
+              isAccountsPanelOpen
+                ? 'Collapse left-hand Accounts panel'
+                : 'Open Admin Accounts panel (promote, demote, unlink, or disable accounts)'
+            }
+          >
+            <PixelShieldIcon />
+            <span>Accounts</span>
+            <span className="accounts-nav-count">{accountsCount}</span>
+          </button>
+        )}
+
         {NAV_LINKS.map((link) => {
           const isCurrent = activePage === link.page;
           const href = getRouteHref(link.page);

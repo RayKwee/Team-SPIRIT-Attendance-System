@@ -16,7 +16,7 @@ export function registerStaticAssetCache(): void {
   const register = () => {
     const swUrl = new URL('sw.js', new URL(import.meta.env.BASE_URL, window.location.origin)).href;
     navigator.serviceWorker
-      .register(swUrl, { scope: import.meta.env.BASE_URL })
+      .register(swUrl, { scope: import.meta.env.BASE_URL, updateViaCache: 'none' })
       .then((registration) => {
         void registration.update();
       })

@@ -381,7 +381,7 @@ create trigger trg_club_post_comments_updated_at
   before update on public.club_post_comments
   for each row execute function public.touch_club_post_comments_updated_at();
 
--- 3e. Club-Wide Settings (Global Member Visibility & Collaboration Permissions)
+-- 3e. Club-Wide Settings (Global Member Visibility, Content Deletion & Collaboration Permissions)
 create table if not exists public.club_settings (
   id text primary key default 'default'
     constraint club_settings_singleton_check
@@ -391,6 +391,9 @@ create table if not exists public.club_settings (
   member_can_view_calendar_details boolean not null default false,
   shared_idea_visibility boolean not null default false,
   member_can_comment_on_posts boolean not null default false,
+  content_deletion_mode text not null default 'own_only'
+    constraint club_settings_content_deletion_mode_check
+    check (content_deletion_mode in ('own_only', 'any', 'disabled')),
   updated_by uuid references auth.users(id) on delete set null,
   updated_at timestamptz not null default now()
 );
@@ -405,6 +408,22 @@ alter table public.club_settings
   add column if not exists shared_idea_visibility boolean not null default false;
 alter table public.club_settings
   add column if not exists member_can_comment_on_posts boolean not null default false;
+alter table public.club_settings
+  add column if not exists content_deletion_mode text not null default 'own_only';
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'club_settings_content_deletion_mode_check'
+      and conrelid = 'public.club_settings'::regclass
+  ) then
+    alter table public.club_settings
+      add constraint club_settings_content_deletion_mode_check
+      check (content_deletion_mode in ('own_only', 'any', 'disabled'));
+  end if;
+end $$;
 
 insert into public.club_settings (
   id,
@@ -412,9 +431,10 @@ insert into public.club_settings (
   member_can_view_attendance_rates,
   member_can_view_calendar_details,
   shared_idea_visibility,
-  member_can_comment_on_posts
+  member_can_comment_on_posts,
+  content_deletion_mode
 )
-values ('default', false, false, false, false, false)
+values ('default', false, false, false, false, false, 'own_only')
 on conflict (id) do nothing;
 
 -- Helpful indexes for ordering and sync lookups
@@ -436,6 +456,9 @@ create table if not exists public.user_profiles (
     check (role in ('member', 'admin')),
   linked_member_id text references public.club_members(id) on delete set null,
   can_view_all_attendance boolean not null default false,
+  is_disabled boolean not null default false,
+  disabled_at timestamptz,
+  disabled_by uuid references auth.users(id) on delete set null,
   promoted_by uuid references auth.users(id) on delete set null,
   promoted_at timestamptz,
   created_at timestamptz not null default now(),
@@ -446,6 +469,12 @@ alter table public.user_profiles
   add column if not exists linked_member_id text references public.club_members(id) on delete set null;
 alter table public.user_profiles
   add column if not exists can_view_all_attendance boolean not null default false;
+alter table public.user_profiles
+  add column if not exists is_disabled boolean not null default false;
+alter table public.user_profiles
+  add column if not exists disabled_at timestamptz;
+alter table public.user_profiles
+  add column if not exists disabled_by uuid references auth.users(id) on delete set null;
 
 create index if not exists idx_user_profiles_role on public.user_profiles (role, created_at asc);
 create unique index if not exists idx_user_profiles_linked_member_unique
@@ -488,7 +517,23 @@ where up.linked_member_id is not null
       and cm.deleted_at is not null
   );
 
--- Server-side admin & visibility helpers (security definer avoids RLS recursion)
+-- Server-side active-user, admin & visibility helpers (security definer avoids RLS recursion)
+create or replace function public.is_active_user(check_user_id uuid default auth.uid())
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.user_profiles
+    where user_id = check_user_id
+      and is_disabled = false
+      and (auth.uid() is null or check_user_id = auth.uid())
+  );
+$$;
+
 create or replace function public.is_admin(check_user_id uuid default auth.uid())
 returns boolean
 language sql
@@ -501,6 +546,7 @@ as $$
     from public.user_profiles
     where user_id = check_user_id
       and role = 'admin'
+      and is_disabled = false
       and (auth.uid() is null or check_user_id = auth.uid())
   );
 $$;
@@ -516,6 +562,7 @@ as $$
     select 1
     from public.user_profiles
     where user_id = check_user_id
+      and is_disabled = false
       and (role = 'admin' or can_view_all_attendance = true)
       and (auth.uid() is null or check_user_id = auth.uid())
   );
@@ -531,6 +578,7 @@ as $$
   select linked_member_id
   from public.user_profiles
   where user_id = check_user_id
+    and is_disabled = false
     and (auth.uid() is null or check_user_id = auth.uid())
   limit 1;
 $$;
@@ -559,10 +607,12 @@ as $$
   );
 $$;
 
+revoke all on function public.is_active_user(uuid) from public, anon;
 revoke all on function public.is_admin(uuid) from public, anon;
 revoke all on function public.has_broad_visibility(uuid) from public, anon;
 revoke all on function public.my_linked_member_id(uuid) from public, anon;
 revoke all on function public.is_member_in_session(text, text) from public, anon;
+grant execute on function public.is_active_user(uuid) to authenticated;
 grant execute on function public.is_admin(uuid) to authenticated;
 grant execute on function public.has_broad_visibility(uuid) to authenticated;
 grant execute on function public.my_linked_member_id(uuid) to authenticated;
@@ -714,12 +764,18 @@ begin
       using errcode = 'P0002';
   end if;
 
-  if not make_admin and target_row.role = 'admin' then
-    -- Lock admin rows to prevent concurrent last-admin demotion races
-    perform 1 from public.user_profiles where role = 'admin' for update;
+  if make_admin and target_row.is_disabled then
+    raise exception 'Cannot promote a disabled account to Admin. Re-enable the account first.'
+      using errcode = 'P0001';
+  end if;
+
+  if not make_admin and target_row.role = 'admin' and not target_row.is_disabled then
+    -- Lock active admin rows to prevent concurrent last-admin demotion races
+    perform 1 from public.user_profiles where role = 'admin' and is_disabled = false for update;
     select count(*) into admin_count
     from public.user_profiles
-    where role = 'admin';
+    where role = 'admin'
+      and is_disabled = false;
 
     if admin_count <= 1 then
       if target_user_id = caller_id then
@@ -840,6 +896,11 @@ begin
   end if;
 
   if cleaned_member_id is not null then
+    if target_row.is_disabled then
+      raise exception 'Cannot link a disabled account to a roster profile. Re-enable the account first.'
+        using errcode = 'P0001';
+    end if;
+
     if not exists (
       select 1 from public.club_members
       where id = cleaned_member_id and deleted_at is null
@@ -867,12 +928,347 @@ begin
   where user_id = target_user_id
   returning * into target_row;
 
+  -- Backfill any project ideas previously submitted by this account so personal ideas stay connected
+  if cleaned_member_id is not null then
+    update public.project_ideas
+    set linked_member_id = cleaned_member_id
+    where submitted_by_user_id = target_user_id
+      and linked_member_id is distinct from cleaned_member_id;
+  end if;
+
   return target_row;
 end;
 $$;
 
 revoke all on function public.admin_link_user_to_member(uuid, text) from public, anon;
 grant execute on function public.admin_link_user_to_member(uuid, text) to authenticated;
+
+-- Admin-only RPC: backfill any auth.users accounts missing from user_profiles & return updated directory
+create or replace function public.admin_sync_auth_profiles()
+returns setof public.user_profiles
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  caller_id uuid := auth.uid();
+begin
+  if caller_id is null or not public.is_admin(caller_id) then
+    raise exception 'Only administrators can sync registered accounts.'
+      using errcode = '42501';
+  end if;
+
+  insert into public.user_profiles (user_id, email, role)
+  select u.id, coalesce(u.email, ''), 'member'
+  from auth.users u
+  on conflict (user_id) do update
+    set email = coalesce(nullif(btrim(excluded.email), ''), public.user_profiles.email),
+        updated_at = case
+          when public.user_profiles.email is distinct from excluded.email then now()
+          else public.user_profiles.updated_at
+        end;
+
+  return query
+  select *
+  from public.user_profiles
+  order by role asc, created_at asc;
+end;
+$$;
+
+revoke all on function public.admin_sync_auth_profiles() from public, anon;
+grant execute on function public.admin_sync_auth_profiles() to authenticated;
+
+-- Admin-only RPC: sync an existing auth.users account by user_id or email and link it to a club_members profile
+create or replace function public.admin_sync_and_link_member_account(
+  target_member_id text,
+  target_email text default null,
+  target_user_id uuid default null
+)
+returns public.user_profiles
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  caller_id uuid := auth.uid();
+  cleaned_member_id text := nullif(btrim(coalesce(target_member_id, '')), '');
+  normalized_email text := lower(btrim(coalesce(target_email, '')));
+  resolved_user_id uuid := target_user_id;
+  resolved_user_email text;
+  existing_member_owner text;
+  other_linked_member_name text;
+  target_row public.user_profiles;
+begin
+  if caller_id is null or not public.is_admin(caller_id) then
+    raise exception 'Only administrators can sync and link member accounts.'
+      using errcode = '42501';
+  end if;
+
+  if cleaned_member_id is null then
+    raise exception 'A target club member profile is required.'
+      using errcode = '22023';
+  end if;
+
+  if not exists (
+    select 1
+    from public.club_members
+    where id = cleaned_member_id
+      and deleted_at is null
+  ) then
+    raise exception 'Selected club member does not exist in Supabase yet or has been deleted.'
+      using errcode = 'P0002';
+  end if;
+
+  if resolved_user_id is not null then
+    select u.id, coalesce(u.email, '')
+    into resolved_user_id, resolved_user_email
+    from auth.users u
+    where u.id = target_user_id
+    limit 1;
+  elsif length(normalized_email) > 0 then
+    select u.id, coalesce(u.email, '')
+    into resolved_user_id, resolved_user_email
+    from auth.users u
+    where lower(btrim(coalesce(u.email, ''))) = normalized_email
+    order by u.created_at asc
+    limit 1;
+  else
+    raise exception 'Provide either an account email address or user ID to link.'
+      using errcode = '22023';
+  end if;
+
+  if resolved_user_id is null then
+    raise exception 'No Supabase login account found for "%". Create the account first or verify the email address.',
+      coalesce(nullif(normalized_email, ''), target_user_id::text)
+      using errcode = 'P0002';
+  end if;
+
+  -- Ensure the auth user exists in public.user_profiles with its current email
+  insert into public.user_profiles (user_id, email, role)
+  values (resolved_user_id, coalesce(resolved_user_email, ''), 'member')
+  on conflict (user_id) do update
+    set email = coalesce(nullif(btrim(excluded.email), ''), public.user_profiles.email),
+        updated_at = now();
+
+  select * into target_row
+  from public.user_profiles
+  where user_id = resolved_user_id
+  for update;
+
+  if target_row.is_disabled then
+    raise exception 'Account "%" is currently disabled. Re-enable it in the Accounts panel before linking.',
+      coalesce(nullif(target_row.email, ''), resolved_user_id::text)
+      using errcode = 'P0001';
+  end if;
+
+  -- Ensure this roster member is not already linked to a different login account
+  select up.email into existing_member_owner
+  from public.user_profiles up
+  where up.linked_member_id = cleaned_member_id
+    and up.user_id <> resolved_user_id
+  limit 1;
+
+  if found then
+    raise exception 'This roster profile is already linked to account "%". Unlink it first before switching accounts.', existing_member_owner
+      using errcode = '23505';
+  end if;
+
+  -- Ensure the target login account is not already linked to a different active roster member
+  if target_row.linked_member_id is not null and target_row.linked_member_id <> cleaned_member_id then
+    select cm.name into other_linked_member_name
+    from public.club_members cm
+    where cm.id = target_row.linked_member_id
+      and cm.deleted_at is null
+    limit 1;
+
+    if found then
+      raise exception 'Account "%" is already linked to "%". Unlink it from that member first.',
+        coalesce(nullif(target_row.email, ''), resolved_user_id::text),
+        other_linked_member_name
+        using errcode = '23505';
+    end if;
+  end if;
+
+  update public.user_profiles
+  set
+    linked_member_id = cleaned_member_id,
+    updated_at = now()
+  where user_id = resolved_user_id
+  returning * into target_row;
+
+  -- Backfill any project ideas previously submitted by this account so personal ideas stay connected
+  update public.project_ideas
+  set linked_member_id = cleaned_member_id
+  where submitted_by_user_id = resolved_user_id
+    and linked_member_id is distinct from cleaned_member_id;
+
+  return target_row;
+end;
+$$;
+
+revoke all on function public.admin_sync_and_link_member_account(text, text, uuid) from public, anon;
+grant execute on function public.admin_sync_and_link_member_account(text, text, uuid) to authenticated;
+
+-- Admin-only RPC: disable or re-enable an account (revokes all RLS access & clears roster link when disabled)
+create or replace function public.admin_set_user_disabled(
+  target_user_id uuid,
+  disable_account boolean
+)
+returns public.user_profiles
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  caller_id uuid := auth.uid();
+  target_row public.user_profiles;
+  active_admin_count integer;
+begin
+  if caller_id is null or not public.is_admin(caller_id) then
+    raise exception 'Only administrators can disable or re-enable accounts.'
+      using errcode = '42501';
+  end if;
+
+  if disable_account and target_user_id = caller_id then
+    raise exception 'You cannot disable your own currently signed-in administrator account.'
+      using errcode = 'P0001';
+  end if;
+
+  select * into target_row
+  from public.user_profiles
+  where user_id = target_user_id
+  for update;
+
+  if not found then
+    raise exception 'Target account profile was not found.'
+      using errcode = 'P0002';
+  end if;
+
+  if disable_account and target_row.role = 'admin' and not target_row.is_disabled then
+    perform 1 from public.user_profiles where role = 'admin' and is_disabled = false for update;
+    select count(*) into active_admin_count
+    from public.user_profiles
+    where role = 'admin'
+      and is_disabled = false;
+
+    if active_admin_count <= 1 then
+      raise exception 'Cannot disable the last remaining active administrator.'
+        using errcode = 'P0001';
+    end if;
+  end if;
+
+  if disable_account then
+    update public.user_profiles
+    set
+      is_disabled = true,
+      disabled_at = now(),
+      disabled_by = caller_id,
+      role = 'member',
+      can_view_all_attendance = false,
+      linked_member_id = null,
+      promoted_by = null,
+      promoted_at = null,
+      updated_at = now()
+    where user_id = target_user_id
+    returning * into target_row;
+  else
+    update public.user_profiles
+    set
+      is_disabled = false,
+      disabled_at = null,
+      disabled_by = null,
+      updated_at = now()
+    where user_id = target_user_id
+    returning * into target_row;
+  end if;
+
+  return target_row;
+end;
+$$;
+
+revoke all on function public.admin_set_user_disabled(uuid, boolean) from public, anon;
+grant execute on function public.admin_set_user_disabled(uuid, boolean) to authenticated;
+
+-- Admin-only RPC: remove an account permanently (deletes from auth.users when permitted, or revokes access permanently)
+create or replace function public.admin_remove_user_account(
+  target_user_id uuid
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  caller_id uuid := auth.uid();
+  target_row public.user_profiles;
+  active_admin_count integer;
+  removal_mode text := 'deleted';
+begin
+  if caller_id is null or not public.is_admin(caller_id) then
+    raise exception 'Only administrators can remove user accounts.'
+      using errcode = '42501';
+  end if;
+
+  if target_user_id = caller_id then
+    raise exception 'You cannot remove your own currently signed-in administrator account.'
+      using errcode = 'P0001';
+  end if;
+
+  select * into target_row
+  from public.user_profiles
+  where user_id = target_user_id
+  for update;
+
+  if not found then
+    raise exception 'Target account profile was not found.'
+      using errcode = 'P0002';
+  end if;
+
+  if target_row.role = 'admin' and not target_row.is_disabled then
+    perform 1 from public.user_profiles where role = 'admin' and is_disabled = false for update;
+    select count(*) into active_admin_count
+    from public.user_profiles
+    where role = 'admin'
+      and is_disabled = false;
+
+    if active_admin_count <= 1 then
+      raise exception 'Cannot remove the last remaining active administrator.'
+        using errcode = 'P0001';
+    end if;
+  end if;
+
+  -- Strip permissions & roster link immediately before attempting auth deletion
+  update public.user_profiles
+  set
+    is_disabled = true,
+    disabled_at = now(),
+    disabled_by = caller_id,
+    role = 'member',
+    can_view_all_attendance = false,
+    linked_member_id = null,
+    promoted_by = null,
+    promoted_at = null,
+    updated_at = now()
+  where user_id = target_user_id;
+
+  begin
+    delete from auth.users
+    where id = target_user_id;
+  exception
+    when insufficient_privilege then
+      removal_mode := 'disabled_only';
+  end;
+
+  return jsonb_build_object(
+    'user_id', target_user_id,
+    'mode', removal_mode,
+    'removed', true
+  );
+end;
+$$;
+
+revoke all on function public.admin_remove_user_account(uuid) from public, anon;
+grant execute on function public.admin_remove_user_account(uuid) to authenticated;
 
 -- Admin-only RPC: grant or revoke broader club-wide read visibility for a member account
 create or replace function public.set_user_visibility_scope(
@@ -978,11 +1374,57 @@ as $$
   );
 $$;
 
+create or replace function public.get_content_deletion_mode()
+returns text
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select coalesce(
+    (select content_deletion_mode from public.club_settings where id = 'default' limit 1),
+    'own_only'
+  );
+$$;
+
+create or replace function public.can_current_user_delete_content(target_author_user_id uuid)
+returns boolean
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  caller_id uuid := auth.uid();
+  deletion_mode text;
+begin
+  if caller_id is null or not public.is_active_user(caller_id) then
+    return false;
+  end if;
+
+  if public.is_admin(caller_id) then
+    return true;
+  end if;
+
+  deletion_mode := public.get_content_deletion_mode();
+
+  if deletion_mode = 'disabled' then
+    return false;
+  elsif deletion_mode = 'any' then
+    return true;
+  else
+    return target_author_user_id is not null and target_author_user_id = caller_id;
+  end if;
+end;
+$$;
+
 grant execute on function public.can_member_view_roster() to anon, authenticated;
 grant execute on function public.can_member_view_attendance_rates() to anon, authenticated;
 grant execute on function public.can_member_view_calendar_details() to anon, authenticated;
 grant execute on function public.is_shared_idea_visibility_enabled() to anon, authenticated;
 grant execute on function public.can_member_comment_on_posts() to anon, authenticated;
+grant execute on function public.get_content_deletion_mode() to anon, authenticated;
+grant execute on function public.can_current_user_delete_content(uuid) to anon, authenticated;
 
 -- Admin-only RPC: update all global Member Visibility Permissions switches atomically
 create or replace function public.update_member_visibility_permissions(
@@ -1073,6 +1515,43 @@ $$;
 
 revoke all on function public.set_shared_idea_visibility(boolean) from public, anon;
 grant execute on function public.set_shared_idea_visibility(boolean) to authenticated;
+
+-- Admin-only RPC: update the global content deletion policy for regular users
+create or replace function public.set_content_deletion_mode(p_mode text)
+returns public.club_settings
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  caller_id uuid := auth.uid();
+  normalized_mode text := lower(btrim(coalesce(p_mode, '')));
+  updated_row public.club_settings;
+begin
+  if caller_id is null or not public.is_admin(caller_id) then
+    raise exception 'Only administrators can update content deletion settings.'
+      using errcode = '42501';
+  end if;
+
+  if normalized_mode not in ('own_only', 'any', 'disabled') then
+    raise exception 'Invalid content deletion mode. Expected own_only, any, or disabled.'
+      using errcode = '22023';
+  end if;
+
+  insert into public.club_settings (id, content_deletion_mode, updated_by, updated_at)
+  values ('default', normalized_mode, caller_id, now())
+  on conflict (id) do update
+    set content_deletion_mode = normalized_mode,
+        updated_by = caller_id,
+        updated_at = now()
+  returning * into updated_row;
+
+  return updated_row;
+end;
+$$;
+
+revoke all on function public.set_content_deletion_mode(text) from public, anon;
+grant execute on function public.set_content_deletion_mode(text) to authenticated;
 
 -- Server-enforced profile ownership for new project ideas (prevents impersonation)
 create or replace function public.enforce_project_idea_ownership()
@@ -1279,10 +1758,13 @@ create policy "Authenticated users can read club_members"
   for select
   to authenticated
   using (
-    public.has_broad_visibility()
-    or id = public.my_linked_member_id()
-    or public.can_member_view_roster()
-    or public.can_member_view_attendance_rates()
+    public.is_active_user()
+    and (
+      public.has_broad_visibility()
+      or id = public.my_linked_member_id()
+      or public.can_member_view_roster()
+      or public.can_member_view_attendance_rates()
+    )
   );
 
 create policy "Authenticated users can insert club_members"
@@ -1315,12 +1797,15 @@ create policy "Authenticated users can read attendance_sessions"
   for select
   to authenticated
   using (
-    public.has_broad_visibility()
-    or public.can_member_view_calendar_details()
-    or public.can_member_view_attendance_rates()
-    or (
-      public.my_linked_member_id() is not null
-      and public.is_member_in_session(id, public.my_linked_member_id())
+    public.is_active_user()
+    and (
+      public.has_broad_visibility()
+      or public.can_member_view_calendar_details()
+      or public.can_member_view_attendance_rates()
+      or (
+        public.my_linked_member_id() is not null
+        and public.is_member_in_session(id, public.my_linked_member_id())
+      )
     )
   );
 
@@ -1354,9 +1839,12 @@ create policy "Authenticated users can read session_attendance"
   for select
   to authenticated
   using (
-    public.has_broad_visibility()
-    or public.can_member_view_attendance_rates()
-    or member_id = public.my_linked_member_id()
+    public.is_active_user()
+    and (
+      public.has_broad_visibility()
+      or public.can_member_view_attendance_rates()
+      or member_id = public.my_linked_member_id()
+    )
   );
 
 create policy "Admins can insert session_attendance"
@@ -1401,9 +1889,12 @@ create policy "Authenticated users can read scoped project_ideas"
   for select
   to authenticated
   using (
-    public.is_admin()
-    or submitted_by_user_id = (select auth.uid())
-    or public.is_shared_idea_visibility_enabled()
+    public.is_active_user()
+    and (
+      public.is_admin()
+      or submitted_by_user_id = (select auth.uid())
+      or public.is_shared_idea_visibility_enabled()
+    )
   );
 
 drop policy if exists "Anyone can submit project_ideas" on public.project_ideas;
@@ -1413,7 +1904,8 @@ create policy "Authenticated users can submit own project_ideas"
   for insert
   to authenticated
   with check (
-    submitted_by_user_id = (select auth.uid())
+    public.is_active_user()
+    and submitted_by_user_id = (select auth.uid())
     and length(btrim(author_name)) between 1 and 80
     and length(btrim(title)) between 2 and 120
     and length(btrim(description)) between 5 and 2000
@@ -1432,11 +1924,12 @@ create policy "Authenticated admins can update project_ideas"
   with check (public.is_admin());
 
 drop policy if exists "Authenticated admins can delete project_ideas" on public.project_ideas;
-create policy "Authenticated admins can delete project_ideas"
+drop policy if exists "Permitted users can delete project_ideas" on public.project_ideas;
+create policy "Permitted users can delete project_ideas"
   on public.project_ideas
   for delete
   to authenticated
-  using (public.is_admin());
+  using (public.can_current_user_delete_content(submitted_by_user_id));
 
 -- Personal Project Idea Feedback policies: strictly visible only to Admins & the idea's author
 drop policy if exists "Author and admins can read project_idea_feedback" on public.project_idea_feedback;
@@ -1445,12 +1938,15 @@ create policy "Author and admins can read project_idea_feedback"
   for select
   to authenticated
   using (
-    public.is_admin()
-    or exists (
-      select 1
-      from public.project_ideas pi
-      where pi.id = idea_id
-        and pi.submitted_by_user_id = (select auth.uid())
+    public.is_active_user()
+    and (
+      public.is_admin()
+      or exists (
+        select 1
+        from public.project_ideas pi
+        where pi.id = idea_id
+          and pi.submitted_by_user_id = (select auth.uid())
+      )
     )
   );
 
@@ -1507,13 +2003,14 @@ create policy "Admins can update club_posts"
   with check (public.is_admin());
 
 drop policy if exists "Admins can delete club_posts" on public.club_posts;
-create policy "Admins can delete club_posts"
+drop policy if exists "Permitted users can delete club_posts" on public.club_posts;
+create policy "Permitted users can delete club_posts"
   on public.club_posts
   for delete
   to authenticated
-  using (public.is_admin());
+  using (public.can_current_user_delete_content(author_user_id));
 
--- Club Post Comments policies: public read alongside posts; admins always reply, members reply/delete own when enabled
+-- Club Post Comments policies: public read alongside posts; admins always reply, deletion governed by global policy
 drop policy if exists "Anyone can read club_post_comments" on public.club_post_comments;
 create policy "Anyone can read club_post_comments"
   on public.club_post_comments
@@ -1527,23 +2024,19 @@ create policy "Admins or permitted members can comment on club_posts"
   for insert
   to authenticated
   with check (
-    (public.is_admin() or public.can_member_comment_on_posts())
+    public.is_active_user()
+    and (public.is_admin() or public.can_member_comment_on_posts())
     and author_user_id = (select auth.uid())
     and length(btrim(content)) between 1 and 1000
   );
 
 drop policy if exists "Admins or permitted comment authors can delete comments" on public.club_post_comments;
-create policy "Admins or permitted comment authors can delete comments"
+drop policy if exists "Permitted users can delete club_post_comments" on public.club_post_comments;
+create policy "Permitted users can delete club_post_comments"
   on public.club_post_comments
   for delete
   to authenticated
-  using (
-    public.is_admin()
-    or (
-      public.can_member_comment_on_posts()
-      and author_user_id = (select auth.uid())
-    )
-  );
+  using (public.can_current_user_delete_content(author_user_id));
 
 -- Club Settings policies: readable by all clients; updated only via admin RPC
 drop policy if exists "Anyone can read club_settings" on public.club_settings;

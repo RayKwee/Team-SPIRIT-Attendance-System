@@ -1,4 +1,5 @@
-import { useEffect, useId, useRef, useState, type ChangeEvent } from 'react';
+import { useEffect, useId, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
+import type { PasswordChangeError } from '../hooks/useSupabaseAuth';
 import { DEFAULT_MEMBER_VISIBILITY_PERMISSIONS } from '../lib/clubPostsApi';
 import type {
   AccessScope,
@@ -12,7 +13,13 @@ import type {
   UserProfileRecord,
   ViewMode,
 } from '../types/attendance';
-import type { MemberVisibilityPermissions } from '../types/projectIdeas';
+import {
+  CONTENT_DELETION_MODE_DESCRIPTIONS,
+  CONTENT_DELETION_MODE_LABELS,
+  DEFAULT_CONTENT_DELETION_MODE,
+  type ContentDeletionMode,
+  type MemberVisibilityPermissions,
+} from '../types/projectIdeas';
 import type { TutorialStatus } from '../types/tutorial';
 import { formatTimestamp } from '../utils/date';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -21,7 +28,10 @@ import {
   PixelCheckIcon,
   PixelCloseIcon,
   PixelDownloadIcon,
+  PixelEyeIcon,
+  PixelEyeOffIcon,
   PixelHelpIcon,
+  PixelKeyIcon,
   PixelLockIcon,
   PixelLogOutIcon,
   PixelRefreshIcon,
@@ -60,6 +70,10 @@ interface SettingsModalProps {
   onResetPreferences: () => void;
   onStartTutorial: () => void;
   onOpenCloudSync: () => void;
+  onChangePassword?: (
+    currentPassword: string,
+    newPassword: string,
+  ) => Promise<{ error: PasswordChangeError | null }>;
   onSignOut: () => Promise<void>;
   onRefreshAdminProfiles?: () => Promise<void>;
   onUpdateUserAdminRole?: (targetUserId: string, makeAdmin: boolean) => Promise<UserProfileRecord>;
@@ -76,6 +90,9 @@ interface SettingsModalProps {
   onUpdateMemberVisibilityPermissions?: (
     patch: Partial<MemberVisibilityPermissions>,
   ) => Promise<MemberVisibilityPermissions>;
+  contentDeletionMode?: ContentDeletionMode;
+  isUpdatingContentDeletionMode?: boolean;
+  onSetContentDeletionMode?: (mode: ContentDeletionMode) => Promise<ContentDeletionMode>;
   onExportBackup: () => void;
   onImportBackupFile: (
     file: File,
@@ -103,6 +120,12 @@ const DEFAULT_ASSIGNMENT_OPTIONS: { value: DefaultAssignmentStatus; label: strin
 const CHECKLIST_VIEW_OPTIONS: { value: ViewMode; label: string }[] = [
   { value: 'list', label: 'List' },
   { value: 'grid', label: 'Grid' },
+];
+
+const CONTENT_DELETION_MODE_OPTIONS: { value: ContentDeletionMode; label: string }[] = [
+  { value: 'own_only', label: CONTENT_DELETION_MODE_LABELS.own_only },
+  { value: 'any', label: CONTENT_DELETION_MODE_LABELS.any },
+  { value: 'disabled', label: CONTENT_DELETION_MODE_LABELS.disabled },
 ];
 
 const MEMBER_PERMISSION_TOGGLES: {
@@ -196,6 +219,7 @@ export function SettingsModal({
   onResetPreferences,
   onStartTutorial,
   onOpenCloudSync,
+  onChangePassword,
   onSignOut,
   onRefreshAdminProfiles,
   onUpdateUserAdminRole,
@@ -204,6 +228,9 @@ export function SettingsModal({
   memberVisibilityPermissions = DEFAULT_MEMBER_VISIBILITY_PERMISSIONS,
   isUpdatingSharedIdeaVisibility = false,
   onUpdateMemberVisibilityPermissions,
+  contentDeletionMode = DEFAULT_CONTENT_DELETION_MODE,
+  isUpdatingContentDeletionMode = false,
+  onSetContentDeletionMode,
   onExportBackup,
   onImportBackupFile,
   onClose,
@@ -211,15 +238,38 @@ export function SettingsModal({
   const titleId = useId();
   const directoryToggleId = useId();
   const sessionToggleId = useId();
+  const currentPasswordInputId = useId();
+  const newPasswordInputId = useId();
+  const confirmPasswordInputId = useId();
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const currentPasswordRef = useRef<HTMLInputElement | null>(null);
+  const newPasswordRef = useRef<HTMLInputElement | null>(null);
+  const confirmPasswordRef = useRef<HTMLInputElement | null>(null);
 
   const [isSigningOut, setIsSigningOut] = useState(false);
+  const [isPasswordFormOpen, setIsPasswordFormOpen] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showCurrentPassword, setShowCurrentPassword] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [isUpdatingPassword, setIsUpdatingPassword] = useState(false);
+  const [passwordNotice, setPasswordNotice] = useState<{
+    tone: 'success' | 'error';
+    message: string;
+    field?: 'current' | 'new' | 'confirm' | 'general';
+  } | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [adminSearchQuery, setAdminSearchQuery] = useState('');
   const [adminRoleFilter, setAdminRoleFilter] = useState<'all' | 'admin' | 'member'>('all');
   const [busyRoleUserId, setBusyRoleUserId] = useState<string | null>(null);
   const [permissionsNotice, setPermissionsNotice] = useState<{
+    tone: 'success' | 'error';
+    message: string;
+  } | null>(null);
+  const [deletionPolicyNotice, setDeletionPolicyNotice] = useState<{
     tone: 'success' | 'error';
     message: string;
   } | null>(null);
@@ -240,12 +290,22 @@ export function SettingsModal({
     if (!isOpen) return;
 
     setIsSigningOut(false);
+    setIsPasswordFormOpen(false);
+    setCurrentPassword('');
+    setNewPassword('');
+    setConfirmPassword('');
+    setShowCurrentPassword(false);
+    setShowNewPassword(false);
+    setShowConfirmPassword(false);
+    setIsUpdatingPassword(false);
+    setPasswordNotice(null);
     setIsImporting(false);
     setAdminSearchQuery('');
     setAdminRoleFilter('all');
     setBusyRoleUserId(null);
     setAdminNotice(null);
     setPermissionsNotice(null);
+    setDeletionPolicyNotice(null);
     setPendingRoleChange(null);
     setBackupNotice(null);
 
@@ -259,12 +319,26 @@ export function SettingsModal({
   }, [isOpen]);
 
   useEffect(() => {
+    if (isCloudConnected) return;
+    setIsPasswordFormOpen(false);
+    setCurrentPassword('');
+    setNewPassword('');
+    setConfirmPassword('');
+    setShowCurrentPassword(false);
+    setShowNewPassword(false);
+    setShowConfirmPassword(false);
+    setIsUpdatingPassword(false);
+    setPasswordNotice(null);
+  }, [isCloudConnected]);
+
+  useEffect(() => {
     if (!isOpen) return;
 
     function handleKeyDown(event: KeyboardEvent) {
       if (
         event.key === 'Escape' &&
         !isSigningOut &&
+        !isUpdatingPassword &&
         !isImporting &&
         !busyRoleUserId &&
         !pendingRoleChange
@@ -277,19 +351,157 @@ export function SettingsModal({
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [isOpen, isSigningOut, isImporting, busyRoleUserId, pendingRoleChange, onClose]);
+  }, [
+    isOpen,
+    isSigningOut,
+    isUpdatingPassword,
+    isImporting,
+    busyRoleUserId,
+    pendingRoleChange,
+    onClose,
+  ]);
 
   if (!isOpen) {
     return null;
   }
 
   async function handleSignOutClick() {
-    if (isSigningOut) return;
+    if (isSigningOut || isUpdatingPassword) return;
     setIsSigningOut(true);
     try {
       await onSignOut();
     } finally {
       setIsSigningOut(false);
+    }
+  }
+
+  function clearPasswordFields() {
+    setCurrentPassword('');
+    setNewPassword('');
+    setConfirmPassword('');
+    setShowCurrentPassword(false);
+    setShowNewPassword(false);
+    setShowConfirmPassword(false);
+  }
+
+  function focusPasswordField(field?: 'current' | 'new' | 'confirm' | 'general') {
+    window.setTimeout(() => {
+      if (field === 'current') {
+        currentPasswordRef.current?.focus();
+      } else if (field === 'new') {
+        newPasswordRef.current?.focus();
+      } else if (field === 'confirm') {
+        confirmPasswordRef.current?.focus();
+      }
+    }, 0);
+  }
+
+  function handleTogglePasswordForm() {
+    if (isUpdatingPassword) return;
+    if (isPasswordFormOpen) {
+      setIsPasswordFormOpen(false);
+      clearPasswordFields();
+      setPasswordNotice(null);
+      return;
+    }
+    clearPasswordFields();
+    setPasswordNotice(null);
+    setIsPasswordFormOpen(true);
+    focusPasswordField('current');
+  }
+
+  async function handlePasswordSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!onChangePassword || isUpdatingPassword) return;
+
+    if (!currentPassword) {
+      setPasswordNotice({
+        tone: 'error',
+        message: 'Enter your current password to verify your identity.',
+        field: 'current',
+      });
+      focusPasswordField('current');
+      return;
+    }
+
+    if (!newPassword) {
+      setPasswordNotice({
+        tone: 'error',
+        message: 'Enter a new password.',
+        field: 'new',
+      });
+      focusPasswordField('new');
+      return;
+    }
+
+    if (newPassword.length < 6) {
+      setPasswordNotice({
+        tone: 'error',
+        message: 'New password must be at least 6 characters.',
+        field: 'new',
+      });
+      focusPasswordField('new');
+      return;
+    }
+
+    if (newPassword === currentPassword) {
+      setPasswordNotice({
+        tone: 'error',
+        message: 'New password must be different from your current password.',
+        field: 'new',
+      });
+      focusPasswordField('new');
+      return;
+    }
+
+    if (!confirmPassword) {
+      setPasswordNotice({
+        tone: 'error',
+        message: 'Confirm your new password.',
+        field: 'confirm',
+      });
+      focusPasswordField('confirm');
+      return;
+    }
+
+    if (newPassword !== confirmPassword) {
+      setPasswordNotice({
+        tone: 'error',
+        message: 'New passwords do not match.',
+        field: 'confirm',
+      });
+      focusPasswordField('confirm');
+      return;
+    }
+
+    setIsUpdatingPassword(true);
+    setPasswordNotice(null);
+    try {
+      const result = await onChangePassword(currentPassword, newPassword);
+      if (result.error) {
+        setPasswordNotice({
+          tone: 'error',
+          message: result.error.message,
+          field: result.error.field,
+        });
+        focusPasswordField(result.error.field);
+        return;
+      }
+
+      clearPasswordFields();
+      setIsPasswordFormOpen(false);
+      setPasswordNotice({
+        tone: 'success',
+        message: 'Password updated successfully.',
+      });
+    } catch (error) {
+      setPasswordNotice({
+        tone: 'error',
+        message: error instanceof Error ? error.message : 'Unable to update password.',
+        field: 'general',
+      });
+    } finally {
+      setIsUpdatingPassword(false);
     }
   }
 
@@ -447,7 +659,29 @@ export function SettingsModal({
     }
   }
 
-  const adminCount = adminProfiles.filter((profile) => profile.role === 'admin').length;
+  async function handleSelectContentDeletionMode(nextMode: ContentDeletionMode) {
+    if (!onSetContentDeletionMode || isUpdatingContentDeletionMode || nextMode === contentDeletionMode) {
+      return;
+    }
+    setDeletionPolicyNotice(null);
+    try {
+      const savedMode = await onSetContentDeletionMode(nextMode);
+      setDeletionPolicyNotice({
+        tone: 'success',
+        message: `Updated user content deletion policy to "${CONTENT_DELETION_MODE_LABELS[savedMode]}".`,
+      });
+    } catch (error) {
+      setDeletionPolicyNotice({
+        tone: 'error',
+        message:
+          error instanceof Error ? error.message : 'Unable to update content deletion policy.',
+      });
+    }
+  }
+
+  const adminCount = adminProfiles.filter(
+    (profile) => !profile.isDisabled && profile.role === 'admin',
+  ).length;
   const standardMemberCount = adminProfiles.length - adminCount;
   const enabledPermissionsCount = Object.values(memberVisibilityPermissions).filter(Boolean).length;
   const memberNameById = new Map(members.map((member) => [member.id, member]));
@@ -467,8 +701,14 @@ export function SettingsModal({
     );
   });
 
-  const isModalBusy = isSigningOut || isImporting || Boolean(busyRoleUserId);
+  const isModalBusy = isSigningOut || isUpdatingPassword || isImporting || Boolean(busyRoleUserId);
   const isRoleVerifying = isRoleLoading || userRole === null;
+  const isCurrentPasswordInvalid =
+    passwordNotice?.tone === 'error' && passwordNotice.field === 'current';
+  const isNewPasswordInvalid =
+    passwordNotice?.tone === 'error' && passwordNotice.field === 'new';
+  const isConfirmPasswordInvalid =
+    passwordNotice?.tone === 'error' && passwordNotice.field === 'confirm';
 
   return (
     <div
@@ -571,16 +811,206 @@ export function SettingsModal({
                     </div>
                   </div>
 
-                  <button
-                    type="button"
-                    className="settings-signout-btn"
-                    onClick={() => void handleSignOutClick()}
-                    disabled={isSigningOut}
-                  >
-                    <PixelLogOutIcon />
-                    <span>{isSigningOut ? 'Signing Out...' : 'Sign Out'}</span>
-                  </button>
+                  <div className="settings-account-actions">
+                    {onChangePassword && userEmail && (
+                      <button
+                        type="button"
+                        className={`btn-secondary btn-compact settings-password-toggle-btn ${
+                          isPasswordFormOpen ? 'is-active' : ''
+                        }`}
+                        onClick={handleTogglePasswordForm}
+                        disabled={isSigningOut || isUpdatingPassword}
+                        aria-expanded={isPasswordFormOpen}
+                      >
+                        <PixelKeyIcon />
+                        <span>{isPasswordFormOpen ? 'Cancel' : 'Change Password'}</span>
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      className="settings-signout-btn"
+                      onClick={() => void handleSignOutClick()}
+                      disabled={isSigningOut || isUpdatingPassword}
+                    >
+                      <PixelLogOutIcon />
+                      <span>{isSigningOut ? 'Signing Out...' : 'Sign Out'}</span>
+                    </button>
+                  </div>
                 </div>
+
+                {isPasswordFormOpen && onChangePassword && userEmail && (
+                  <form
+                    className="settings-password-form"
+                    onSubmit={(event) => void handlePasswordSubmit(event)}
+                    noValidate
+                  >
+                    <div className="settings-password-grid">
+                      <div className="settings-password-field is-full">
+                        <label className="settings-password-label" htmlFor={currentPasswordInputId}>
+                          Current Password
+                        </label>
+                        <div className="auth-password-wrap">
+                          <input
+                            ref={currentPasswordRef}
+                            id={currentPasswordInputId}
+                            type={showCurrentPassword ? 'text' : 'password'}
+                            className={`auth-input auth-input-password settings-password-input ${
+                              isCurrentPasswordInvalid ? 'is-invalid' : ''
+                            }`}
+                            placeholder="Verify current password"
+                            value={currentPassword}
+                            onChange={(event) => {
+                              setCurrentPassword(event.target.value);
+                              if (passwordNotice?.tone === 'error') {
+                                setPasswordNotice(null);
+                              }
+                            }}
+                            autoComplete="current-password"
+                            aria-invalid={isCurrentPasswordInvalid || undefined}
+                            disabled={isUpdatingPassword}
+                            required
+                          />
+                          <button
+                            type="button"
+                            className="auth-visibility-btn"
+                            onClick={() => setShowCurrentPassword((prev) => !prev)}
+                            aria-label={
+                              showCurrentPassword
+                                ? 'Hide current password'
+                                : 'Show current password'
+                            }
+                            title={
+                              showCurrentPassword
+                                ? 'Hide current password'
+                                : 'Show current password'
+                            }
+                            disabled={isUpdatingPassword}
+                          >
+                            {showCurrentPassword ? <PixelEyeOffIcon /> : <PixelEyeIcon />}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="settings-password-field">
+                        <label className="settings-password-label" htmlFor={newPasswordInputId}>
+                          New Password
+                        </label>
+                        <div className="auth-password-wrap">
+                          <input
+                            ref={newPasswordRef}
+                            id={newPasswordInputId}
+                            type={showNewPassword ? 'text' : 'password'}
+                            className={`auth-input auth-input-password settings-password-input ${
+                              isNewPasswordInvalid ? 'is-invalid' : ''
+                            }`}
+                            placeholder="At least 6 characters"
+                            value={newPassword}
+                            onChange={(event) => {
+                              setNewPassword(event.target.value);
+                              if (passwordNotice?.tone === 'error') {
+                                setPasswordNotice(null);
+                              }
+                            }}
+                            autoComplete="new-password"
+                            aria-invalid={isNewPasswordInvalid || undefined}
+                            disabled={isUpdatingPassword}
+                            required
+                          />
+                          <button
+                            type="button"
+                            className="auth-visibility-btn"
+                            onClick={() => setShowNewPassword((prev) => !prev)}
+                            aria-label={showNewPassword ? 'Hide new password' : 'Show new password'}
+                            title={showNewPassword ? 'Hide new password' : 'Show new password'}
+                            disabled={isUpdatingPassword}
+                          >
+                            {showNewPassword ? <PixelEyeOffIcon /> : <PixelEyeIcon />}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="settings-password-field">
+                        <label className="settings-password-label" htmlFor={confirmPasswordInputId}>
+                          Confirm New Password
+                        </label>
+                        <div className="auth-password-wrap">
+                          <input
+                            ref={confirmPasswordRef}
+                            id={confirmPasswordInputId}
+                            type={showConfirmPassword ? 'text' : 'password'}
+                            className={`auth-input auth-input-password settings-password-input ${
+                              isConfirmPasswordInvalid ? 'is-invalid' : ''
+                            }`}
+                            placeholder="Re-enter new password"
+                            value={confirmPassword}
+                            onChange={(event) => {
+                              setConfirmPassword(event.target.value);
+                              if (passwordNotice?.tone === 'error') {
+                                setPasswordNotice(null);
+                              }
+                            }}
+                            autoComplete="new-password"
+                            aria-invalid={isConfirmPasswordInvalid || undefined}
+                            disabled={isUpdatingPassword}
+                            required
+                          />
+                          <button
+                            type="button"
+                            className="auth-visibility-btn"
+                            onClick={() => setShowConfirmPassword((prev) => !prev)}
+                            aria-label={
+                              showConfirmPassword
+                                ? 'Hide confirm password'
+                                : 'Show confirm password'
+                            }
+                            title={
+                              showConfirmPassword
+                                ? 'Hide confirm password'
+                                : 'Show confirm password'
+                            }
+                            disabled={isUpdatingPassword}
+                          >
+                            {showConfirmPassword ? <PixelEyeOffIcon /> : <PixelEyeIcon />}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {passwordNotice?.tone === 'error' && (
+                      <div className="settings-backup-notice is-error" role="alert">
+                        <PixelAlertIcon width={13} height={13} />
+                        <span>{passwordNotice.message}</span>
+                      </div>
+                    )}
+
+                    <div className="settings-password-actions">
+                      <button
+                        type="submit"
+                        className="btn-primary btn-compact"
+                        disabled={isUpdatingPassword}
+                      >
+                        <PixelKeyIcon />
+                        <span>{isUpdatingPassword ? 'Updating...' : 'Update Password'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-secondary btn-compact"
+                        onClick={handleTogglePasswordForm}
+                        disabled={isUpdatingPassword}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                )}
+
+                {!isPasswordFormOpen && passwordNotice?.tone === 'success' && (
+                  <div className="settings-backup-notice is-success" role="status">
+                    <PixelCheckIcon width={13} height={13} />
+                    <span>{passwordNotice.message}</span>
+                  </div>
+                )}
 
                 {roleError && (
                   <div className="settings-backup-notice is-error" role="alert">
@@ -727,7 +1157,8 @@ export function SettingsModal({
                 ) : (
                   <div className="admin-management-list" role="list" aria-label="Registered accounts">
                     {filteredAdminProfiles.map((profile) => {
-                      const isTargetAdmin = profile.role === 'admin';
+                      const isTargetDisabled = Boolean(profile.isDisabled);
+                      const isTargetAdmin = !isTargetDisabled && profile.role === 'admin';
                       const isSelf = Boolean(currentUserId && profile.userId === currentUserId);
                       const isLastRemainingAdmin = isTargetAdmin && adminCount <= 1;
                       const isBusy = busyRoleUserId === profile.userId;
@@ -749,20 +1180,24 @@ export function SettingsModal({
                               {isSelf && <span className="admin-self-tag">You</span>}
                               <span
                                 className={`admin-role-pill ${
-                                  isTargetAdmin
-                                    ? 'is-admin'
-                                    : profile.canViewAllAttendance
-                                      ? 'is-viewer'
-                                      : 'is-member'
+                                  isTargetDisabled
+                                    ? 'is-member'
+                                    : isTargetAdmin
+                                      ? 'is-admin'
+                                      : profile.canViewAllAttendance
+                                        ? 'is-viewer'
+                                        : 'is-member'
                                 }`}
                               >
                                 {isTargetAdmin && <PixelStarIcon width={10} height={10} />}
                                 <span>
-                                  {isTargetAdmin
-                                    ? 'Admin'
-                                    : profile.canViewAllAttendance
-                                      ? 'Broad Viewer'
-                                      : 'Member'}
+                                  {isTargetDisabled
+                                    ? 'Disabled'
+                                    : isTargetAdmin
+                                      ? 'Admin'
+                                      : profile.canViewAllAttendance
+                                        ? 'Broad Viewer'
+                                        : 'Normal Member'}
                                 </span>
                               </span>
                             </div>
@@ -783,7 +1218,7 @@ export function SettingsModal({
                                 <select
                                   className="form-control admin-link-select"
                                   value={profile.linkedMemberId ?? ''}
-                                  disabled={isAnyAccountBusy || !onLinkUserToMember}
+                                  disabled={isAnyAccountBusy || isTargetDisabled || !onLinkUserToMember}
                                   onChange={(event) =>
                                     void handleLinkMemberChange(profile, event.target.value)
                                   }
@@ -869,8 +1304,12 @@ export function SettingsModal({
                               <button
                                 type="button"
                                 className="btn-primary btn-compact"
-                                disabled={isAnyAccountBusy || !onUpdateUserAdminRole}
-                                title={`Elevate ${profile.email} to Administrator`}
+                                disabled={isAnyAccountBusy || isTargetDisabled || !onUpdateUserAdminRole}
+                                title={
+                                  isTargetDisabled
+                                    ? 'Re-enable this account in the left Accounts panel first'
+                                    : `Elevate ${profile.email} to Administrator`
+                                }
                                 onClick={() =>
                                   setPendingRoleChange({ profile, makeAdmin: true })
                                 }
@@ -954,6 +1393,69 @@ export function SettingsModal({
                         </label>
                       );
                     })}
+                  </div>
+                </div>
+              )}
+
+              {onSetContentDeletionMode && (
+                <div className="admin-permissions-panel" aria-label="User Content Deletion Policy">
+                  <div className="settings-section-header">
+                    <div className="admin-permissions-heading">
+                      <h4 className="admin-permissions-title">Content Deletion Policy</h4>
+                      <span className="settings-toggle-desc">
+                        Global rule controlling which posted content regular users can delete across
+                        Project Ideas, Posts &amp; Updates, and Comments. Admins always retain full
+                        moderation access.
+                      </span>
+                    </div>
+                    <span className="settings-mode-tag is-cloud">
+                      {isUpdatingContentDeletionMode
+                        ? 'Saving...'
+                        : CONTENT_DELETION_MODE_LABELS[contentDeletionMode]}
+                    </span>
+                  </div>
+
+                  {deletionPolicyNotice && (
+                    <div
+                      className={`settings-backup-notice is-${deletionPolicyNotice.tone}`}
+                      role={deletionPolicyNotice.tone === 'error' ? 'alert' : 'status'}
+                    >
+                      {deletionPolicyNotice.tone === 'error' ? (
+                        <PixelAlertIcon width={13} height={13} />
+                      ) : (
+                        <PixelCheckIcon width={13} height={13} />
+                      )}
+                      <span>{deletionPolicyNotice.message}</span>
+                    </div>
+                  )}
+
+                  <div className="admin-deletion-mode-control">
+                    <div
+                      className="settings-segmented admin-deletion-segmented"
+                      role="radiogroup"
+                      aria-label="User content deletion permission mode"
+                    >
+                      {CONTENT_DELETION_MODE_OPTIONS.map((option) => {
+                        const isActive = contentDeletionMode === option.value;
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            role="radio"
+                            aria-checked={isActive}
+                            className={`settings-segmented-btn ${isActive ? 'is-active' : ''}`}
+                            disabled={isUpdatingContentDeletionMode}
+                            onClick={() => void handleSelectContentDeletionMode(option.value)}
+                          >
+                            {option.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <p className="settings-toggle-desc admin-deletion-mode-desc">
+                      {CONTENT_DELETION_MODE_DESCRIPTIONS[contentDeletionMode]}
+                    </p>
                   </div>
                 </div>
               )}

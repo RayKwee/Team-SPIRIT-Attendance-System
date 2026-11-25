@@ -49,6 +49,7 @@
   /* Layout */
   --container-max: 1200px;
   --member-sidebar-width: clamp(360px, 31vw, 430px);
+  --accounts-sidebar-width: clamp(360px, 31vw, 430px);
 }
 
 :root[data-accent='gold'] {

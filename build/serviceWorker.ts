@@ -18,7 +18,7 @@ self.addEventListener('activate', (event) => {
 });
 `.trimStart();
 
-const PRECACHE_EXT_RE = /\.(?:html|js|css|png|jpg|jpeg|webp|gif|svg|ico|woff2?|ttf|eot)$/i;
+const PRECACHE_EXT_RE = /\.(?:js|css|png|jpg|jpeg|webp|gif|svg|ico|woff2?|ttf|eot)$/i;
 
 /** Computes a deterministic FNV-1a + length build fingerprint in pure TypeScript. */
 function computeBuildFingerprint(entries: string[]): string {
@@ -125,18 +125,46 @@ function isSameOriginStaticAsset(url) {
   return url.pathname.startsWith(assetsPrefix) || STATIC_ASSET_EXT_RE.test(url.pathname);
 }
 
+/**
+ * Strips the redirected flag from a fetched or cached response so browsers never reject
+ * top-level navigations (request.redirect === 'manual') with ERR_FAILED.
+ */
+async function toCleanResponse(response) {
+  if (!response || !response.redirected) {
+    return response;
+  }
+  const body = await response.arrayBuffer();
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: new Headers(response.headers),
+  });
+}
+
+async function precacheUrl(cache, relativePath) {
+  try {
+    const resolved = resolveFromScope(relativePath);
+    const response = await fetch(new Request(resolved, { cache: 'reload' }));
+    if (!response || !response.ok || response.type !== 'basic') {
+      return;
+    }
+    const isStaticAsset = STATIC_ASSET_EXT_RE.test(new URL(resolved).pathname);
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (isStaticAsset && contentType.includes('text/html')) {
+      return;
+    }
+    const cleanResponse = await toCleanResponse(response);
+    await cache.put(resolved, cleanResponse);
+  } catch {
+    // Never abort SW installation/upgrade on a single non-critical precache fetch error.
+  }
+}
+
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches
       .open(STATIC_CACHE)
-      .then((cache) =>
-        Promise.all(
-          PRECACHE_URLS.map((url) => {
-            const resolved = resolveFromScope(url);
-            return cache.add(new Request(resolved, { cache: 'reload' }));
-          }),
-        ),
-      )
+      .then((cache) => Promise.all(PRECACHE_URLS.map((url) => precacheUrl(cache, url))))
       .then(() => self.skipWaiting()),
   );
 });
@@ -201,44 +229,84 @@ async function handleGoogleFontAsset(request) {
   return response;
 }
 
-async function handleNavigationRequest(request, url) {
-  const cache = await caches.open(STATIC_CACHE);
+function getNavigationCandidatePaths(url) {
   const normalizedPathname = url.pathname.replace(/\\/+$/, '').toLowerCase() || '/';
-  const isCalendarRoute =
-    normalizedPathname.endsWith('/calendar') || normalizedPathname.endsWith('/calendar.html');
-  const isUpdatesRoute =
-    normalizedPathname.endsWith('/updates') || normalizedPathname.endsWith('/updates.html');
-  const isIdeasRoute =
-    normalizedPathname.endsWith('/ideas') || normalizedPathname.endsWith('/ideas.html');
+  if (normalizedPathname.endsWith('/calendar') || normalizedPathname.endsWith('/calendar.html')) {
+    return ['./calendar', './'];
+  }
+  if (normalizedPathname.endsWith('/updates') || normalizedPathname.endsWith('/updates.html')) {
+    return ['./updates', './ideas', './'];
+  }
+  if (normalizedPathname.endsWith('/ideas') || normalizedPathname.endsWith('/ideas.html')) {
+    return ['./ideas', './'];
+  }
+  return ['./'];
+}
 
-  const candidatePaths = isCalendarRoute
-    ? ['./calendar.html', './index.html']
-    : isUpdatesRoute
-      ? ['./updates.html', './ideas.html', './index.html']
-      : isIdeasRoute
-        ? ['./ideas.html', './index.html']
-        : ['./index.html'];
-
+async function matchCleanCachedNavigation(cache, candidatePaths) {
   for (const candidate of candidatePaths) {
     const cached = await cache.match(resolveFromScope(candidate));
     if (cached) {
-      return cached;
+      return toCleanResponse(cached);
     }
   }
+  return null;
+}
 
-  return fetch(request);
+async function handleNavigationRequest(request, url) {
+  const cache = await caches.open(STATIC_CACHE);
+  const candidatePaths = getNavigationCandidatePaths(url);
+  const primaryCacheUrl = resolveFromScope(candidatePaths[0]);
+
+  try {
+    const networkResponse = await fetch(request);
+
+    // Preserve browser-native redirect handling (e.g. /index.html -> / 307 on Cloudflare).
+    if (networkResponse.type === 'opaqueredirect') {
+      return networkResponse;
+    }
+
+    if (networkResponse.ok && networkResponse.type === 'basic') {
+      const cleanResponse = await toCleanResponse(networkResponse);
+      void cache.put(primaryCacheUrl, cleanResponse.clone());
+      return cleanResponse;
+    }
+
+    if (networkResponse.status >= 500) {
+      const fallback = await matchCleanCachedNavigation(cache, candidatePaths);
+      if (fallback) {
+        return fallback;
+      }
+    }
+
+    return toCleanResponse(networkResponse);
+  } catch {
+    const fallback = await matchCleanCachedNavigation(cache, candidatePaths);
+    if (fallback) {
+      return fallback;
+    }
+    return Response.error();
+  }
 }
 
 async function handleStaticAssetRequest(request) {
   const cache = await caches.open(STATIC_CACHE);
   const cached = await cache.match(request);
   if (cached) {
-    return cached;
+    return toCleanResponse(cached);
   }
 
   const response = await fetch(request);
-  if (response && response.ok && response.type === 'basic') {
-    await cache.put(request, response.clone());
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+  if (
+    response &&
+    response.ok &&
+    response.type === 'basic' &&
+    !contentType.includes('text/html')
+  ) {
+    const cleanResponse = await toCleanResponse(response);
+    await cache.put(request, cleanResponse.clone());
+    return cleanResponse;
   }
   return response;
 }
@@ -317,10 +385,9 @@ export function teamSpiritStaticCachePlugin(): Plugin {
     generateBundle(_options, bundle) {
       const precacheSet = new Set<string>([
         './',
-        './index.html',
-        './calendar.html',
-        './ideas.html',
-        './updates.html',
+        './calendar',
+        './ideas',
+        './updates',
         './team-spirit-emblem.png',
       ]);
       const fingerprintInputs: string[] = [];

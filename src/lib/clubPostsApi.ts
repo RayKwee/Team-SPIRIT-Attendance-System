@@ -1,11 +1,14 @@
-import type {
-  ClubPost,
-  ClubPostCategory,
-  ClubPostComment,
-  ClubPostCommentInput,
-  ClubPostInput,
-  ClubSettings,
-  MemberVisibilityPermissions,
+import {
+  DEFAULT_CONTENT_DELETION_MODE,
+  normalizeContentDeletionMode,
+  type ClubPost,
+  type ClubPostCategory,
+  type ClubPostComment,
+  type ClubPostCommentInput,
+  type ClubPostInput,
+  type ClubSettings,
+  type ContentDeletionMode,
+  type MemberVisibilityPermissions,
 } from '../types/projectIdeas';
 import { toSupabaseSyncError } from './attendanceSync';
 import { supabase } from './supabase';
@@ -44,6 +47,7 @@ export interface DbClubSettingsRow {
   member_can_view_calendar_details?: boolean | null;
   shared_idea_visibility?: boolean | null;
   member_can_comment_on_posts?: boolean | null;
+  content_deletion_mode?: string | null;
   updated_by: string | null;
   updated_at: string;
 }
@@ -129,6 +133,7 @@ export function clubSettingsFromDbRow(row: DbClubSettingsRow): ClubSettings {
     memberCanViewCalendarDetails: Boolean(row.member_can_view_calendar_details),
     sharedIdeaVisibility: Boolean(row.shared_idea_visibility),
     memberCanCommentOnPosts: Boolean(row.member_can_comment_on_posts),
+    contentDeletionMode: normalizeContentDeletionMode(row.content_deletion_mode),
     updatedBy: row.updated_by ?? undefined,
     updatedAt: row.updated_at,
   };
@@ -191,6 +196,7 @@ export async function fetchClubSettings(): Promise<ClubSettings> {
     if (syncErr.isMissingTable || syncErr.isMissingColumn) {
       return {
         ...DEFAULT_MEMBER_VISIBILITY_PERMISSIONS,
+        contentDeletionMode: DEFAULT_CONTENT_DELETION_MODE,
         updatedAt: new Date(0).toISOString(),
       };
     }
@@ -200,6 +206,7 @@ export async function fetchClubSettings(): Promise<ClubSettings> {
   if (!data) {
     return {
       ...DEFAULT_MEMBER_VISIBILITY_PERMISSIONS,
+      contentDeletionMode: DEFAULT_CONTENT_DELETION_MODE,
       updatedAt: new Date(0).toISOString(),
     };
   }
@@ -240,6 +247,25 @@ export async function updateSharedIdeaVisibility(allowShared: boolean): Promise<
     throw normalizePostsError(
       error ?? new Error('Unable to update Shared Idea Visibility.'),
       'Failed to update Shared Idea Visibility.',
+      status,
+    );
+  }
+
+  return clubSettingsFromDbRow(data as DbClubSettingsRow);
+}
+
+/** Admin-only RPC: sets the global user content deletion policy (`own_only`, `any`, or `disabled`). */
+export async function updateContentDeletionMode(
+  mode: ContentDeletionMode,
+): Promise<ClubSettings> {
+  const { data, error, status } = await supabase.rpc('set_content_deletion_mode', {
+    p_mode: mode,
+  });
+
+  if (error || !data) {
+    throw normalizePostsError(
+      error ?? new Error('Unable to update Content Deletion Policy.'),
+      'Failed to update Content Deletion Policy.',
       status,
     );
   }
@@ -331,12 +357,21 @@ export async function toggleClubPostPin(postId: string, isPinned: boolean): Prom
   return clubPostFromDbRow(data as DbClubPostRow);
 }
 
-/** Admin-only: permanently deletes a club post. */
+/** Permanently deletes a club post (server RLS enforces the active content deletion policy). */
 export async function deleteClubPost(postId: string): Promise<void> {
-  const { error, status } = await supabase.from('club_posts').delete().eq('id', postId);
+  const { data, error, status } = await supabase
+    .from('club_posts')
+    .delete()
+    .eq('id', postId)
+    .select('id');
 
   if (error) {
     throw normalizePostsError(error, 'Failed to delete club post.', status);
+  }
+  if (!data || data.length === 0) {
+    throw new Error(
+      'Deletion is not permitted under the current content deletion policy (or the post was already removed).',
+    );
   }
 }
 
@@ -367,11 +402,20 @@ export async function createClubPostComment(
   return clubPostCommentFromDbRow(data as DbClubPostCommentRow);
 }
 
-/** Deletes a post comment (Admin on any comment, or author on own comment when commenting is enabled). */
+/** Deletes a post comment (server RLS enforces the active content deletion policy). */
 export async function deleteClubPostComment(commentId: string): Promise<void> {
-  const { error, status } = await supabase.from('club_post_comments').delete().eq('id', commentId);
+  const { data, error, status } = await supabase
+    .from('club_post_comments')
+    .delete()
+    .eq('id', commentId)
+    .select('id');
 
   if (error) {
     throw normalizePostsError(error, 'Failed to delete comment.', status);
+  }
+  if (!data || data.length === 0) {
+    throw new Error(
+      'Deletion is not permitted under the current content deletion policy (or the comment was already removed).',
+    );
   }
 }

@@ -1,12 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  adminCreateAndLinkMemberAccount,
   adminLinkUserToMember,
+  adminSyncAndLinkMemberAccount,
   autoLinkMyMemberProfile,
   fetchAllUserProfiles,
   fetchMyUserProfile,
+  removeUserAccount,
+  setUserAccountDisabled,
   setUserAdminRole,
   setUserVisibilityScope,
+  syncAuthProfiles,
   userProfileFromDbRow,
+  type AdminCreateAccountResult,
+  type AdminRemoveAccountResult,
   type DbUserProfileRow,
 } from '../lib/adminApi';
 import { supabase } from '../lib/supabase';
@@ -15,6 +22,7 @@ import type { AccountRole, UserProfileRecord } from '../types/attendance';
 export interface UseAdminRoleResult {
   userRole: AccountRole | null;
   isAdmin: boolean;
+  isAccountDisabled: boolean;
   linkedMemberId: string | null;
   canViewAllAttendance: boolean;
   isRoleLoading: boolean;
@@ -23,15 +31,29 @@ export interface UseAdminRoleResult {
   isProfilesLoading: boolean;
   profilesError: string | null;
   refreshRoleAndProfiles: () => Promise<void>;
+  syncAdminProfiles: () => Promise<UserProfileRecord[]>;
   updateUserAdminRole: (targetUserId: string, makeAdmin: boolean) => Promise<UserProfileRecord>;
   linkUserToMember: (
     targetUserId: string,
     targetMemberId: string | null,
   ) => Promise<UserProfileRecord>;
+  createAndLinkMemberAccount: (params: {
+    memberId: string;
+    memberName: string;
+    email: string;
+    password: string;
+  }) => Promise<AdminCreateAccountResult>;
+  syncAndLinkMemberAccount: (params: {
+    memberId: string;
+    email?: string;
+    userId?: string;
+  }) => Promise<UserProfileRecord>;
   updateUserVisibilityScope: (
     targetUserId: string,
     allowBroadView: boolean,
   ) => Promise<UserProfileRecord>;
+  setAccountDisabled: (targetUserId: string, disableAccount: boolean) => Promise<UserProfileRecord>;
+  removeAccount: (targetUserId: string) => Promise<AdminRemoveAccountResult>;
 }
 
 /**
@@ -40,6 +62,7 @@ export interface UseAdminRoleResult {
  */
 export function useAdminRole(userId: string | null): UseAdminRoleResult {
   const [userRole, setUserRole] = useState<AccountRole | null>(null);
+  const [isAccountDisabled, setIsAccountDisabled] = useState(false);
   const [linkedMemberId, setLinkedMemberId] = useState<string | null>(null);
   const [canViewAllAttendance, setCanViewAllAttendance] = useState(false);
   const [isRoleLoading, setIsRoleLoading] = useState(false);
@@ -68,6 +91,18 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
       let myProfile = await fetchMyUserProfile(targetUserId);
       if (!isCurrentRequest()) return;
 
+      if (myProfile?.isDisabled) {
+        userRoleRef.current = 'member';
+        setIsAccountDisabled(true);
+        setUserRole('member');
+        setLinkedMemberId(null);
+        setCanViewAllAttendance(false);
+        setProfiles([]);
+        setProfilesError(null);
+        setIsProfilesLoading(false);
+        return;
+      }
+
       // Attempt exact-email auto-link once if the signed-in user has no linked roster member yet.
       if (myProfile && !myProfile.linkedMemberId) {
         try {
@@ -84,6 +119,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
 
       const resolvedRole: AccountRole = myProfile?.role === 'admin' ? 'admin' : 'member';
       userRoleRef.current = resolvedRole;
+      setIsAccountDisabled(false);
       setUserRole(resolvedRole);
       setLinkedMemberId(myProfile?.linkedMemberId ?? null);
       setCanViewAllAttendance(Boolean(myProfile?.canViewAllAttendance));
@@ -134,6 +170,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
 
     // Always clear previous user's role & directory state immediately on user change.
     userRoleRef.current = null;
+    setIsAccountDisabled(false);
     setUserRole(null);
     setLinkedMemberId(null);
     setCanViewAllAttendance(false);
@@ -165,6 +202,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
             setProfiles((prev) => prev.filter((p) => p.userId !== deletedId));
             if (deletedId === userId) {
               userRoleRef.current = 'member';
+              setIsAccountDisabled(true);
               setUserRole('member');
               setLinkedMemberId(null);
               setCanViewAllAttendance(false);
@@ -176,8 +214,18 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
           if (!payload.new) return;
           const incoming = userProfileFromDbRow(payload.new as DbUserProfileRow);
           if (incoming.userId === userId) {
+            if (incoming.isDisabled) {
+              userRoleRef.current = 'member';
+              setIsAccountDisabled(true);
+              setUserRole('member');
+              setLinkedMemberId(null);
+              setCanViewAllAttendance(false);
+              setProfiles([]);
+              return;
+            }
             const roleChanged = userRoleRef.current !== incoming.role;
             userRoleRef.current = incoming.role;
+            setIsAccountDisabled(false);
             setUserRole(incoming.role);
             setLinkedMemberId(incoming.linkedMemberId ?? null);
             setCanViewAllAttendance(incoming.canViewAllAttendance);
@@ -256,6 +304,57 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
     [syncUpdatedProfileIntoState],
   );
 
+  const syncAdminProfiles = useCallback(async (): Promise<UserProfileRecord[]> => {
+    if (!activeUserIdRef.current || userRoleRef.current !== 'admin') {
+      return [];
+    }
+    setIsProfilesLoading(true);
+    setProfilesError(null);
+    try {
+      const synced = await syncAuthProfiles();
+      if (mountedRef.current && userRoleRef.current === 'admin') {
+        setProfiles(synced);
+      }
+      return synced;
+    } catch (err) {
+      if (mountedRef.current) {
+        setProfilesError(err instanceof Error ? err.message : 'Unable to sync registered accounts.');
+      }
+      throw err;
+    } finally {
+      if (mountedRef.current) {
+        setIsProfilesLoading(false);
+      }
+    }
+  }, []);
+
+  const createAndLinkMemberAccount = useCallback(
+    async (params: {
+      memberId: string;
+      memberName: string;
+      email: string;
+      password: string;
+    }): Promise<AdminCreateAccountResult> => {
+      const result = await adminCreateAndLinkMemberAccount(params);
+      syncUpdatedProfileIntoState(result.profile);
+      return result;
+    },
+    [syncUpdatedProfileIntoState],
+  );
+
+  const syncAndLinkMemberAccount = useCallback(
+    async (params: {
+      memberId: string;
+      email?: string;
+      userId?: string;
+    }): Promise<UserProfileRecord> => {
+      const updated = await adminSyncAndLinkMemberAccount(params);
+      syncUpdatedProfileIntoState(updated);
+      return updated;
+    },
+    [syncUpdatedProfileIntoState],
+  );
+
   const updateUserVisibilityScope = useCallback(
     async (targetUserId: string, allowBroadView: boolean): Promise<UserProfileRecord> => {
       const updated = await setUserVisibilityScope(targetUserId, allowBroadView);
@@ -265,9 +364,46 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
     [syncUpdatedProfileIntoState],
   );
 
+  const setAccountDisabled = useCallback(
+    async (targetUserId: string, disableAccount: boolean): Promise<UserProfileRecord> => {
+      const updated = await setUserAccountDisabled(targetUserId, disableAccount);
+      syncUpdatedProfileIntoState(updated);
+      return updated;
+    },
+    [syncUpdatedProfileIntoState],
+  );
+
+  const removeAccount = useCallback(
+    async (targetUserId: string): Promise<AdminRemoveAccountResult> => {
+      const result = await removeUserAccount(targetUserId);
+      if (!mountedRef.current) return result;
+      if (result.mode === 'deleted') {
+        setProfiles((prev) => prev.filter((profile) => profile.userId !== targetUserId));
+      } else {
+        setProfiles((prev) =>
+          prev.map((profile) =>
+            profile.userId === targetUserId
+              ? {
+                  ...profile,
+                  role: 'member',
+                  linkedMemberId: undefined,
+                  canViewAllAttendance: false,
+                  isDisabled: true,
+                  disabledAt: new Date().toISOString(),
+                }
+              : profile,
+          ),
+        );
+      }
+      return result;
+    },
+    [],
+  );
+
   return {
     userRole,
-    isAdmin: Boolean(userId && userRole === 'admin'),
+    isAdmin: Boolean(userId && userRole === 'admin' && !isAccountDisabled),
+    isAccountDisabled,
     linkedMemberId,
     canViewAllAttendance,
     isRoleLoading,
@@ -276,8 +412,13 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
     isProfilesLoading,
     profilesError,
     refreshRoleAndProfiles,
+    syncAdminProfiles,
     updateUserAdminRole,
     linkUserToMember,
+    createAndLinkMemberAccount,
+    syncAndLinkMemberAccount,
     updateUserVisibilityScope,
+    setAccountDisabled,
+    removeAccount,
   };
 }

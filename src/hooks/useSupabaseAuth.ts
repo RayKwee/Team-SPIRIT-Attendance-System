@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { User } from '@supabase/supabase-js';
-import { supabase } from '../lib/supabase';
+import { createEphemeralAuthClient, supabase } from '../lib/supabase';
 
 export type AuthStatus = 'loading' | 'authenticated' | 'unauthenticated';
 
@@ -22,11 +22,21 @@ export interface AuthLoginError {
   field?: 'email' | 'password' | 'both';
 }
 
+export interface PasswordChangeError {
+  code: string;
+  message: string;
+  field?: 'current' | 'new' | 'confirm' | 'general';
+}
+
 export interface UseSupabaseAuthResult {
   authStatus: AuthStatus;
   user: User | null;
   signIn: (email: string, password: string) => Promise<{ error: AuthLoginError | null }>;
   signOut: () => Promise<void>;
+  changePassword: (
+    currentPassword: string,
+    newPassword: string,
+  ) => Promise<{ error: PasswordChangeError | null }>;
 }
 
 const NETWORK_ERROR_PATTERN =
@@ -37,6 +47,95 @@ const EMAIL_UNCONFIRMED_PATTERN = /email not confirmed|not confirmed/i;
 const RATE_LIMIT_PATTERN = /rate limit|too many requests|too many attempts/i;
 const INVALID_CREDENTIALS_PATTERN =
   /invalid login credentials|invalid credentials|invalid email or password|wrong password|incorrect password/i;
+const SAME_PASSWORD_PATTERN = /different from the old password|same password/i;
+const WEAK_PASSWORD_PATTERN = /at least \d+ characters|weak password|password should be/i;
+
+function extractAuthErrorMeta(error: unknown): {
+  message: string;
+  code: string;
+  name: string;
+  status?: number;
+} {
+  let rawMessage = '';
+  let code = '';
+  let name = '';
+  let status: number | undefined;
+
+  if (error instanceof Error) {
+    rawMessage = error.message;
+    name = error.name;
+    const errWithMeta = error as Error & { code?: unknown; status?: unknown };
+    if (typeof errWithMeta.code === 'string') code = errWithMeta.code;
+    if (typeof errWithMeta.status === 'number') status = errWithMeta.status;
+  } else if (typeof error === 'object' && error !== null) {
+    const obj = error as Record<string, unknown>;
+    if (typeof obj.message === 'string') rawMessage = obj.message;
+    if (typeof obj.code === 'string') code = obj.code;
+    if (typeof obj.name === 'string') name = obj.name;
+    if (typeof obj.status === 'number') status = obj.status;
+  } else if (typeof error === 'string') {
+    rawMessage = error;
+  }
+
+  return { message: rawMessage.trim(), code, name, status };
+}
+
+function classifyPasswordUpdateError(error: unknown): PasswordChangeError {
+  const { message, code, name, status } = extractAuthErrorMeta(error);
+  const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+
+  if (
+    isOffline ||
+    name === 'AuthRetryableFetchError' ||
+    status === 0 ||
+    (typeof status === 'number' && status >= 500) ||
+    NETWORK_ERROR_PATTERN.test(message)
+  ) {
+    return {
+      code: 'network',
+      message: 'Unable to reach Supabase. Check your internet connection and try again.',
+      field: 'general',
+    };
+  }
+
+  if (code === 'same_password' || SAME_PASSWORD_PATTERN.test(message)) {
+    return {
+      code: 'same_password',
+      message: 'New password must be different from your current password.',
+      field: 'new',
+    };
+  }
+
+  if (code === 'weak_password' || WEAK_PASSWORD_PATTERN.test(message)) {
+    return {
+      code: 'weak_password',
+      message: message || 'New password must be at least 6 characters.',
+      field: 'new',
+    };
+  }
+
+  if (code === 'over_request_rate_limit' || status === 429 || RATE_LIMIT_PATTERN.test(message)) {
+    return {
+      code: 'rate_limited',
+      message: 'Too many attempts. Please wait a moment and try again.',
+      field: 'general',
+    };
+  }
+
+  if (code === 'reauthentication_needed' || /reauthentication/i.test(message)) {
+    return {
+      code: 'reauthentication_needed',
+      message: message || 'Please sign out and sign back in before changing your password.',
+      field: 'general',
+    };
+  }
+
+  return {
+    code: code || 'update_failed',
+    message: message || 'Unable to update password. Please try again.',
+    field: 'general',
+  };
+}
 
 /** Classifies Supabase Auth errors and network failures into structured, user-friendly login errors. */
 export function classifySupabaseAuthError(error: unknown): AuthLoginError {
@@ -243,10 +342,98 @@ export function useSupabaseAuth(): UseSupabaseAuthResult {
     }
   }, []);
 
+  const changePassword = useCallback(
+    async (
+      currentPassword: string,
+      newPassword: string,
+    ): Promise<{ error: PasswordChangeError | null }> => {
+      try {
+        const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+        const activeEmail = sessionData.session?.user?.email?.trim() || user?.email?.trim();
+
+        if (sessionError || !activeEmail) {
+          return {
+            error: {
+              code: 'unauthenticated',
+              message: 'Your session is no longer active. Sign in again to change your password.',
+              field: 'general',
+            },
+          };
+        }
+
+        // Verify current password using an isolated non-persisting client so the active session
+        // and Realtime sync subscriptions are not disrupted.
+        const ephemeralClient = createEphemeralAuthClient();
+        const { error: verifyError } = await ephemeralClient.auth.signInWithPassword({
+          email: activeEmail,
+          password: currentPassword,
+        });
+
+        if (verifyError) {
+          const classified = classifySupabaseAuthError(verifyError);
+          if (classified.category === 'network') {
+            return {
+              error: {
+                code: 'network',
+                message: 'Unable to reach Supabase. Check your internet connection and try again.',
+                field: 'general',
+              },
+            };
+          }
+          if (classified.category === 'rate_limited') {
+            return {
+              error: {
+                code: 'rate_limited',
+                message: 'Too many attempts. Please wait a moment and try again.',
+                field: 'general',
+              },
+            };
+          }
+          if (
+            classified.category === 'invalid_credentials' ||
+            classified.category === 'account_not_found'
+          ) {
+            return {
+              error: {
+                code: 'invalid_current_password',
+                message: 'Current password is incorrect.',
+                field: 'current',
+              },
+            };
+          }
+          return {
+            error: {
+              code: classified.code,
+              message: classified.message || 'Unable to verify your current password.',
+              field: 'current',
+            },
+          };
+        }
+
+        // Only clear the ephemeral client's in-memory session (never global signOut).
+        await ephemeralClient.auth.signOut({ scope: 'local' }).catch(() => undefined);
+
+        const { error: updateError } = await supabase.auth.updateUser({
+          password: newPassword,
+        });
+
+        if (updateError) {
+          return { error: classifyPasswordUpdateError(updateError) };
+        }
+
+        return { error: null };
+      } catch (error) {
+        return { error: classifyPasswordUpdateError(error) };
+      }
+    },
+    [user?.email],
+  );
+
   return {
     authStatus,
     user,
     signIn,
     signOut,
+    changePassword,
   };
 }

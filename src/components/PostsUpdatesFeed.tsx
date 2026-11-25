@@ -2,11 +2,13 @@ import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from 'rea
 import {
   CLUB_POST_CATEGORIES,
   CLUB_POST_CATEGORY_LABELS,
+  canUserDeleteContent,
   type ClubPost,
   type ClubPostCategory,
   type ClubPostComment,
   type ClubPostCommentInput,
   type ClubPostInput,
+  type ContentDeletionMode,
 } from '../types/projectIdeas';
 import { formatSessionDate, formatTimestamp } from '../utils/date';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -36,6 +38,7 @@ interface PostsUpdatesFeedProps {
   isPublishing: boolean;
   isAdmin: boolean;
   memberCanCommentOnPosts: boolean;
+  contentDeletionMode: ContentDeletionMode;
   authorDisplayName: string;
   onRefresh: () => Promise<void>;
   onPublishPost: (input: ClubPostInput) => Promise<ClubPost>;
@@ -73,6 +76,7 @@ export function PostsUpdatesFeed({
   isPublishing,
   isAdmin,
   memberCanCommentOnPosts,
+  contentDeletionMode,
   authorDisplayName,
   onRefresh,
   onPublishPost,
@@ -306,13 +310,36 @@ export function PostsUpdatesFeed({
   }
 
   const activePendingDeletePost =
-    isAdmin && pendingDeletePost && posts.some((post) => post.id === pendingDeletePost.id)
+    pendingDeletePost &&
+    canUserDeleteContent({
+      isAdmin,
+      userId,
+      authorUserId: pendingDeletePost.authorUserId,
+      mode: contentDeletionMode,
+    }) &&
+    posts.some((post) => post.id === pendingDeletePost.id)
       ? pendingDeletePost
       : null;
 
   async function handleConfirmDeletePost() {
-    if (!isAdmin || !activePendingDeletePost || busyPostId) return;
+    if (!activePendingDeletePost || busyPostId) return;
     const target = activePendingDeletePost;
+    if (
+      !canUserDeleteContent({
+        isAdmin,
+        userId,
+        authorUserId: target.authorUserId,
+        mode: contentDeletionMode,
+      })
+    ) {
+      setPendingDeletePost(null);
+      onNotify?.({
+        tone: 'error',
+        tag: 'Deletion Disabled',
+        message: 'You do not have permission to delete this post under the active policy.',
+      });
+      return;
+    }
     setBusyPostId(target.id);
     try {
       await onDeletePost(target.id);
@@ -392,6 +419,21 @@ export function PostsUpdatesFeed({
 
   async function handleDeleteCommentClick(comment: ClubPostComment) {
     if (deletingCommentId) return;
+    if (
+      !canUserDeleteContent({
+        isAdmin,
+        userId,
+        authorUserId: comment.authorUserId,
+        mode: contentDeletionMode,
+      })
+    ) {
+      onNotify?.({
+        tone: 'error',
+        tag: 'Deletion Disabled',
+        message: 'You do not have permission to delete this comment under the active policy.',
+      });
+      return;
+    }
     setDeletingCommentId(comment.id);
     try {
       await onDeleteComment(comment.id);
@@ -552,6 +594,12 @@ export function PostsUpdatesFeed({
           <div className="posts-feed-list" role="feed" aria-label="Official club updates">
             {filteredPosts.map((post) => {
               const isBusy = Boolean(busyPostId);
+              const canDeletePost = canUserDeleteContent({
+                isAdmin,
+                userId,
+                authorUserId: post.authorUserId,
+                mode: contentDeletionMode,
+              });
               const postComments = commentsByPostId.get(post.id) ?? [];
               const commentsExpanded = expandedCommentPostIds.has(post.id);
               const rawReplyTarget = replyTargetByPostId[post.id] ?? null;
@@ -589,40 +637,46 @@ export function PostsUpdatesFeed({
                       )}
                     </div>
 
-                    {isAdmin && (
+                    {(isAdmin || canDeletePost) && (
                       <div className="idea-admin-actions">
-                        <button
-                          type="button"
-                          className={`icon-btn idea-highlight-btn ${
-                            post.isPinned ? 'is-active' : ''
-                          }`}
-                          disabled={isBusy}
-                          onClick={() => void handleTogglePin(post)}
-                          title={post.isPinned ? 'Unpin update' : 'Pin update to top'}
-                          aria-label={post.isPinned ? `Unpin ${post.title}` : `Pin ${post.title}`}
-                        >
-                          <PixelPinIcon width={12} height={12} />
-                        </button>
-                        <button
-                          type="button"
-                          className="icon-btn"
-                          disabled={isBusy}
-                          onClick={() => openEditModal(post)}
-                          title="Edit update"
-                          aria-label={`Edit ${post.title}`}
-                        >
-                          <PixelEditIcon width={12} height={12} />
-                        </button>
-                        <button
-                          type="button"
-                          className="icon-btn icon-btn-danger"
-                          disabled={isBusy}
-                          onClick={() => setPendingDeletePost(post)}
-                          title="Delete update"
-                          aria-label={`Delete ${post.title}`}
-                        >
-                          <PixelTrashIcon width={12} height={12} />
-                        </button>
+                        {isAdmin && (
+                          <>
+                            <button
+                              type="button"
+                              className={`icon-btn idea-highlight-btn ${
+                                post.isPinned ? 'is-active' : ''
+                              }`}
+                              disabled={isBusy}
+                              onClick={() => void handleTogglePin(post)}
+                              title={post.isPinned ? 'Unpin update' : 'Pin update to top'}
+                              aria-label={post.isPinned ? `Unpin ${post.title}` : `Pin ${post.title}`}
+                            >
+                              <PixelPinIcon width={12} height={12} />
+                            </button>
+                            <button
+                              type="button"
+                              className="icon-btn"
+                              disabled={isBusy}
+                              onClick={() => openEditModal(post)}
+                              title="Edit update"
+                              aria-label={`Edit ${post.title}`}
+                            >
+                              <PixelEditIcon width={12} height={12} />
+                            </button>
+                          </>
+                        )}
+                        {canDeletePost && (
+                          <button
+                            type="button"
+                            className="icon-btn icon-btn-danger"
+                            disabled={isBusy}
+                            onClick={() => setPendingDeletePost(post)}
+                            title="Delete update"
+                            aria-label={`Delete ${post.title}`}
+                          >
+                            <PixelTrashIcon width={12} height={12} />
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
@@ -678,11 +732,12 @@ export function PostsUpdatesFeed({
                             const parentComment = comment.parentCommentId
                               ? commentById.get(comment.parentCommentId)
                               : undefined;
-                            const canDeleteComment =
-                              isAdmin ||
-                              (memberCanCommentOnPosts &&
-                                Boolean(userId) &&
-                                comment.authorUserId === userId);
+                            const canDeleteComment = canUserDeleteContent({
+                              isAdmin,
+                              userId,
+                              authorUserId: comment.authorUserId,
+                              mode: contentDeletionMode,
+                            });
                             return (
                               <li
                                 key={comment.id}

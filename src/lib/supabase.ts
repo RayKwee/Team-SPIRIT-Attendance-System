@@ -14,3 +14,28 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
     detectSessionInUrl: false,
   },
 });
+
+/**
+ * Creates a short-lived, non-persisting Supabase client for Admin-initiated `auth.signUp()`
+ * calls so creating a member's login account never replaces the signed-in Admin's session.
+ */
+export function createEphemeralAuthClient() {
+  const memoryStorage = new Map<string, string>();
+  return createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+      storageKey: `team-spirit-ephemeral-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      storage: {
+        getItem: (key: string) => memoryStorage.get(key) ?? null,
+        setItem: (key: string, value: string) => {
+          memoryStorage.set(key, value);
+        },
+        removeItem: (key: string) => {
+          memoryStorage.delete(key);
+        },
+      },
+    },
+  });
+}

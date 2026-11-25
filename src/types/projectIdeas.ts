@@ -111,6 +111,51 @@ export interface ClubPostCommentInput {
   content: string;
 }
 
+export type ContentDeletionMode = 'own_only' | 'any' | 'disabled';
+
+export const DEFAULT_CONTENT_DELETION_MODE: ContentDeletionMode = 'own_only';
+
+export const CONTENT_DELETION_MODE_LABELS: Record<ContentDeletionMode, string> = {
+  own_only: 'Own Content Only',
+  any: 'Any Content',
+  disabled: 'Disabled',
+};
+
+export const CONTENT_DELETION_MODE_DESCRIPTIONS: Record<ContentDeletionMode, string> = {
+  own_only:
+    'Regular users can delete only content they posted themselves (their own project ideas, comments, and authored posts).',
+  any: 'Signed-in regular users can delete any visible posted content across the system (project ideas, posts, and comments).',
+  disabled:
+    'Content deletion is disabled for regular users entirely. Only administrators can delete posted content.',
+};
+
+export function normalizeContentDeletionMode(
+  value: string | null | undefined,
+): ContentDeletionMode {
+  if (value === 'own_only' || value === 'any' || value === 'disabled') {
+    return value;
+  }
+  return DEFAULT_CONTENT_DELETION_MODE;
+}
+
+/**
+ * Single source of truth for client-side content deletion checks across project ideas,
+ * club posts, and post comments. Mirrors PostgreSQL `public.can_current_user_delete_content`.
+ */
+export function canUserDeleteContent(params: {
+  isAdmin: boolean;
+  userId: string | null | undefined;
+  authorUserId: string | null | undefined;
+  mode: ContentDeletionMode;
+}): boolean {
+  const { isAdmin, userId, authorUserId, mode } = params;
+  if (isAdmin) return true;
+  if (!userId) return false;
+  if (mode === 'disabled') return false;
+  if (mode === 'any') return true;
+  return Boolean(authorUserId && authorUserId === userId);
+}
+
 export interface MemberVisibilityPermissions {
   memberCanViewRoster: boolean;
   memberCanViewAttendanceRates: boolean;
@@ -120,6 +165,7 @@ export interface MemberVisibilityPermissions {
 }
 
 export interface ClubSettings extends MemberVisibilityPermissions {
+  contentDeletionMode: ContentDeletionMode;
   updatedBy?: string;
   updatedAt: string;
 }

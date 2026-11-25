@@ -12,11 +12,14 @@ import {
   type DbProjectIdeaRow,
 } from '../lib/projectIdeasApi';
 import { supabase } from '../lib/supabase';
-import type {
-  ProjectIdea,
-  ProjectIdeaFeedback,
-  ProjectIdeaInput,
-  ProjectIdeaReviewStatus,
+import {
+  DEFAULT_CONTENT_DELETION_MODE,
+  canUserDeleteContent,
+  type ContentDeletionMode,
+  type ProjectIdea,
+  type ProjectIdeaFeedback,
+  type ProjectIdeaInput,
+  type ProjectIdeaReviewStatus,
 } from '../types/projectIdeas';
 
 const SUBMIT_COOLDOWN_MS = 5_000;
@@ -25,6 +28,7 @@ export interface UseProjectIdeasOptions {
   userId: string | null;
   isAdmin: boolean;
   sharedIdeaVisibility: boolean;
+  contentDeletionMode?: ContentDeletionMode;
   responderName?: string;
 }
 
@@ -51,6 +55,7 @@ export function useProjectIdeas({
   userId,
   isAdmin,
   sharedIdeaVisibility,
+  contentDeletionMode = DEFAULT_CONTENT_DELETION_MODE,
   responderName = 'Club Admin',
 }: UseProjectIdeasOptions): UseProjectIdeasResult {
   const [ideas, setIdeas] = useState<ProjectIdea[]>([]);
@@ -62,6 +67,8 @@ export function useProjectIdeas({
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   const mountedRef = useRef(true);
+  const ideasRef = useRef<ProjectIdea[]>(ideas);
+  ideasRef.current = ideas;
   const activeUserIdRef = useRef<string | null>(userId);
   activeUserIdRef.current = userId;
   const prevUserIdRef = useRef<string | null>(userId);
@@ -293,12 +300,27 @@ export function useProjectIdeas({
     [responderName, userId],
   );
 
-  const removeIdea = useCallback(async (ideaId: string): Promise<void> => {
-    await deleteProjectIdea(ideaId);
-    if (mountedRef.current) {
-      setIdeas((prev) => prev.filter((item) => item.id !== ideaId));
-    }
-  }, []);
+  const removeIdea = useCallback(
+    async (ideaId: string): Promise<void> => {
+      const target = ideasRef.current.find((item) => item.id === ideaId);
+      if (
+        !canUserDeleteContent({
+          isAdmin,
+          userId,
+          authorUserId: target?.submittedByUserId,
+          mode: contentDeletionMode,
+        })
+      ) {
+        throw new Error('You do not have permission to delete this project idea under the current policy.');
+      }
+
+      await deleteProjectIdea(ideaId);
+      if (mountedRef.current) {
+        setIdeas((prev) => prev.filter((item) => item.id !== ideaId));
+      }
+    },
+    [contentDeletionMode, isAdmin, userId],
+  );
 
   return {
     ideas,

@@ -290,3 +290,27 @@ export function PixelLinkIcon(props: IconProps) {
     </svg>
   );
 }
+
+export function PixelKeyIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M4 3h5v2h1v2h4v2h-1v2h-2V9h-1v2H8V9H6v2H4v-1H2V5h2V3zm0 2v4h2V5H4z" />
+    </svg>
+  );
+}
+
+export function PixelShieldIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M7 1h2v1h3v1h2v5h-1v3h-2v2H9v2H7v-2H5v-2H3V8H2V3h2V2h3V1zm0 2v1H4v4h1v2h2v2h2v-2h2V8h1V4H9V3H7z" />
+    </svg>
+  );
+}
+
+export function PixelBanIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M5 1h6v2h2v2h2v6h-2v2h-2v2H5v-2H3v-2H1V5h2V3h2V1zm0 2v2H3v6h2v2h6v-2h2V5h-2V3H5zm1 2h2v2h2v2h2v2h-2V9H8V7H6V5z" />
+    </svg>
+  );
+}
