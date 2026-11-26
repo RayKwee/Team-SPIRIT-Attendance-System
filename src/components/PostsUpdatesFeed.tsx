@@ -11,12 +11,19 @@ import {
   type ContentDeletionMode,
 } from '../types/projectIdeas';
 import { formatSessionDate, formatTimestamp } from '../utils/date';
+import {
+  shouldDeferContextMenu,
+  useContextMenu,
+  type ContextMenuItem,
+} from './AppContextMenu';
 import { ConfirmDialog } from './ConfirmDialog';
 import {
   PixelAlertIcon,
   PixelCalendarIcon,
+  PixelChatIcon,
   PixelCheckIcon,
   PixelCloseIcon,
+  PixelCopyIcon,
   PixelEditIcon,
   PixelLinkIcon,
   PixelMegaphoneIcon,
@@ -100,6 +107,7 @@ export function PostsUpdatesFeed({
   const postPinnedId = useId();
 
   const titleInputRef = useRef<HTMLInputElement | null>(null);
+  const { openContextMenu } = useContextMenu();
 
   const [categoryFilter, setCategoryFilter] = useState<'all' | ClubPostCategory>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -624,6 +632,103 @@ export function PostsUpdatesFeed({
                 <article
                   key={post.id}
                   className={`club-post-card ${post.isPinned ? 'is-pinned' : ''}`}
+                  onContextMenu={(event) => {
+                    if (shouldDeferContextMenu(event, { excludeSelector: '.post-comments-thread' })) {
+                      return;
+                    }
+                    const menuItems: ContextMenuItem[] = [
+                      {
+                        type: 'action',
+                        id: `post-copy-${post.id}`,
+                        label: 'Copy Announcement Text',
+                        icon: <PixelCopyIcon width={13} height={13} />,
+                        onSelect: () => {
+                          const snippet = `${post.title}\n\n${post.content}`;
+                          void navigator.clipboard?.writeText(snippet).then(
+                            () =>
+                              onNotify?.({
+                                tone: 'success',
+                                tag: 'Copied',
+                                message: 'Copied announcement text to clipboard.',
+                              }),
+                            () => undefined,
+                          );
+                        },
+                      },
+                      {
+                        type: 'action',
+                        id: `post-comments-${post.id}`,
+                        label: commentsExpanded
+                          ? 'Hide Comments'
+                          : `Show Comments (${postComments.length})`,
+                        icon: <PixelChatIcon width={13} height={13} />,
+                        onSelect: () => handleToggleComments(post.id),
+                      },
+                    ];
+
+                    if (post.resourceUrl) {
+                      const url = post.resourceUrl;
+                      menuItems.push({
+                        type: 'action',
+                        id: `post-link-${post.id}`,
+                        label: 'Copy Resource Link',
+                        icon: <PixelLinkIcon width={13} height={13} />,
+                        onSelect: () => {
+                          void navigator.clipboard?.writeText(url).then(
+                            () =>
+                              onNotify?.({
+                                tone: 'success',
+                                tag: 'Copied',
+                                message: 'Copied resource link to clipboard.',
+                              }),
+                            () => undefined,
+                          );
+                        },
+                      });
+                    }
+
+                    if (isAdmin) {
+                      menuItems.push(
+                        { type: 'separator', id: `post-admin-sep-${post.id}` },
+                        {
+                          type: 'action',
+                          id: `post-pin-${post.id}`,
+                          label: post.isPinned ? 'Unpin Announcement' : 'Pin to Top',
+                          icon: <PixelPinIcon width={13} height={13} />,
+                          disabled: isBusy,
+                          onSelect: () => void handleTogglePin(post),
+                        },
+                        {
+                          type: 'action',
+                          id: `post-edit-${post.id}`,
+                          label: 'Edit Announcement',
+                          icon: <PixelEditIcon width={13} height={13} />,
+                          disabled: isBusy,
+                          onSelect: () => openEditModal(post),
+                        },
+                      );
+                    }
+
+                    if (canDeletePost) {
+                      menuItems.push(
+                        { type: 'separator', id: `post-del-sep-${post.id}` },
+                        {
+                          type: 'action',
+                          id: `post-delete-${post.id}`,
+                          label: 'Delete Announcement',
+                          icon: <PixelTrashIcon width={13} height={13} />,
+                          danger: true,
+                          disabled: isBusy,
+                          onSelect: () => setPendingDeletePost(post),
+                        },
+                      );
+                    }
+
+                    openContextMenu(event, menuItems, {
+                      header: CLUB_POST_CATEGORY_LABELS[post.category],
+                      targetEl: event.currentTarget,
+                    });
+                  }}
                 >
                   <div className="club-post-card-head">
                     <div className="club-post-badges">

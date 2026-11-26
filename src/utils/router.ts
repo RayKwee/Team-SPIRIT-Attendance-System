@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type MouseEvent } from 'react';
 
-export type AppPage = 'landing' | 'lounge' | 'tracker' | 'calendar' | 'ideas';
+export type AppPage = 'landing' | 'lounge' | 'games' | 'tracker' | 'calendar' | 'ideas';
 
 /** Returns true when the active page belongs to the isolated Attendance & Ops tools section. */
 export function isAttendancePage(page: AppPage): boolean {
@@ -10,6 +10,7 @@ export function isAttendancePage(page: AppPage): boolean {
 const ROUTE_TITLES: Record<AppPage, string> = {
   landing: 'Team SPIRIT — Club Hub',
   lounge: 'Team SPIRIT — Student Lounge',
+  games: 'Team SPIRIT — Arcade Games',
   tracker: 'Team SPIRIT — Attendance Tools',
   calendar: 'Team SPIRIT — Attendance Calendar',
   ideas: 'Team SPIRIT — Project Ideas',
@@ -46,6 +47,9 @@ export function getPageFromPathname(pathname: string): AppPage {
   if (normalized.endsWith('/ideas') || normalized.endsWith('/ideas.html')) {
     return 'ideas';
   }
+  if (normalized.endsWith('/games') || normalized.endsWith('/games.html')) {
+    return 'games';
+  }
   return 'landing';
 }
 
@@ -54,6 +58,7 @@ export function getRouteHref(page: AppPage): string {
   const baseUrl = import.meta.env.BASE_URL || '/';
   const normalizedBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
   if (page === 'lounge') return `${normalizedBase}lounge`;
+  if (page === 'games') return `${normalizedBase}games`;
   if (page === 'tracker') return `${normalizedBase}attendance`;
   if (page === 'calendar') return `${normalizedBase}calendar`;
   if (page === 'ideas') return `${normalizedBase}ideas`;
@@ -111,6 +116,7 @@ export function useAppRoute(): [AppPage, (page: AppPage) => void] {
       if (
         customEvent.detail === 'landing' ||
         customEvent.detail === 'lounge' ||
+        customEvent.detail === 'games' ||
         customEvent.detail === 'tracker' ||
         customEvent.detail === 'calendar' ||
         customEvent.detail === 'ideas'

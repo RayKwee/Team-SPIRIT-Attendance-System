@@ -7,6 +7,7 @@ import {
   type AppPage,
 } from '../utils/router';
 import {
+  PixelGamepadIcon,
   PixelIdeaIcon,
   PixelLockIcon,
   PixelLoungeIcon,
@@ -46,6 +47,11 @@ const PRIMARY_NAV_ITEMS: {
     page: 'lounge',
     label: 'Lounge',
     description: 'Announcements & casual student chat',
+  },
+  {
+    page: 'games',
+    label: 'Games',
+    description: 'Play arcade games & climb the club leaderboards',
   },
   {
     page: 'ideas',
@@ -144,6 +150,8 @@ export function Header({
             >
               {item.page === 'lounge' ? (
                 <PixelLoungeIcon />
+              ) : item.page === 'games' ? (
+                <PixelGamepadIcon />
               ) : item.page === 'ideas' ? (
                 <PixelIdeaIcon />
               ) : (

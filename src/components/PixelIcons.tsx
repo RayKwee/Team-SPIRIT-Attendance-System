@@ -354,3 +354,35 @@ export function PixelToolsIcon(props: IconProps) {
     </svg>
   );
 }
+
+export function PixelSmileIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M5 1h6v2H5V1zM3 3h2v2H3V3zm8 0h2v2h-2V3zM1 5h2v6H1V5zm12 0h2v6h-2V5zM5 6h2v2H5V6zm4 0h2v2H9V6zM5 10h6v1H5v-1zm1 1h4v1H6v-1zM3 11h2v2H3v-2zm8 0h2v2h-2v-2zm-6 2h6v2H5v-2z" />
+    </svg>
+  );
+}
+
+export function PixelGamepadIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M3 4h10v1h2v7h-2v1h-2v-2H5v2H3v-1H1V5h2V4zm2 2v1H4v2h1v1h1V9h1V7H6V6H5zm6 0v2h2V6h-2zm-1 2v2h2V8h-2z" />
+    </svg>
+  );
+}
+
+export function PixelTrophyIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M4 1h8v2h3v4h-2v1h-2v2H9v2h3v2H4v-2h3v-2H5V8H3V7H1V3h3V1zM3 4v2h1V4H3zm9 0v2h1V4h-1z" />
+    </svg>
+  );
+}
+
+export function PixelExpandIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M1 1h5v2H3v3H1V1zm9 0h5v5h-2V3h-3V1zM1 10h2v3h3v2H1v-5zm12 0h2v5h-5v-2h3v-3z" />
+    </svg>
+  );
+}

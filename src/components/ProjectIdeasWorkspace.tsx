@@ -6,6 +6,7 @@ import {
   useState,
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
 } from 'react';
 import { useProjectIdeas } from '../hooks/useProjectIdeas';
 import type { ClubMember, ViewMode } from '../types/attendance';
@@ -20,11 +21,17 @@ import {
   type ProjectIdeasSortMode,
 } from '../types/projectIdeas';
 import { formatTimestamp } from '../utils/date';
+import {
+  shouldDeferContextMenu,
+  useContextMenu,
+  type ContextMenuItem,
+} from './AppContextMenu';
 import { ConfirmDialog } from './ConfirmDialog';
 import {
   PixelAlertIcon,
   PixelCheckIcon,
   PixelCloseIcon,
+  PixelCopyIcon,
   PixelEditIcon,
   PixelEyeIcon,
   PixelEyeOffIcon,
@@ -114,6 +121,7 @@ export function ProjectIdeasWorkspace({
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
   const descriptionInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const { openContextMenu } = useContextMenu();
 
   const profileAuthorName = resolveProfileAuthorName(linkedMember, userEmail);
 
@@ -472,6 +480,77 @@ export function ProjectIdeasWorkspace({
       event.preventDefault();
       setSelectedIdeaId(ideaId);
     }
+  }
+
+  function handleIdeaContextMenu(
+    event: ReactMouseEvent<HTMLElement>,
+    idea: ProjectIdea,
+    canDeleteIdea: boolean,
+  ) {
+    if (shouldDeferContextMenu(event)) return;
+    const isBusy = Boolean(busyActionId);
+    const items: ContextMenuItem[] = [
+      {
+        type: 'action',
+        id: `idea-open-${idea.id}`,
+        label: 'Open Idea Details',
+        icon: <PixelEyeIcon width={13} height={13} />,
+        onSelect: () => setSelectedIdeaId(idea.id),
+      },
+      {
+        type: 'action',
+        id: `idea-copy-${idea.id}`,
+        label: 'Copy Idea Summary',
+        icon: <PixelCopyIcon width={13} height={13} />,
+        onSelect: () => {
+          void navigator.clipboard
+            ?.writeText(`${idea.title} (by ${idea.authorName})\n\n${idea.description}`)
+            .then(
+              () =>
+                onNotify?.({
+                  tone: 'success',
+                  tag: 'Copied',
+                  message: 'Copied project idea to clipboard.',
+                }),
+              () => undefined,
+            );
+        },
+      },
+    ];
+
+    if (isAdmin) {
+      items.push(
+        { type: 'separator', id: `idea-mod-sep-${idea.id}` },
+        {
+          type: 'action',
+          id: `idea-highlight-${idea.id}`,
+          label: idea.isHighlighted ? 'Remove Highlight' : 'Highlight Idea',
+          icon: <PixelStarIcon width={13} height={13} />,
+          disabled: isBusy,
+          onSelect: () => void handleToggleHighlight(idea),
+        },
+      );
+    }
+
+    if (canDeleteIdea) {
+      items.push(
+        { type: 'separator', id: `idea-del-sep-${idea.id}` },
+        {
+          type: 'action',
+          id: `idea-delete-${idea.id}`,
+          label: 'Delete Idea',
+          icon: <PixelTrashIcon width={13} height={13} />,
+          danger: true,
+          disabled: isBusy,
+          onSelect: () => setPendingDeleteIdea(idea),
+        },
+      );
+    }
+
+    openContextMenu(event, items, {
+      header: `Project Idea · ${idea.authorName}`,
+      targetEl: event.currentTarget,
+    });
   }
 
   return (
@@ -1019,6 +1098,9 @@ export function ProjectIdeasWorkspace({
                               tabIndex={0}
                               onClick={() => setSelectedIdeaId(idea.id)}
                               onKeyDown={(event) => handleCardKeyDown(event, idea.id)}
+                              onContextMenu={(event) =>
+                                handleIdeaContextMenu(event, idea, canDeleteIdea)
+                              }
                               aria-label={`View full project idea: ${idea.title} by ${idea.authorName}`}
                             >
                               <div className="idea-card-head">
@@ -1141,6 +1223,9 @@ export function ProjectIdeasWorkspace({
                               tabIndex={0}
                               onClick={() => setSelectedIdeaId(idea.id)}
                               onKeyDown={(event) => handleCardKeyDown(event, idea.id)}
+                              onContextMenu={(event) =>
+                                handleIdeaContextMenu(event, idea, canDeleteIdea)
+                              }
                             >
                               <div className="idea-list-main">
                                 <div className="idea-badges-row">

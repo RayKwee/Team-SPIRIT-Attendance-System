@@ -107,6 +107,10 @@ function shouldBypassStaticCache(request, url) {
     return true;
   }
 
+  if (url.origin === self.location.origin && url.pathname.includes('/games/')) {
+    return true;
+  }
+
   if (url.origin === self.location.origin && url.pathname.endsWith('/sw.js')) {
     return true;
   }
@@ -243,6 +247,12 @@ function getNavigationCandidatePaths(url) {
   if (normalizedPathname.endsWith('/ideas') || normalizedPathname.endsWith('/ideas.html')) {
     return ['./ideas', './'];
   }
+  if (normalizedPathname.endsWith('/games') || normalizedPathname.endsWith('/games.html')) {
+    return ['./games', './'];
+  }
+  if (normalizedPathname.endsWith('/lounge') || normalizedPathname.endsWith('/lounge.html')) {
+    return ['./lounge', './'];
+  }
   return ['./'];
 }
 
@@ -376,7 +386,7 @@ export function teamSpiritStaticCachePlugin(): Plugin {
       server.middlewares.use((req, _res, next) => {
         const incoming = req as { url?: string };
         if (incoming.url) {
-          const match = /^\/(tracker|calendar|ideas|updates)\/?(\?.*)?$/i.exec(incoming.url);
+          const match = /^\/(lounge|games|attendance|tracker|calendar|ideas|updates)\/?(\?.*)?$/i.exec(incoming.url);
           if (match) {
             incoming.url = `/${match[1].toLowerCase()}.html${match[2] ?? ''}`;
           }
@@ -388,6 +398,8 @@ export function teamSpiritStaticCachePlugin(): Plugin {
     generateBundle(_options, bundle) {
       const precacheSet = new Set<string>([
         './',
+        './lounge',
+        './games',
         './tracker',
         './calendar',
         './ideas',

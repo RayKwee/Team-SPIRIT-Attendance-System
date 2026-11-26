@@ -1,4 +1,10 @@
-import { useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import {
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+} from 'react';
 import type {
   AccessScope,
   AttendanceSession,
@@ -12,6 +18,11 @@ import {
   type SessionAttendanceSummary,
 } from '../utils/attendance';
 import { formatSessionDate, formatSessionTime, formatTimestamp } from '../utils/date';
+import {
+  shouldDeferContextMenu,
+  useContextMenu,
+  type ContextMenuItem,
+} from './AppContextMenu';
 import { ConfirmDialog } from './ConfirmDialog';
 import { MeetingVisibilityBadge } from './MeetingSettingsModal';
 import {
@@ -71,6 +82,7 @@ export function SessionHub({
   onOpenCreateSession,
 }: SessionHubProps) {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const { openContextMenu } = useContextMenu();
   const [searchQuery, setSearchQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<string>('all');
   const [pendingDeleteSession, setPendingDeleteSession] = useState<AttendanceSession | null>(null);
@@ -144,6 +156,75 @@ export function SessionHub({
     if (!activePendingDelete) return;
     onDeleteSession(activePendingDelete.id);
     setPendingDeleteSession(null);
+  }
+
+  function handleSessionContextMenu(
+    event: ReactMouseEvent<HTMLElement>,
+    session: AttendanceSession,
+  ) {
+    if (shouldDeferContextMenu(event)) return;
+    const canEdit = accessScope === 'local' || accessScope === 'admin';
+    const items: ContextMenuItem[] = [
+      {
+        type: 'action',
+        id: `session-open-${session.id}`,
+        label: 'Open Attendance Checklist',
+        icon: <PixelListIcon width={13} height={13} />,
+        onSelect: () => onSelectSession(session.id),
+      },
+      {
+        type: 'action',
+        id: `session-copy-${session.id}`,
+        label: 'Copy Session Details',
+        icon: <PixelCopyIcon width={13} height={13} />,
+        onSelect: () => {
+          const details = [
+            session.name,
+            `${formatSessionDate(session.date)} at ${formatSessionTime(session.time)}`,
+            session.location ? `Location: ${session.location}` : null,
+            session.description ? session.description : null,
+          ]
+            .filter(Boolean)
+            .join('\n');
+          void navigator.clipboard?.writeText(details).catch(() => undefined);
+        },
+      },
+    ];
+
+    if (canEdit) {
+      items.push(
+        { type: 'separator', id: `session-edit-sep-${session.id}` },
+        {
+          type: 'action',
+          id: `session-edit-${session.id}`,
+          label: 'Edit Meeting Settings',
+          icon: <PixelSettingsIcon width={13} height={13} />,
+          onSelect: () => onEditSession(session),
+        },
+        {
+          type: 'action',
+          id: `session-dup-${session.id}`,
+          label: 'Duplicate Session',
+          icon: <PixelCopyIcon width={13} height={13} />,
+          onSelect: () => onDuplicateSession(session),
+        },
+        { type: 'separator', id: `session-del-sep-${session.id}` },
+        {
+          type: 'action',
+          id: `session-del-${session.id}`,
+          label: 'Delete Session',
+          icon: <PixelTrashIcon width={13} height={13} />,
+          danger: true,
+          disabled: !canManageClubRecords,
+          onSelect: () => setPendingDeleteSession(session),
+        },
+      );
+    }
+
+    openContextMenu(event, items, {
+      header: `Session · ${formatSessionDate(session.date)}`,
+      targetEl: event.currentTarget,
+    });
   }
 
   const isMemberSelfScope = accessScope === 'member_self';
@@ -362,6 +443,7 @@ export function SessionHub({
                     tabIndex={0}
                     onClick={() => onSelectSession(session.id)}
                     onKeyDown={(event) => handleCardKeyDown(event, session.id)}
+                    onContextMenu={(event) => handleSessionContextMenu(event, session)}
                     aria-label={`Open attendance checklist for ${session.name} on ${formatSessionDate(session.date)}`}
                   >
                     <div className="session-hub-card-head">
@@ -533,13 +615,18 @@ export function SessionHub({
               const fillPercent = summary.rate ?? 0;
 
               return (
-                <article key={session.id} role="listitem" className="session-hub-row">
+                <article
+                  key={session.id}
+                  role="listitem"
+                  className="session-hub-row"
+                >
                   <div
                     className="session-hub-row-surface"
                     role="button"
                     tabIndex={0}
                     onClick={() => onSelectSession(session.id)}
                     onKeyDown={(event) => handleCardKeyDown(event, session.id)}
+                    onContextMenu={(event) => handleSessionContextMenu(event, session)}
                     aria-label={`Open attendance checklist for ${session.name} on ${formatSessionDate(session.date)}`}
                   >
                     <div className="session-hub-row-main">

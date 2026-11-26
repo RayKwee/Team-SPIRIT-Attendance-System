@@ -9,6 +9,7 @@ export default defineConfig({
       input: {
         main: 'index.html',
         lounge: 'lounge.html',
+        games: 'games.html',
         attendance: 'attendance.html',
         tracker: 'tracker.html',
         calendar: 'calendar.html',

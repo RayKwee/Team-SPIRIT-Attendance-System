@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useLoungeChat, type LoungeRoomId } from '../hooks/useLoungeChat';
 import type { AttendanceSession, ClubMember } from '../types/attendance';
 import type {
@@ -13,6 +13,7 @@ import { LoungeChatPanel } from './LoungeChatPanel';
 import {
   PixelCalendarIcon,
   PixelChatIcon,
+  PixelGamepadIcon,
   PixelIdeaIcon,
   PixelLoungeIcon,
   PixelMegaphoneIcon,
@@ -44,6 +45,7 @@ interface LoungeWorkspaceProps {
   onAddComment: (input: ClubPostCommentInput) => Promise<ClubPostComment>;
   onDeleteComment: (commentId: string) => Promise<void>;
   onOpenCloudSync: () => void;
+  onNavigateGames: () => void;
   onNavigateIdeas: () => void;
   onNavigateAttendanceCalendar: () => void;
   onNotify?: (options: {
@@ -75,8 +77,8 @@ function getTimeGreeting(): string {
 
 /**
  * Relaxed, welcoming Team SPIRIT Student Lounge:
- * Prioritizes club announcements and casual real-time hangout chat while keeping
- * technical attendance tools completely out of the way.
+ * Prioritizes club announcements and live hangout chat (view-only for unauthenticated
+ * visitors, interactive for logged-in members) while keeping attendance tools isolated.
  */
 export function LoungeWorkspace({
   userId,
@@ -101,6 +103,7 @@ export function LoungeWorkspace({
   onAddComment,
   onDeleteComment,
   onOpenCloudSync,
+  onNavigateGames,
   onNavigateIdeas,
   onNavigateAttendanceCalendar,
   onNotify,
@@ -109,34 +112,37 @@ export function LoungeWorkspace({
   const [activeRoom, setActiveRoom] = useState<LoungeRoomId>('general');
 
   const baseProfileName = resolveDisplayName(linkedMember, userEmail);
-  const authorRole: 'admin' | 'member' | 'guest' = !userId
-    ? 'guest'
-    : isAdmin
-      ? 'admin'
-      : 'member';
+
+  const handleChatError = useCallback(
+    (message: string) => {
+      onNotify?.({
+        tone: 'warning',
+        tag: 'Chill Chat',
+        message,
+      });
+    },
+    [onNotify],
+  );
 
   const {
     messages,
     onlineMembers,
+    isLoading: isChatLoading,
     isLiveConnected: isChatLiveConnected,
-    actorKey,
-    guestNickname,
+    isDbBacked,
     vibe,
-    setGuestNickname,
     setVibe,
     sendMessage,
+    editMessage,
     toggleReaction,
     deleteMessage,
   } = useLoungeChat({
     userId,
     authorName: baseProfileName,
-    authorRole,
+    isAdmin,
     activeRoom,
+    onError: handleChatError,
   });
-
-  const chatDisplayName = userId
-    ? baseProfileName
-    : guestNickname.trim() || 'Student Guest';
 
   const nextUpcomingSession = useMemo(() => {
     const todayIso = toIsoDateString(new Date());
@@ -151,9 +157,9 @@ export function LoungeWorkspace({
   }, [sessions]);
 
   const greetingFirstName = useMemo(() => {
-    if (!userId && !guestNickname.trim()) return null;
-    return chatDisplayName.split(/\s+/)[0] || chatDisplayName;
-  }, [chatDisplayName, guestNickname, userId]);
+    if (!userId) return null;
+    return baseProfileName.split(/\s+/)[0] || baseProfileName;
+  }, [baseProfileName, userId]);
 
   return (
     <div className="lounge-workspace" data-tutorial-target="lounge-hub">
@@ -195,6 +201,11 @@ export function LoungeWorkspace({
               </span>
             </button>
           )}
+
+          <button type="button" className="lounge-pitch-shortcut" onClick={onNavigateGames}>
+            <PixelGamepadIcon width={13} height={13} />
+            <span>Arcade Games</span>
+          </button>
 
           <button type="button" className="lounge-pitch-shortcut" onClick={onNavigateIdeas}>
             <PixelIdeaIcon width={13} height={13} />
@@ -258,20 +269,21 @@ export function LoungeWorkspace({
             activeRoom={activeRoom}
             messages={messages}
             onlineMembers={onlineMembers}
+            isLoading={isChatLoading}
             isLiveConnected={isChatLiveConnected}
-            actorKey={actorKey}
+            isDbBacked={isDbBacked}
             userId={userId}
             isAdmin={isAdmin}
-            displayName={chatDisplayName}
-            guestNickname={guestNickname}
+            displayName={baseProfileName}
             vibe={vibe}
             onSelectRoom={setActiveRoom}
-            onChangeGuestNickname={setGuestNickname}
             onChangeVibe={setVibe}
             onSendMessage={sendMessage}
+            onEditMessage={editMessage}
             onToggleReaction={toggleReaction}
             onDeleteMessage={deleteMessage}
             onOpenCloudSync={onOpenCloudSync}
+            onNotify={onNotify}
           />
         </div>
       </div>

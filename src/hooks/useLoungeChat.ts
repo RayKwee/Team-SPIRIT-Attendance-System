@@ -1,8 +1,21 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  deleteLoungeChatMessage,
+  fetchLoungeChatHistory,
+  insertLoungeChatMessage,
+  isValidLoungeRoom,
+  loungeMessageFromDbRow,
+  setLoungeChatReaction,
+  updateLoungeChatMessage,
+  type DbLoungeChatMessageRow,
+  type DbLoungeChatReactionRow,
+  type LoungeChatMessage,
+  type LoungeReplyRef,
+  type LoungeRoomId,
+} from '../lib/loungeChatApi';
 import { supabase } from '../lib/supabase';
-import { generateId } from '../utils/attendance';
 
-export type LoungeRoomId = 'general' | 'build-talk' | 'off-topic';
+export type { LoungeChatMessage, LoungeReplyRef, LoungeRoomId };
 
 export interface LoungeRoomMeta {
   id: LoungeRoomId;
@@ -28,93 +41,52 @@ export const LOUNGE_ROOMS: LoungeRoomMeta[] = [
   },
 ];
 
-export const LOUNGE_QUICK_REACTIONS = ['🔥', '✨', '😂', '👍', '🎉'] as const;
-
 export const LOUNGE_VIBES = ['Chilling', 'Building', 'Studying', 'Listening to music'] as const;
 export type LoungeVibe = (typeof LOUNGE_VIBES)[number];
-
-export interface LoungeReplyRef {
-  id: string;
-  authorName: string;
-  snippet: string;
-}
-
-export interface LoungeChatMessage {
-  id: string;
-  room: LoungeRoomId;
-  senderClientId: string;
-  authorUserId?: string;
-  authorName: string;
-  authorRole: 'admin' | 'member' | 'guest';
-  content: string;
-  replyTo?: LoungeReplyRef;
-  reactions: Record<string, string[]>;
-  createdAt: string;
-}
 
 export interface LoungeOnlineMember {
   key: string;
   name: string;
-  role: 'admin' | 'member' | 'guest';
+  role: 'admin' | 'member';
   vibe: LoungeVibe;
   room: LoungeRoomId;
 }
 
-const CHAT_STORAGE_KEY = 'team-spirit:lounge-chat:v1';
-const CLIENT_ID_STORAGE_KEY = 'team-spirit:lounge-client-id:v1';
-const NICKNAME_STORAGE_KEY = 'team-spirit:lounge-nickname:v1';
-const MAX_STORED_MESSAGES = 180;
-const REALTIME_CHANNEL_NAME = 'team-spirit-student-lounge-v1';
+const CHAT_FALLBACK_STORAGE_KEY = 'team-spirit:lounge-chat-cache:v2';
+const BROADCAST_CHANNEL_NAME = 'team-spirit-student-lounge-live-v2';
+const BROWSER_BC_NAME = 'team-spirit-lounge-bc-v2';
+const MAX_CACHED_MESSAGES = 200;
 
-type ChatBroadcastEvent =
+// Module-level teardown promise prevents React StrictMode / rapid route transitions
+// from colliding with an in-flight `supabase.removeChannel()` on the same topic.
+let pendingBroadcastTeardown: Promise<void> = Promise.resolve();
+let instanceCounter = 0;
+
+type ChatRealtimeEvent =
   | { type: 'message'; payload: LoungeChatMessage }
-  | { type: 'reaction'; payload: { messageId: string; emoji: string; actorKey: string } }
+  | { type: 'edit'; payload: { messageId: string; content: string; updatedAt: string } }
+  | {
+      type: 'reaction';
+      payload: { messageId: string; emoji: string; userId: string; add: boolean };
+    }
   | { type: 'delete'; payload: { messageId: string } };
 
-function getOrCreateClientId(): string {
-  if (typeof window === 'undefined') return 'client-ssr';
-  try {
-    const existing = window.localStorage.getItem(CLIENT_ID_STORAGE_KEY);
-    if (existing && existing.trim().length > 0) return existing;
-    const created = generateId('lounge');
-    window.localStorage.setItem(CLIENT_ID_STORAGE_KEY, created);
-    return created;
-  } catch {
-    return generateId('lounge');
+function generateUuid(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
   }
+  // RFC4122 v4 fallback for older browsers
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 }
 
-function loadSavedNickname(): string {
-  if (typeof window === 'undefined') return '';
-  try {
-    return window.localStorage.getItem(NICKNAME_STORAGE_KEY) ?? '';
-  } catch {
-    return '';
-  }
-}
-
-function saveNickname(value: string): void {
-  if (typeof window === 'undefined') return;
-  try {
-    const trimmed = value.trim();
-    if (trimmed) {
-      window.localStorage.setItem(NICKNAME_STORAGE_KEY, trimmed);
-    } else {
-      window.localStorage.removeItem(NICKNAME_STORAGE_KEY);
-    }
-  } catch {
-    // Ignore storage errors in restricted contexts.
-  }
-}
-
-function isValidRoom(room: unknown): room is LoungeRoomId {
-  return room === 'general' || room === 'build-talk' || room === 'off-topic';
-}
-
-function loadStoredMessages(): LoungeChatMessage[] {
+function loadCachedMessages(): LoungeChatMessage[] {
   if (typeof window === 'undefined') return [];
   try {
-    const raw = window.localStorage.getItem(CHAT_STORAGE_KEY);
+    const raw = window.localStorage.getItem(CHAT_FALLBACK_STORAGE_KEY);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -124,7 +96,8 @@ function loadStoredMessages(): LoungeChatMessage[] {
       const candidate = item as Partial<LoungeChatMessage>;
       if (
         typeof candidate.id !== 'string' ||
-        !isValidRoom(candidate.room) ||
+        !isValidLoungeRoom(candidate.room) ||
+        typeof candidate.authorUserId !== 'string' ||
         typeof candidate.authorName !== 'string' ||
         typeof candidate.content !== 'string' ||
         typeof candidate.createdAt !== 'string'
@@ -134,15 +107,9 @@ function loadStoredMessages(): LoungeChatMessage[] {
       valid.push({
         id: candidate.id,
         room: candidate.room,
-        senderClientId:
-          typeof candidate.senderClientId === 'string' ? candidate.senderClientId : 'unknown',
-        authorUserId:
-          typeof candidate.authorUserId === 'string' ? candidate.authorUserId : undefined,
+        authorUserId: candidate.authorUserId,
         authorName: candidate.authorName,
-        authorRole:
-          candidate.authorRole === 'admin' || candidate.authorRole === 'member'
-            ? candidate.authorRole
-            : 'guest',
+        authorRole: candidate.authorRole === 'admin' ? 'admin' : 'member',
         content: candidate.content,
         replyTo:
           candidate.replyTo &&
@@ -156,230 +123,557 @@ function loadStoredMessages(): LoungeChatMessage[] {
             ? candidate.reactions
             : {},
         createdAt: candidate.createdAt,
+        updatedAt: typeof candidate.updatedAt === 'string' ? candidate.updatedAt : undefined,
       });
     }
-    return valid.slice(-MAX_STORED_MESSAGES);
+    return valid.slice(-MAX_CACHED_MESSAGES);
   } catch {
     return [];
   }
 }
 
-function persistMessages(messages: LoungeChatMessage[]): void {
+function persistCachedMessages(messages: LoungeChatMessage[]): void {
   if (typeof window === 'undefined') return;
   try {
     window.localStorage.setItem(
-      CHAT_STORAGE_KEY,
-      JSON.stringify(messages.slice(-MAX_STORED_MESSAGES)),
+      CHAT_FALLBACK_STORAGE_KEY,
+      JSON.stringify(messages.slice(-MAX_CACHED_MESSAGES)),
     );
   } catch {
-    // Ignore quota/storage errors safely.
+    // Ignore storage quota errors safely.
   }
 }
 
-function applyReactionToggle(
+function upsertMessageList(
+  prev: LoungeChatMessage[],
+  incoming: LoungeChatMessage,
+): LoungeChatMessage[] {
+  const idx = prev.findIndex((item) => item.id === incoming.id);
+  if (idx >= 0) {
+    const existing = prev[idx];
+    // Preserve reactions already attached locally/from DB when updating canonical message metadata.
+    const mergedReactions: Record<string, string[]> = { ...existing.reactions };
+    for (const [emoji, users] of Object.entries(incoming.reactions)) {
+      const merged = new Set([...(mergedReactions[emoji] ?? []), ...users]);
+      if (merged.size > 0) {
+        mergedReactions[emoji] = Array.from(merged);
+      }
+    }
+    const next = [...prev];
+    next[idx] = { ...incoming, reactions: mergedReactions };
+    return next;
+  }
+  return [...prev, incoming]
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    .slice(-MAX_CACHED_MESSAGES);
+}
+
+function applyReactionMutation(
   messages: LoungeChatMessage[],
   messageId: string,
   emoji: string,
-  actorKey: string,
+  actorUserId: string,
+  add: boolean,
 ): LoungeChatMessage[] {
-  return messages.map((msg) => {
+  let changed = false;
+  const next = messages.map((msg) => {
     if (msg.id !== messageId) return msg;
-    const currentActors = msg.reactions[emoji] ?? [];
-    const hasReacted = currentActors.includes(actorKey);
-    const nextActors = hasReacted
-      ? currentActors.filter((id) => id !== actorKey)
-      : [...currentActors, actorKey];
+    const current = msg.reactions[emoji] ?? [];
+    const exists = current.includes(actorUserId);
+    if (add && exists) return msg;
+    if (!add && !exists) return msg;
+
+    changed = true;
+    const updatedUsers = add
+      ? [...current, actorUserId]
+      : current.filter((id) => id !== actorUserId);
     const nextReactions = { ...msg.reactions };
-    if (nextActors.length === 0) {
+    if (updatedUsers.length === 0) {
       delete nextReactions[emoji];
     } else {
-      nextReactions[emoji] = nextActors;
+      nextReactions[emoji] = updatedUsers;
     }
     return {
       ...msg,
       reactions: nextReactions,
     };
   });
+  return changed ? next : messages;
 }
 
 export interface UseLoungeChatOptions {
   userId: string | null;
   authorName: string;
-  authorRole: 'admin' | 'member' | 'guest';
+  isAdmin: boolean;
   activeRoom: LoungeRoomId;
+  onError?: (message: string) => void;
 }
 
 export interface UseLoungeChatResult {
   messages: LoungeChatMessage[];
   onlineMembers: LoungeOnlineMember[];
+  isLoading: boolean;
   isLiveConnected: boolean;
-  actorKey: string;
-  guestNickname: string;
+  isDbBacked: boolean;
   vibe: LoungeVibe;
-  setGuestNickname: (nickname: string) => void;
   setVibe: (vibe: LoungeVibe) => void;
-  sendMessage: (content: string, replyTo?: LoungeReplyRef) => LoungeChatMessage | null;
-  toggleReaction: (messageId: string, emoji: string) => void;
-  deleteMessage: (messageId: string) => void;
+  refreshHistory: () => Promise<void>;
+  sendMessage: (content: string, replyTo?: LoungeReplyRef) => Promise<LoungeChatMessage | null>;
+  editMessage: (messageId: string, content: string) => Promise<LoungeChatMessage | null>;
+  toggleReaction: (messageId: string, emoji: string) => Promise<void>;
+  deleteMessage: (messageId: string) => Promise<void>;
 }
 
 /**
- * Real-time student hangout chat powered by Supabase Realtime Broadcast & Presence
- * plus local browser persistence — requires zero database schema modifications.
+ * Real-time Student Lounge chat backed by Supabase Postgres (`lounge_chat_messages` &
+ * `lounge_chat_reactions`) + `postgres_changes` + serialized Realtime Broadcast/Presence
+ * + same-browser `BroadcastChannel`.
+ *
+ * - Unauthenticated visitors (`userId === null`) have strictly read-only live access.
+ * - Authenticated users can post messages, react with any emoji, and delete own messages.
  */
 export function useLoungeChat({
   userId,
   authorName,
-  authorRole,
+  isAdmin,
   activeRoom,
+  onError,
 }: UseLoungeChatOptions): UseLoungeChatResult {
-  const clientIdRef = useRef<string>(getOrCreateClientId());
-  const actorKey = userId ?? clientIdRef.current;
-
-  const [messages, setMessages] = useState<LoungeChatMessage[]>(() => loadStoredMessages());
-  const [guestNickname, setGuestNicknameState] = useState<string>(() => loadSavedNickname());
-  const [vibe, setVibe] = useState<LoungeVibe>('Chilling');
+  const [messages, setMessages] = useState<LoungeChatMessage[]>(() => loadCachedMessages());
   const [onlineMembers, setOnlineMembers] = useState<LoungeOnlineMember[]>([]);
-  const [isLiveConnected, setIsLiveConnected] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isDbBacked, setIsDbBacked] = useState(true);
+  const [isBroadcastLive, setIsBroadcastLive] = useState(false);
+  const [isDbRealtimeLive, setIsDbRealtimeLive] = useState(false);
+  const [vibe, setVibe] = useState<LoungeVibe>('Chilling');
 
-  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
-  const resolvedDisplayName = useMemo(() => {
-    if (userId) return authorName;
-    const custom = guestNickname.trim();
-    return custom || authorName || 'Club Member';
-  }, [authorName, guestNickname, userId]);
+  const mountedRef = useRef(true);
+  const messagesRef = useRef<LoungeChatMessage[]>(messages);
+  messagesRef.current = messages;
+  const isDbBackedRef = useRef(isDbBacked);
+  isDbBackedRef.current = isDbBacked;
+  const broadcastChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const isBroadcastReadyRef = useRef(false);
+  const browserBcRef = useRef<BroadcastChannel | null>(null);
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
 
-  const setGuestNickname = useCallback((nickname: string) => {
-    const cleaned = nickname.slice(0, 32);
-    setGuestNicknameState(cleaned);
-    saveNickname(cleaned);
+  const isLiveConnected = isBroadcastLive || isDbRealtimeLive;
+
+  const applyRealtimeEvent = useCallback((event: ChatRealtimeEvent) => {
+    if (!mountedRef.current) return;
+    if (event.type === 'message' && event.payload?.id) {
+      setMessages((prev) => {
+        const next = upsertMessageList(prev, event.payload);
+        persistCachedMessages(next);
+        return next;
+      });
+    } else if (event.type === 'edit' && event.payload?.messageId) {
+      const { messageId, content, updatedAt } = event.payload;
+      setMessages((prev) => {
+        const next = prev.map((item) =>
+          item.id === messageId ? { ...item, content, updatedAt } : item,
+        );
+        persistCachedMessages(next);
+        return next;
+      });
+    } else if (event.type === 'reaction' && event.payload?.messageId) {
+      const { messageId, emoji, userId: actorId, add } = event.payload;
+      setMessages((prev) => {
+        const next = applyReactionMutation(prev, messageId, emoji, actorId, add);
+        if (next !== prev) persistCachedMessages(next);
+        return next;
+      });
+    } else if (event.type === 'delete' && event.payload?.messageId) {
+      const { messageId } = event.payload;
+      setMessages((prev) => {
+        const next = prev.filter((item) => item.id !== messageId);
+        if (next.length !== prev.length) persistCachedMessages(next);
+        return next;
+      });
+    }
   }, []);
 
-  // Sync messages across tabs on the same browser via storage events.
+  const relayEvent = useCallback((event: ChatRealtimeEvent) => {
+    // 1. Instant 0ms delivery to other tabs on the same browser
+    try {
+      browserBcRef.current?.postMessage(event);
+    } catch {
+      // Ignore BroadcastChannel errors in restricted contexts.
+    }
+
+    // 2. Instant cross-device delivery over Supabase Realtime Broadcast
+    const ch = broadcastChannelRef.current;
+    if (ch) {
+      void ch
+        .send({
+          type: 'broadcast',
+          event: 'lounge_event',
+          payload: event,
+        })
+        .catch(() => {});
+    }
+  }, []);
+
+  const refreshHistory = useCallback(async () => {
+    try {
+      const result = await fetchLoungeChatHistory(MAX_CACHED_MESSAGES);
+      if (!mountedRef.current) return;
+      setIsDbBacked(result.schemaReady);
+      isDbBackedRef.current = result.schemaReady;
+      if (result.schemaReady) {
+        setMessages(result.messages);
+        persistCachedMessages(result.messages);
+      }
+    } catch {
+      // Keep existing messages visible if temporarily offline.
+    } finally {
+      if (mountedRef.current) {
+        setIsLoading(false);
+      }
+    }
+  }, []);
+
+  // Load canonical history on mount, reconnect, and tab foreground.
   useEffect(() => {
+    mountedRef.current = true;
+    void refreshHistory();
+
+    function handleOnline() {
+      void refreshHistory();
+    }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === 'visible') {
+        void refreshHistory();
+      }
+    }
+
+    window.addEventListener('online', handleOnline);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      mountedRef.current = false;
+      window.removeEventListener('online', handleOnline);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [refreshHistory]);
+
+  // Same-browser cross-tab BroadcastChannel + storage fallback.
+  useEffect(() => {
+    let bc: BroadcastChannel | null = null;
+    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+      try {
+        bc = new BroadcastChannel(BROWSER_BC_NAME);
+        bc.onmessage = (msgEvent: MessageEvent<ChatRealtimeEvent>) => {
+          if (msgEvent.data) {
+            applyRealtimeEvent(msgEvent.data);
+          }
+        };
+        browserBcRef.current = bc;
+      } catch {
+        bc = null;
+      }
+    }
+
     function handleStorage(event: StorageEvent) {
-      if (event.key === CHAT_STORAGE_KEY) {
-        setMessages(loadStoredMessages());
-      } else if (event.key === NICKNAME_STORAGE_KEY) {
-        setGuestNicknameState(loadSavedNickname());
+      if (event.key === CHAT_FALLBACK_STORAGE_KEY && !isDbBackedRef.current) {
+        setMessages(loadCachedMessages());
       }
     }
 
     window.addEventListener('storage', handleStorage);
-    return () => window.removeEventListener('storage', handleStorage);
-  }, []);
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      if (bc) {
+        bc.close();
+      }
+      if (browserBcRef.current === bc) {
+        browserBcRef.current = null;
+      }
+    };
+  }, [applyRealtimeEvent]);
 
-  // Connect to Supabase Realtime Broadcast & Presence for live cross-device hangout chat.
+  // 1. Dedicated Postgres Changes channel (unique topic per mount -> zero teardown races).
   useEffect(() => {
     let active = true;
-    const presenceKey = `${actorKey}:${clientIdRef.current.slice(-6)}`;
+    let reconnectTimer: number | null = null;
+    let reconnectAttempt = 0;
+    let currentChannel: ReturnType<typeof supabase.channel> | null = null;
 
-    const channel = supabase.channel(REALTIME_CHANNEL_NAME, {
-      config: {
-        broadcast: { self: false },
-        presence: { key: presenceKey },
-      },
-    });
-    channelRef.current = channel;
-
-    function syncPresenceList() {
-      if (!active) return;
-      const state = channel.presenceState<LoungeOnlineMember>();
-      const seen = new Map<string, LoungeOnlineMember>();
-      for (const entries of Object.values(state)) {
-        for (const entry of entries) {
-          if (!entry || typeof entry.name !== 'string') continue;
-          const dedupeKey = entry.key || entry.name;
-          seen.set(dedupeKey, {
-            key: dedupeKey,
-            name: entry.name,
-            role:
-              entry.role === 'admin' || entry.role === 'member' ? entry.role : 'guest',
-            vibe: LOUNGE_VIBES.includes(entry.vibe) ? entry.vibe : 'Chilling',
-            room: isValidRoom(entry.room) ? entry.room : 'general',
-          });
-        }
+    function cleanupChannel() {
+      const ch = currentChannel;
+      currentChannel = null;
+      if (ch) {
+        void Promise.resolve(supabase.removeChannel(ch)).catch(() => {});
       }
-      setOnlineMembers(Array.from(seen.values()));
     }
 
-    channel
-      .on('presence', { event: 'sync' }, syncPresenceList)
-      .on('broadcast', { event: 'lounge_event' }, ({ payload }) => {
-        if (!active || !payload) return;
-        const event = payload as ChatBroadcastEvent;
-        if (event.type === 'message' && event.payload?.id) {
-          setMessages((prev) => {
-            if (prev.some((item) => item.id === event.payload.id)) return prev;
-            const next = [...prev, event.payload].slice(-MAX_STORED_MESSAGES);
-            persistMessages(next);
-            return next;
-          });
-        } else if (event.type === 'reaction' && event.payload?.messageId) {
-          const { messageId, emoji, actorKey: remoteActorKey } = event.payload;
-          setMessages((prev) => {
-            const next = applyReactionToggle(prev, messageId, emoji, remoteActorKey);
-            persistMessages(next);
-            return next;
-          });
-        } else if (event.type === 'delete' && event.payload?.messageId) {
-          const { messageId } = event.payload;
-          setMessages((prev) => {
-            const next = prev.filter((item) => item.id !== messageId);
-            persistMessages(next);
-            return next;
-          });
-        }
-      })
-      .subscribe((status) => {
-        if (!active) return;
-        const connected = status === 'SUBSCRIBED';
-        setIsLiveConnected(connected);
-        if (connected) {
-          void channel.track({
-            key: actorKey,
-            name: resolvedDisplayName,
-            role: authorRole,
-            vibe,
-            room: activeRoom,
-          } satisfies LoungeOnlineMember);
-        }
-      });
+    function connectDbChannel() {
+      if (!active) return;
+      cleanupChannel();
+
+      const uniqueId = ++instanceCounter;
+      const channel = supabase
+        .channel(`team-spirit-lounge-db-${uniqueId}`)
+        .on(
+          'postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'lounge_chat_messages' },
+          (payload) => {
+            if (!active || !payload.new) return;
+            const incoming = loungeMessageFromDbRow(payload.new as DbLoungeChatMessageRow, {});
+            setIsDbBacked(true);
+            isDbBackedRef.current = true;
+            setMessages((prev) => {
+              const next = upsertMessageList(prev, incoming);
+              persistCachedMessages(next);
+              return next;
+            });
+          },
+        )
+        .on(
+          'postgres_changes',
+          { event: 'UPDATE', schema: 'public', table: 'lounge_chat_messages' },
+          (payload) => {
+            if (!active || !payload.new) return;
+            const incoming = loungeMessageFromDbRow(payload.new as DbLoungeChatMessageRow, {});
+            setMessages((prev) => {
+              const next = upsertMessageList(prev, incoming);
+              persistCachedMessages(next);
+              return next;
+            });
+          },
+        )
+        .on(
+          'postgres_changes',
+          { event: 'DELETE', schema: 'public', table: 'lounge_chat_messages' },
+          (payload) => {
+            if (!active) return;
+            const oldId = (payload.old as { id?: string } | null)?.id;
+            if (!oldId) return;
+            setMessages((prev) => {
+              const next = prev.filter((item) => item.id !== oldId);
+              if (next.length !== prev.length) persistCachedMessages(next);
+              return next;
+            });
+          },
+        )
+        .on(
+          'postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'lounge_chat_reactions' },
+          (payload) => {
+            if (!active || !payload.new) return;
+            const row = payload.new as DbLoungeChatReactionRow;
+            if (!row.message_id || !row.user_id || !row.emoji) return;
+            setMessages((prev) => {
+              const next = applyReactionMutation(prev, row.message_id, row.emoji, row.user_id, true);
+              if (next !== prev) persistCachedMessages(next);
+              return next;
+            });
+          },
+        )
+        .on(
+          'postgres_changes',
+          { event: 'DELETE', schema: 'public', table: 'lounge_chat_reactions' },
+          (payload) => {
+            if (!active || !payload.old) return;
+            const row = payload.old as Partial<DbLoungeChatReactionRow>;
+            if (row.message_id && row.user_id && row.emoji) {
+              setMessages((prev) => {
+                const next = applyReactionMutation(
+                  prev,
+                  row.message_id!,
+                  row.emoji!,
+                  row.user_id!,
+                  false,
+                );
+                if (next !== prev) persistCachedMessages(next);
+                return next;
+              });
+            } else {
+              // If replica identity wasn't full, refresh history cleanly to stay consistent.
+              void refreshHistory();
+            }
+          },
+        )
+        .subscribe((status) => {
+          if (!active) return;
+          if (status === 'SUBSCRIBED') {
+            reconnectAttempt = 0;
+            setIsDbRealtimeLive(true);
+            return;
+          }
+          if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+            setIsDbRealtimeLive(false);
+            if (reconnectTimer === null && active) {
+              const delayMs = Math.min(2000 * Math.pow(2, reconnectAttempt), 15000);
+              reconnectAttempt += 1;
+              reconnectTimer = window.setTimeout(() => {
+                reconnectTimer = null;
+                connectDbChannel();
+              }, delayMs);
+            }
+          }
+        });
+
+      currentChannel = channel;
+    }
+
+    connectDbChannel();
 
     return () => {
       active = false;
-      channelRef.current = null;
-      void Promise.resolve(supabase.removeChannel(channel)).catch(() => {});
+      setIsDbRealtimeLive(false);
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      cleanupChannel();
     };
-    // Re-subscribe only when identity key changes; presence updates are tracked below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [actorKey]);
+  }, [refreshHistory]);
 
-  // Keep presence metadata updated whenever room, nickname, role, or vibe changes.
+  // 2. Shared Realtime Broadcast & Presence channel (serialized teardown eliminates StrictMode/nav races).
   useEffect(() => {
-    const channel = channelRef.current;
-    if (!channel || !isLiveConnected) return;
-    void channel.track({
-      key: actorKey,
-      name: resolvedDisplayName,
-      role: authorRole,
-      vibe,
-      room: activeRoom,
-    } satisfies LoungeOnlineMember);
-  }, [activeRoom, actorKey, authorRole, isLiveConnected, resolvedDisplayName, vibe]);
+    let active = true;
+    let reconnectTimer: number | null = null;
+    let reconnectAttempt = 0;
+    let ownedChannel: ReturnType<typeof supabase.channel> | null = null;
+
+    async function connectBroadcastChannel() {
+      // Wait for any previous unmount's `removeChannel` to finish teardown completely
+      // before creating a new channel on the shared topic name.
+      await pendingBroadcastTeardown;
+      if (!active) return;
+
+      const presenceKey = `tab-${++instanceCounter}-${Math.random().toString(36).slice(2, 7)}`;
+      const channel = supabase.channel(BROADCAST_CHANNEL_NAME, {
+        config: {
+          broadcast: { self: false, ack: false },
+          presence: { key: presenceKey },
+        },
+      });
+      ownedChannel = channel;
+      broadcastChannelRef.current = channel;
+
+      function syncPresenceList() {
+        if (!active) return;
+        const state = channel.presenceState<LoungeOnlineMember>();
+        const seen = new Map<string, LoungeOnlineMember>();
+        for (const entries of Object.values(state)) {
+          for (const entry of entries) {
+            if (!entry || typeof entry.name !== 'string' || typeof entry.key !== 'string') continue;
+            seen.set(entry.key, {
+              key: entry.key,
+              name: entry.name,
+              role: entry.role === 'admin' ? 'admin' : 'member',
+              vibe: LOUNGE_VIBES.includes(entry.vibe) ? entry.vibe : 'Chilling',
+              room: isValidLoungeRoom(entry.room) ? entry.room : 'general',
+            });
+          }
+        }
+        setOnlineMembers(Array.from(seen.values()));
+      }
+
+      channel
+        .on('presence', { event: 'sync' }, syncPresenceList)
+        .on('broadcast', { event: 'lounge_event' }, ({ payload }) => {
+          if (!active || !payload) return;
+          applyRealtimeEvent(payload as ChatRealtimeEvent);
+        })
+        .subscribe((status) => {
+          if (!active) return;
+          if (status === 'SUBSCRIBED') {
+            reconnectAttempt = 0;
+            isBroadcastReadyRef.current = true;
+            setIsBroadcastLive(true);
+            return;
+          }
+          if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+            isBroadcastReadyRef.current = false;
+            setIsBroadcastLive(false);
+            if (reconnectTimer === null && active) {
+              const delayMs = Math.min(2000 * Math.pow(2, reconnectAttempt), 15000);
+              reconnectAttempt += 1;
+              const stale = ownedChannel;
+              ownedChannel = null;
+              if (broadcastChannelRef.current === stale) {
+                broadcastChannelRef.current = null;
+              }
+              if (stale) {
+                pendingBroadcastTeardown = Promise.resolve(supabase.removeChannel(stale))
+                  .then(() => undefined)
+                  .catch(() => undefined);
+              }
+              reconnectTimer = window.setTimeout(() => {
+                reconnectTimer = null;
+                void connectBroadcastChannel();
+              }, delayMs);
+            }
+          }
+        });
+    }
+
+    void connectBroadcastChannel();
+
+    return () => {
+      active = false;
+      isBroadcastReadyRef.current = false;
+      setIsBroadcastLive(false);
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      const ch = ownedChannel;
+      ownedChannel = null;
+      if (broadcastChannelRef.current === ch) {
+        broadcastChannelRef.current = null;
+      }
+      if (ch) {
+        pendingBroadcastTeardown = Promise.resolve(supabase.removeChannel(ch))
+          .then(() => undefined)
+          .catch(() => undefined);
+      }
+    };
+  }, [applyRealtimeEvent]);
+
+  // Track presence strictly for authenticated users (read-only guests view presence without broadcasting).
+  useEffect(() => {
+    const channel = broadcastChannelRef.current;
+    if (!channel || !isBroadcastLive) return;
+
+    if (!userId) {
+      void channel.untrack().catch(() => {});
+      return;
+    }
+
+    void channel
+      .track({
+        key: userId,
+        name: authorName,
+        role: isAdmin ? 'admin' : 'member',
+        vibe,
+        room: activeRoom,
+      } satisfies LoungeOnlineMember)
+      .catch(() => {});
+  }, [activeRoom, authorName, isAdmin, isBroadcastLive, userId, vibe]);
 
   const sendMessage = useCallback(
-    (content: string, replyTo?: LoungeReplyRef): LoungeChatMessage | null => {
+    async (content: string, replyTo?: LoungeReplyRef): Promise<LoungeChatMessage | null> => {
+      // Strictly require an authenticated user to post messages.
+      if (!userId) {
+        onErrorRef.current?.('Sign in with your club account to send messages in Chill Chat.');
+        return null;
+      }
+
       const trimmed = content.trim();
       if (!trimmed || trimmed.length > 600) return null;
 
-      const created: LoungeChatMessage = {
-        id: generateId('chat'),
+      const canonicalId = generateUuid();
+      const optimistic: LoungeChatMessage = {
+        id: canonicalId,
         room: activeRoom,
-        senderClientId: clientIdRef.current,
-        authorUserId: userId ?? undefined,
-        authorName: resolvedDisplayName,
-        authorRole,
+        authorUserId: userId,
+        authorName,
+        authorRole: isAdmin ? 'admin' : 'member',
         content: trimmed,
         replyTo,
         reactions: {},
@@ -387,75 +681,237 @@ export function useLoungeChat({
       };
 
       setMessages((prev) => {
-        const next = [...prev, created].slice(-MAX_STORED_MESSAGES);
-        persistMessages(next);
+        const next = upsertMessageList(prev, optimistic);
+        persistCachedMessages(next);
         return next;
       });
+      relayEvent({ type: 'message', payload: optimistic });
 
-      if (channelRef.current && isLiveConnected) {
-        void channelRef.current.send({
-          type: 'broadcast',
-          event: 'lounge_event',
-          payload: { type: 'message', payload: created } satisfies ChatBroadcastEvent,
+      try {
+        const saved = await insertLoungeChatMessage({
+          id: canonicalId,
+          room: activeRoom,
+          content: trimmed,
+          replyTo,
         });
+        if (mountedRef.current) {
+          setIsDbBacked(true);
+          isDbBackedRef.current = true;
+          setMessages((prev) => {
+            const next = upsertMessageList(prev, saved);
+            persistCachedMessages(next);
+            return next;
+          });
+        }
+        return saved;
+      } catch (err) {
+        if (err instanceof Error && err.message === 'LOUNGE_SCHEMA_MISSING') {
+          if (mountedRef.current) {
+            setIsDbBacked(false);
+            isDbBackedRef.current = false;
+          }
+          // Broadcast already delivered live; keep optimistic message gracefully until SQL is run.
+          return optimistic;
+        }
+
+        // Roll back optimistic bubble on genuine auth/RLS/network rejection.
+        if (mountedRef.current) {
+          setMessages((prev) => {
+            const next = prev.filter((item) => item.id !== canonicalId);
+            persistCachedMessages(next);
+            return next;
+          });
+        }
+        onErrorRef.current?.(
+          err instanceof Error ? err.message : 'Unable to send message right now.',
+        );
+        return null;
+      }
+    },
+    [activeRoom, authorName, isAdmin, relayEvent, userId],
+  );
+
+  const editMessage = useCallback(
+    async (messageId: string, content: string): Promise<LoungeChatMessage | null> => {
+      if (!userId) {
+        onErrorRef.current?.('Sign in with your club account to edit messages.');
+        return null;
       }
 
-      return created;
+      const trimmed = content.trim();
+      if (!trimmed || trimmed.length > 600) return null;
+
+      const targetMsg = messagesRef.current.find((item) => item.id === messageId);
+      if (!targetMsg || targetMsg.authorUserId !== userId) return null;
+      if (targetMsg.content === trimmed) return targetMsg;
+
+      const editedAt = new Date().toISOString();
+      const optimistic: LoungeChatMessage = {
+        ...targetMsg,
+        content: trimmed,
+        updatedAt: editedAt,
+      };
+
+      setMessages((prev) => {
+        const next = prev.map((item) => (item.id === messageId ? optimistic : item));
+        persistCachedMessages(next);
+        return next;
+      });
+      relayEvent({
+        type: 'edit',
+        payload: { messageId, content: trimmed, updatedAt: editedAt },
+      });
+
+      try {
+        const saved = await updateLoungeChatMessage(messageId, trimmed);
+        if (mountedRef.current) {
+          setMessages((prev) => {
+            const next = upsertMessageList(prev, saved);
+            persistCachedMessages(next);
+            return next;
+          });
+        }
+        return saved;
+      } catch (err) {
+        if (err instanceof Error && err.message === 'LOUNGE_SCHEMA_MISSING') {
+          if (mountedRef.current) {
+            setIsDbBacked(false);
+            isDbBackedRef.current = false;
+          }
+          return optimistic;
+        }
+
+        // Roll back edit on genuine permission or network error.
+        if (mountedRef.current) {
+          setMessages((prev) => {
+            const next = prev.map((item) => (item.id === messageId ? targetMsg : item));
+            persistCachedMessages(next);
+            return next;
+          });
+        }
+        onErrorRef.current?.(
+          err instanceof Error ? err.message : 'Unable to save message edit right now.',
+        );
+        return null;
+      }
     },
-    [activeRoom, authorRole, isLiveConnected, resolvedDisplayName, userId],
+    [relayEvent, userId],
   );
 
   const toggleReaction = useCallback(
-    (messageId: string, emoji: string) => {
+    async (messageId: string, emoji: string): Promise<void> => {
+      // Strictly require an authenticated user to add or remove reactions.
+      if (!userId) {
+        onErrorRef.current?.('Sign in with your club account to react to messages.');
+        return;
+      }
+
+      const cleanedEmoji = emoji.trim();
+      if (!cleanedEmoji || cleanedEmoji.length > 32) return;
+
+      const targetMsg = messagesRef.current.find((item) => item.id === messageId);
+      if (!targetMsg) return;
+
+      const alreadyReacted = (targetMsg.reactions[cleanedEmoji] ?? []).includes(userId);
+      const shouldAdd = !alreadyReacted;
+
       setMessages((prev) => {
-        const next = applyReactionToggle(prev, messageId, emoji, actorKey);
-        persistMessages(next);
+        const next = applyReactionMutation(prev, messageId, cleanedEmoji, userId, shouldAdd);
+        persistCachedMessages(next);
         return next;
       });
+      relayEvent({
+        type: 'reaction',
+        payload: { messageId, emoji: cleanedEmoji, userId, add: shouldAdd },
+      });
 
-      if (channelRef.current && isLiveConnected) {
-        void channelRef.current.send({
-          type: 'broadcast',
-          event: 'lounge_event',
-          payload: {
-            type: 'reaction',
-            payload: { messageId, emoji, actorKey },
-          } satisfies ChatBroadcastEvent,
+      try {
+        await setLoungeChatReaction({
+          messageId,
+          userId,
+          emoji: cleanedEmoji,
+          add: shouldAdd,
         });
+      } catch (err) {
+        if (err instanceof Error && err.message === 'LOUNGE_SCHEMA_MISSING') {
+          if (mountedRef.current) {
+            setIsDbBacked(false);
+            isDbBackedRef.current = false;
+          }
+          return;
+        }
+        // Revert optimistic reaction toggle on error.
+        if (mountedRef.current) {
+          setMessages((prev) => {
+            const next = applyReactionMutation(
+              prev,
+              messageId,
+              cleanedEmoji,
+              userId,
+              !shouldAdd,
+            );
+            persistCachedMessages(next);
+            return next;
+          });
+        }
+        onErrorRef.current?.(
+          err instanceof Error ? err.message : 'Unable to update emoji reaction.',
+        );
       }
     },
-    [actorKey, isLiveConnected],
+    [relayEvent, userId],
   );
 
   const deleteMessage = useCallback(
-    (messageId: string) => {
+    async (messageId: string): Promise<void> => {
+      if (!userId) return;
+      const targetMsg = messagesRef.current.find((item) => item.id === messageId);
+      if (!targetMsg) return;
+      if (!isAdmin && targetMsg.authorUserId !== userId) return;
+
       setMessages((prev) => {
         const next = prev.filter((item) => item.id !== messageId);
-        persistMessages(next);
+        persistCachedMessages(next);
         return next;
       });
+      relayEvent({ type: 'delete', payload: { messageId } });
 
-      if (channelRef.current && isLiveConnected) {
-        void channelRef.current.send({
-          type: 'broadcast',
-          event: 'lounge_event',
-          payload: { type: 'delete', payload: { messageId } } satisfies ChatBroadcastEvent,
-        });
+      try {
+        await deleteLoungeChatMessage(messageId);
+      } catch (err) {
+        if (err instanceof Error && err.message === 'LOUNGE_SCHEMA_MISSING') {
+          if (mountedRef.current) {
+            setIsDbBacked(false);
+            isDbBackedRef.current = false;
+          }
+          return;
+        }
+        if (mountedRef.current) {
+          setMessages((prev) => {
+            const next = upsertMessageList(prev, targetMsg);
+            persistCachedMessages(next);
+            return next;
+          });
+        }
+        onErrorRef.current?.(
+          err instanceof Error ? err.message : 'Unable to delete chat message.',
+        );
       }
     },
-    [isLiveConnected],
+    [isAdmin, relayEvent, userId],
   );
 
   return {
     messages,
     onlineMembers,
+    isLoading,
     isLiveConnected,
-    actorKey,
-    guestNickname,
+    isDbBacked,
     vibe,
-    setGuestNickname,
     setVibe,
+    refreshHistory,
     sendMessage,
+    editMessage,
     toggleReaction,
     deleteMessage,
   };

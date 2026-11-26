@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { AccountsLeftPanel } from './components/AccountsLeftPanel';
+import { ContextMenuProvider } from './components/AppContextMenu';
 import { AttendanceLeaderboard } from './components/AttendanceLeaderboard';
 import { AttendanceToolsSection } from './components/AttendanceToolsSection';
 import { AttendanceWorkspace } from './components/AttendanceWorkspace';
@@ -8,6 +9,8 @@ import { CreateSessionModal } from './components/CreateSessionModal';
 import { Header } from './components/Header';
 import { LandingScreen } from './components/LandingScreen';
 import { LoungeWorkspace } from './components/LoungeWorkspace';
+
+const LazyGamesWorkspace = lazy(() => import('./components/GamesWorkspace'));
 import { MeetingSettingsModal } from './components/MeetingSettingsModal';
 import { MemberManagerSidebar } from './components/MemberManagerSidebar';
 import { Preloader } from './components/Preloader';
@@ -1327,62 +1330,73 @@ export function App() {
   const activeMemberCount = members.filter((member) => !isLegacyMember(member)).length;
   const hasLocalRecords = !isCloudConnected && (members.length > 0 || sessions.length > 0);
 
-  if (activePage === 'landing') {
-    return (
-      <>
-        <LandingScreen
-          themeAccent={preferences.themeAccent}
-          periodLabel={getCurrentPeriodLabel()}
-          isCloudConnected={isCloudConnected}
-          isAdmin={isAdmin}
-          userEmail={user?.email}
-          isAuthModalOpen={isCloudSyncModalOpen}
-          syncStatus={syncStatus}
-          realtimeStatus={realtimeStatus}
-          onEnterSystem={() => handleNavigate('lounge')}
-          onNavigateWorkspace={(page) => handleNavigate(page)}
-          onOpenLogin={() => handleOpenAuthModal('login')}
-          onOpenCreateAccount={() => handleOpenAuthModal('register')}
-        />
-        <CloudSyncModal
-          isOpen={isCloudSyncModalOpen}
-          initialMode={authModalMode}
-          hasLocalRecords={hasLocalRecords}
-          localMemberCount={members.length}
-          localSessionCount={sessions.length}
-          onClose={() => setIsCloudSyncModalOpen(false)}
-          onConnect={handleConnectCloudSync}
-          onRegisterAdmin={handleRegisterAdminAccount}
-        />
-        <ToastContainer
-          toasts={toasts}
-          onDismiss={handleDismissToast}
-          onUndo={handleUndoToast}
-        />
-      </>
-    );
-  }
-
   const inAttendanceSection = isAttendancePage(activePage);
   const currentPeriodLabel = getCurrentPeriodLabel();
 
   return (
-    <div
-      className={`app-shell ${inAttendanceSection ? 'is-attendance-section' : 'is-hangout-section'} ${
-        preferences.isMemberSidebarOpen ? 'is-sidebar-open' : ''
-      } ${isCloudConnected && isAdmin && isAccountsPanelOpen ? 'is-accounts-panel-open' : ''}`}
-      data-density={preferences.rosterDensity}
+    <ContextMenuProvider
+      activePage={activePage}
+      isCloudConnected={isCloudConnected}
+      onNavigate={handleNavigate}
+      onOpenSettings={() => {
+        setOpenSettingsToPassword(false);
+        setIsSettingsModalOpen(true);
+      }}
+      onOpenSignIn={() => handleOpenAuthModal('login')}
+      onStartTutorial={handleStartTutorial}
+      onNotify={pushToast}
     >
+      {activePage === 'landing' ? (
+        <>
+          <LandingScreen
+            themeAccent={preferences.themeAccent}
+            periodLabel={currentPeriodLabel}
+            isCloudConnected={isCloudConnected}
+            isAdmin={isAdmin}
+            userEmail={user?.email}
+            isAuthModalOpen={isCloudSyncModalOpen}
+            syncStatus={syncStatus}
+            realtimeStatus={realtimeStatus}
+            onEnterSystem={() => handleNavigate('lounge')}
+            onNavigateWorkspace={(page) => handleNavigate(page)}
+            onOpenLogin={() => handleOpenAuthModal('login')}
+            onOpenCreateAccount={() => handleOpenAuthModal('register')}
+          />
+          <CloudSyncModal
+            isOpen={isCloudSyncModalOpen}
+            initialMode={authModalMode}
+            hasLocalRecords={hasLocalRecords}
+            localMemberCount={members.length}
+            localSessionCount={sessions.length}
+            onClose={() => setIsCloudSyncModalOpen(false)}
+            onConnect={handleConnectCloudSync}
+            onRegisterAdmin={handleRegisterAdminAccount}
+          />
+          <ToastContainer
+            toasts={toasts}
+            onDismiss={handleDismissToast}
+            onUndo={handleUndoToast}
+          />
+        </>
+      ) : (
+        <div
+          className={`app-shell ${inAttendanceSection ? 'is-attendance-section' : 'is-hangout-section'} ${
+            preferences.isMemberSidebarOpen ? 'is-sidebar-open' : ''
+          } ${isCloudConnected && isAdmin && isAccountsPanelOpen ? 'is-accounts-panel-open' : ''}`}
+          data-density={preferences.rosterDensity}
+        >
       {preloaderPhase !== 'done' && (
         <Preloader
           ariaLabel={
             activePage === 'lounge'
               ? 'Loading Team SPIRIT Student Lounge'
-              : activePage === 'calendar'
-                ? 'Loading Team SPIRIT Session Calendar'
-                : activePage === 'ideas'
-                  ? 'Loading Team SPIRIT Project Ideas'
-                  : 'Loading Team SPIRIT Attendance Tools'
+              : activePage === 'games'
+                ? 'Loading Team SPIRIT Arcade Games'
+                : activePage === 'calendar'
+                  ? 'Loading Team SPIRIT Session Calendar'
+                  : activePage === 'ideas'
+                    ? 'Loading Team SPIRIT Project Ideas'
+                    : 'Loading Team SPIRIT Attendance Tools'
           }
           onBeginExit={handlePreloaderBeginExit}
           onComplete={handlePreloaderComplete}
@@ -1437,10 +1451,28 @@ export function App() {
                 onAddComment={addClubPostComment}
                 onDeleteComment={handleDeleteClubPostComment}
                 onOpenCloudSync={() => handleOpenAuthModal('login')}
+                onNavigateGames={() => handleNavigate('games')}
                 onNavigateIdeas={() => handleNavigate('ideas')}
                 onNavigateAttendanceCalendar={() => handleNavigate('calendar')}
                 onNotify={pushToast}
               />
+            ) : activePage === 'games' ? (
+              <Suspense
+                fallback={
+                  <div className="arcade-loading-fallback" role="status">
+                    Loading Team SPIRIT Arcade…
+                  </div>
+                }
+              >
+                <LazyGamesWorkspace
+                  userId={isCloudConnected ? (user?.id ?? null) : null}
+                  userEmail={user?.email}
+                  linkedMember={linkedMember}
+                  isAdmin={isAdmin}
+                  onOpenCloudSync={() => handleOpenAuthModal('login')}
+                  onNotify={pushToast}
+                />
+              </Suspense>
             ) : activePage === 'ideas' ? (
               <ProjectIdeasWorkspace
                 userId={isCloudConnected ? (user?.id ?? null) : null}
@@ -1819,17 +1851,19 @@ export function App() {
         onUndo={handleUndoToast}
       />
 
-      <TutorialOverlay
-        isOpen={isTutorialActive}
-        steps={activeTutorialSteps}
-        stepIndex={clampedTutorialStepIndex}
-        isDemoSessionActive={isTutorialDemoSession}
-        onNext={handleTutorialNext}
-        onBack={handleTutorialBack}
-        onSkip={() => finishTutorial('dismissed')}
-        onComplete={() => finishTutorial('completed')}
-      />
-    </div>
+          <TutorialOverlay
+            isOpen={isTutorialActive}
+            steps={activeTutorialSteps}
+            stepIndex={clampedTutorialStepIndex}
+            isDemoSessionActive={isTutorialDemoSession}
+            onNext={handleTutorialNext}
+            onBack={handleTutorialBack}
+            onSkip={() => finishTutorial('dismissed')}
+            onComplete={() => finishTutorial('completed')}
+          />
+        </div>
+      )}
+    </ContextMenuProvider>
   );
 }
 

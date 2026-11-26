@@ -2626,3 +2626,662 @@ end $$;
 
 -- 8. Reload PostgREST schema cache immediately
 notify pgrst, 'reload schema';
+
+
+-- ============================================================================
+-- 9. Student Lounge Chill Chat (Purely Additive — Zero Changes to Existing Tables)
+--    - Read-only for unauthenticated visitors (`anon`) and signed-in members
+--    - Strictly authenticated active users (`authenticated`) can post or react
+-- ============================================================================
+
+create table if not exists public.lounge_chat_messages (
+  id uuid primary key default gen_random_uuid(),
+  room text not null default 'general'
+    constraint lounge_chat_messages_room_check
+    check (room in ('general', 'build-talk', 'off-topic')),
+  author_user_id uuid not null references auth.users(id) on delete cascade,
+  author_name text not null
+    constraint lounge_chat_messages_author_name_check
+    check (length(btrim(author_name)) between 1 and 80),
+  author_role text not null default 'member'
+    constraint lounge_chat_messages_author_role_check
+    check (author_role in ('admin', 'member')),
+  content text not null
+    constraint lounge_chat_messages_content_check
+    check (length(btrim(content)) between 1 and 600),
+  reply_to_id uuid references public.lounge_chat_messages(id) on delete set null,
+  reply_to_author text
+    constraint lounge_chat_messages_reply_author_check
+    check (reply_to_author is null or length(btrim(reply_to_author)) <= 80),
+  reply_to_snippet text
+    constraint lounge_chat_messages_reply_snippet_check
+    check (reply_to_snippet is null or length(btrim(reply_to_snippet)) <= 120),
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_lounge_chat_messages_room_created
+  on public.lounge_chat_messages (room, created_at desc);
+
+create table if not exists public.lounge_chat_reactions (
+  message_id uuid not null references public.lounge_chat_messages(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  emoji text not null
+    constraint lounge_chat_reactions_emoji_check
+    check (length(btrim(emoji)) between 1 and 32),
+  created_at timestamptz not null default now(),
+  primary key (message_id, user_id, emoji)
+);
+
+create index if not exists idx_lounge_chat_reactions_message
+  on public.lounge_chat_reactions (message_id);
+
+-- Replica identity FULL ensures Realtime DELETE payloads carry message_id, user_id & emoji
+alter table public.lounge_chat_messages replica identity full;
+alter table public.lounge_chat_reactions replica identity full;
+
+-- Server-enforced verified identity for Chill Chat messages
+create or replace function public.enforce_lounge_chat_message_author()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  caller_id uuid := auth.uid();
+  resolved_member_id text;
+  resolved_name text;
+  caller_email text;
+begin
+  if caller_id is null then
+    raise exception 'Authentication is required to post in Chill Chat.'
+      using errcode = '42501';
+  end if;
+
+  resolved_member_id := public.my_linked_member_id(caller_id);
+  if resolved_member_id is not null then
+    select nullif(btrim(name), '')
+    into resolved_name
+    from public.club_members
+    where id = resolved_member_id
+      and deleted_at is null
+    limit 1;
+  end if;
+
+  if resolved_name is null then
+    select email
+    into caller_email
+    from public.user_profiles
+    where user_id = caller_id
+    limit 1;
+
+    resolved_name := coalesce(
+      nullif(btrim(split_part(coalesce(caller_email, ''), '@', 1)), ''),
+      'Club Member'
+    );
+  end if;
+
+  new.author_user_id := caller_id;
+  new.author_role := case when public.is_admin(caller_id) then 'admin' else 'member' end;
+  new.author_name := left(resolved_name, 80);
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_lounge_chat_messages_enforce_author on public.lounge_chat_messages;
+create trigger trg_lounge_chat_messages_enforce_author
+  before insert on public.lounge_chat_messages
+  for each row execute function public.enforce_lounge_chat_message_author();
+
+-- Server-enforced verified actor for Chill Chat emoji reactions
+create or replace function public.enforce_lounge_chat_reaction_actor()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  caller_id uuid := auth.uid();
+begin
+  if caller_id is null then
+    raise exception 'Authentication is required to react in Chill Chat.'
+      using errcode = '42501';
+  end if;
+
+  new.user_id := caller_id;
+  new.emoji := btrim(new.emoji);
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_lounge_chat_reactions_enforce_actor on public.lounge_chat_reactions;
+create trigger trg_lounge_chat_reactions_enforce_actor
+  before insert on public.lounge_chat_reactions
+  for each row execute function public.enforce_lounge_chat_reaction_actor();
+
+-- Privileges & RLS
+grant select on table public.lounge_chat_messages to anon, authenticated;
+grant insert, delete on table public.lounge_chat_messages to authenticated;
+grant select on table public.lounge_chat_reactions to anon, authenticated;
+grant insert, delete on table public.lounge_chat_reactions to authenticated;
+grant all on table public.lounge_chat_messages, public.lounge_chat_reactions to service_role;
+
+alter table public.lounge_chat_messages enable row level security;
+alter table public.lounge_chat_reactions enable row level security;
+
+drop policy if exists "Anyone can read lounge_chat_messages" on public.lounge_chat_messages;
+create policy "Anyone can read lounge_chat_messages"
+  on public.lounge_chat_messages
+  for select
+  to anon, authenticated
+  using (true);
+
+drop policy if exists "Authenticated active users can insert lounge_chat_messages" on public.lounge_chat_messages;
+create policy "Authenticated active users can insert lounge_chat_messages"
+  on public.lounge_chat_messages
+  for insert
+  to authenticated
+  with check (
+    public.is_active_user()
+    and author_user_id = (select auth.uid())
+    and length(btrim(content)) between 1 and 600
+  );
+
+drop policy if exists "Authors or admins can delete lounge_chat_messages" on public.lounge_chat_messages;
+create policy "Authors or admins can delete lounge_chat_messages"
+  on public.lounge_chat_messages
+  for delete
+  to authenticated
+  using (
+    public.is_admin()
+    or (public.is_active_user() and author_user_id = (select auth.uid()))
+  );
+
+drop policy if exists "Anyone can read lounge_chat_reactions" on public.lounge_chat_reactions;
+create policy "Anyone can read lounge_chat_reactions"
+  on public.lounge_chat_reactions
+  for select
+  to anon, authenticated
+  using (true);
+
+drop policy if exists "Authenticated active users can insert lounge_chat_reactions" on public.lounge_chat_reactions;
+create policy "Authenticated active users can insert lounge_chat_reactions"
+  on public.lounge_chat_reactions
+  for insert
+  to authenticated
+  with check (
+    public.is_active_user()
+    and user_id = (select auth.uid())
+    and length(btrim(emoji)) between 1 and 32
+  );
+
+drop policy if exists "Users or admins can delete lounge_chat_reactions" on public.lounge_chat_reactions;
+create policy "Users or admins can delete lounge_chat_reactions"
+  on public.lounge_chat_reactions
+  for delete
+  to authenticated
+  using (
+    public.is_active_user()
+    and (user_id = (select auth.uid()) or public.is_admin())
+  );
+
+-- Enable Realtime publication for live cross-session chat & reaction updates
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'lounge_chat_messages'
+  ) then
+    alter publication supabase_realtime add table public.lounge_chat_messages;
+  end if;
+
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'lounge_chat_reactions'
+  ) then
+    alter publication supabase_realtime add table public.lounge_chat_reactions;
+  end if;
+end $$;
+
+notify pgrst, 'reload schema';
+
+
+-- 9b. Purely Additive Inline Message Editing Support for Chill Chat
+alter table public.lounge_chat_messages
+  add column if not exists updated_at timestamptz;
+
+create or replace function public.enforce_lounge_chat_message_edit()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  caller_id uuid := auth.uid();
+begin
+  if caller_id is null or caller_id <> old.author_user_id then
+    raise exception 'Only the original author can edit their chat message.'
+      using errcode = '42501';
+  end if;
+
+  new.id := old.id;
+  new.room := old.room;
+  new.author_user_id := old.author_user_id;
+  new.author_name := old.author_name;
+  new.author_role := old.author_role;
+  new.reply_to_id := old.reply_to_id;
+  new.reply_to_author := old.reply_to_author;
+  new.reply_to_snippet := old.reply_to_snippet;
+  new.created_at := old.created_at;
+  new.content := btrim(new.content);
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_lounge_chat_messages_enforce_edit on public.lounge_chat_messages;
+create trigger trg_lounge_chat_messages_enforce_edit
+  before update on public.lounge_chat_messages
+  for each row execute function public.enforce_lounge_chat_message_edit();
+
+grant update (content, updated_at) on table public.lounge_chat_messages to authenticated;
+
+drop policy if exists "Authors can update own lounge_chat_messages" on public.lounge_chat_messages;
+create policy "Authors can update own lounge_chat_messages"
+  on public.lounge_chat_messages
+  for update
+  to authenticated
+  using (
+    public.is_active_user()
+    and author_user_id = (select auth.uid())
+  )
+  with check (
+    public.is_active_user()
+    and author_user_id = (select auth.uid())
+    and length(btrim(content)) between 1 and 600
+  );
+
+notify pgrst, 'reload schema';
+
+
+-- ============================================================================
+-- 10. Student Lounge Arcade Games & Persistent Account-Linked Leaderboards
+--     (Purely Additive — Zero Changes to Existing Tables)
+--     - Publicly readable leaderboards & stats (`anon`, `authenticated`)
+--     - Authenticated active users record runs via atomic `record_game_run` RPC
+--     - Guests can play freely without saving scores
+-- ============================================================================
+
+create table if not exists public.game_leaderboard_entries (
+  id uuid primary key default gen_random_uuid(),
+  game_id text not null
+    constraint game_leaderboard_entries_game_id_check
+    check (game_id in ('schloss-defender', 'buzzy-escape')),
+  mode text not null
+    constraint game_leaderboard_entries_mode_check
+    check (
+      (game_id = 'schloss-defender' and mode in ('easy', 'medium', 'hard', 'nightmare', 'impossible', 'endless'))
+      or (game_id = 'buzzy-escape' and mode in ('easy', 'medium', 'hard', 'nightmare', 'extreme', 'impossible'))
+    ),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  player_name text not null
+    constraint game_leaderboard_entries_player_name_check
+    check (length(btrim(player_name)) between 1 and 80),
+  player_role text not null default 'member'
+    constraint game_leaderboard_entries_player_role_check
+    check (player_role in ('admin', 'member')),
+  avatar_id integer not null default 0
+    constraint game_leaderboard_entries_avatar_check
+    check (avatar_id between 0 and 20),
+  best_score integer not null default 0
+    constraint game_leaderboard_entries_score_check
+    check (best_score between 0 and 10000000),
+  won boolean not null default false,
+  kills integer not null default 0
+    constraint game_leaderboard_entries_kills_check
+    check (kills between 0 and 1000000),
+  max_combo integer not null default 0
+    constraint game_leaderboard_entries_combo_check
+    check (max_combo between 0 and 100000),
+  hits_taken integer not null default 0
+    constraint game_leaderboard_entries_hits_check
+    check (hits_taken between 0 and 100000),
+  duration_sec numeric(8, 1) not null default 0
+    constraint game_leaderboard_entries_duration_check
+    check (duration_sec >= 0 and duration_sec <= 86400),
+  rank_title text
+    constraint game_leaderboard_entries_rank_title_check
+    check (rank_title is null or length(btrim(rank_title)) <= 80),
+  achieved_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint game_leaderboard_entries_unique_user_mode unique (game_id, mode, user_id)
+);
+
+create index if not exists idx_game_leaderboard_game_mode_score
+  on public.game_leaderboard_entries (game_id, mode, best_score desc, achieved_at asc);
+
+create index if not exists idx_game_leaderboard_game_score
+  on public.game_leaderboard_entries (game_id, best_score desc, achieved_at asc);
+
+create table if not exists public.game_player_stats (
+  game_id text not null
+    constraint game_player_stats_game_id_check
+    check (game_id in ('schloss-defender', 'buzzy-escape')),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  player_name text not null
+    constraint game_player_stats_player_name_check
+    check (length(btrim(player_name)) between 1 and 80),
+  player_role text not null default 'member'
+    constraint game_player_stats_player_role_check
+    check (player_role in ('admin', 'member')),
+  avatar_id integer not null default 0
+    constraint game_player_stats_avatar_check
+    check (avatar_id between 0 and 20),
+  games_played integer not null default 0
+    constraint game_player_stats_games_played_check
+    check (games_played >= 0),
+  wins integer not null default 0
+    constraint game_player_stats_wins_check
+    check (wins >= 0),
+  total_score bigint not null default 0
+    constraint game_player_stats_total_score_check
+    check (total_score >= 0),
+  highest_score integer not null default 0
+    constraint game_player_stats_highest_score_check
+    check (highest_score between 0 and 10000000),
+  total_kills integer not null default 0
+    constraint game_player_stats_total_kills_check
+    check (total_kills >= 0),
+  best_combo integer not null default 0
+    constraint game_player_stats_best_combo_check
+    check (best_combo >= 0),
+  total_hits_taken integer not null default 0
+    constraint game_player_stats_total_hits_check
+    check (total_hits_taken >= 0),
+  best_mode text,
+  best_rank_title text,
+  last_played_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (game_id, user_id)
+);
+
+create index if not exists idx_game_player_stats_game_highest
+  on public.game_player_stats (game_id, highest_score desc);
+
+alter table public.game_leaderboard_entries replica identity full;
+alter table public.game_player_stats replica identity full;
+
+-- Atomic server-verified RPC to record a completed arcade game run for the signed-in user
+create or replace function public.record_game_run(
+  p_game_id text,
+  p_mode text,
+  p_score integer,
+  p_won boolean default false,
+  p_kills integer default 0,
+  p_max_combo integer default 0,
+  p_hits_taken integer default 0,
+  p_duration_sec numeric default 0,
+  p_rank_title text default null,
+  p_avatar_id integer default 0
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  caller_id uuid := auth.uid();
+  resolved_member_id text;
+  resolved_name text;
+  caller_email text;
+  resolved_role text;
+  norm_game text := lower(btrim(coalesce(p_game_id, '')));
+  norm_mode text := lower(btrim(coalesce(p_mode, '')));
+  clean_score integer := greatest(0, least(coalesce(p_score, 0), 10000000));
+  clean_kills integer := greatest(0, least(coalesce(p_kills, 0), 1000000));
+  clean_combo integer := greatest(0, least(coalesce(p_max_combo, 0), 100000));
+  clean_hits integer := greatest(0, least(coalesce(p_hits_taken, 0), 100000));
+  clean_duration numeric(8, 1) := greatest(0, least(round(coalesce(p_duration_sec, 0)::numeric, 1), 86400));
+  clean_avatar integer := greatest(0, least(coalesce(p_avatar_id, 0), 20));
+  clean_rank text := nullif(left(btrim(coalesce(p_rank_title, '')), 80), '');
+  prev_best integer := null;
+  is_new_best boolean := false;
+  resulting_best integer := clean_score;
+begin
+  if caller_id is null or not public.is_active_user() then
+    raise exception 'Sign in with an active Team SPIRIT account to save high scores.'
+      using errcode = '42501';
+  end if;
+
+  if norm_game = 'schloss-defender' then
+    if norm_mode not in ('easy', 'medium', 'hard', 'nightmare', 'impossible', 'endless') then
+      raise exception 'Invalid mode for Schloss Defender.' using errcode = '22023';
+    end if;
+  elsif norm_game = 'buzzy-escape' then
+    if norm_mode not in ('easy', 'medium', 'hard', 'nightmare', 'extreme', 'impossible') then
+      raise exception 'Invalid mode for Buzzy Escape.' using errcode = '22023';
+    end if;
+  else
+    raise exception 'Unsupported arcade game ID.' using errcode = '22023';
+  end if;
+
+  -- Resolve verified display name & role from club roster / user profile
+  resolved_member_id := public.my_linked_member_id(caller_id);
+  if resolved_member_id is not null then
+    select nullif(btrim(name), '')
+    into resolved_name
+    from public.club_members
+    where id = resolved_member_id
+      and deleted_at is null
+    limit 1;
+  end if;
+
+  if resolved_name is null then
+    select email
+    into caller_email
+    from public.user_profiles
+    where user_id = caller_id
+    limit 1;
+
+    resolved_name := coalesce(
+      nullif(btrim(split_part(coalesce(caller_email, ''), '@', 1)), ''),
+      'Club Member'
+    );
+  end if;
+
+  resolved_name := left(resolved_name, 80);
+  resolved_role := case when public.is_admin(caller_id) then 'admin' else 'member' end;
+
+  -- Check existing personal best for this (game, mode, user)
+  select best_score
+  into prev_best
+  from public.game_leaderboard_entries
+  where game_id = norm_game
+    and mode = norm_mode
+    and user_id = caller_id;
+
+  if prev_best is null or clean_score > prev_best then
+    is_new_best := true;
+    resulting_best := clean_score;
+
+    insert into public.game_leaderboard_entries (
+      game_id,
+      mode,
+      user_id,
+      player_name,
+      player_role,
+      avatar_id,
+      best_score,
+      won,
+      kills,
+      max_combo,
+      hits_taken,
+      duration_sec,
+      rank_title,
+      achieved_at,
+      updated_at
+    )
+    values (
+      norm_game,
+      norm_mode,
+      caller_id,
+      resolved_name,
+      resolved_role,
+      clean_avatar,
+      clean_score,
+      coalesce(p_won, false),
+      clean_kills,
+      clean_combo,
+      clean_hits,
+      clean_duration,
+      clean_rank,
+      now(),
+      now()
+    )
+    on conflict (game_id, mode, user_id) do update
+    set
+      player_name = excluded.player_name,
+      player_role = excluded.player_role,
+      avatar_id = excluded.avatar_id,
+      best_score = excluded.best_score,
+      won = excluded.won,
+      kills = excluded.kills,
+      max_combo = excluded.max_combo,
+      hits_taken = excluded.hits_taken,
+      duration_sec = excluded.duration_sec,
+      rank_title = excluded.rank_title,
+      achieved_at = now(),
+      updated_at = now();
+  else
+    resulting_best := prev_best;
+    -- Keep display name & avatar fresh on existing record without downgrading score
+    update public.game_leaderboard_entries
+    set
+      player_name = resolved_name,
+      player_role = resolved_role,
+      avatar_id = clean_avatar,
+      updated_at = now()
+    where game_id = norm_game
+      and mode = norm_mode
+      and user_id = caller_id;
+  end if;
+
+  -- Accumulate account-linked lifetime stats for this game
+  insert into public.game_player_stats (
+    game_id,
+    user_id,
+    player_name,
+    player_role,
+    avatar_id,
+    games_played,
+    wins,
+    total_score,
+    highest_score,
+    total_kills,
+    best_combo,
+    total_hits_taken,
+    best_mode,
+    best_rank_title,
+    last_played_at,
+    updated_at
+  )
+  values (
+    norm_game,
+    caller_id,
+    resolved_name,
+    resolved_role,
+    clean_avatar,
+    1,
+    case when coalesce(p_won, false) then 1 else 0 end,
+    clean_score,
+    clean_score,
+    clean_kills,
+    clean_combo,
+    clean_hits,
+    norm_mode,
+    clean_rank,
+    now(),
+    now()
+  )
+  on conflict (game_id, user_id) do update
+  set
+    player_name = excluded.player_name,
+    player_role = excluded.player_role,
+    avatar_id = excluded.avatar_id,
+    games_played = public.game_player_stats.games_played + 1,
+    wins = public.game_player_stats.wins + case when coalesce(p_won, false) then 1 else 0 end,
+    total_score = public.game_player_stats.total_score + clean_score,
+    highest_score = greatest(public.game_player_stats.highest_score, clean_score),
+    total_kills = public.game_player_stats.total_kills + clean_kills,
+    best_combo = greatest(public.game_player_stats.best_combo, clean_combo),
+    total_hits_taken = public.game_player_stats.total_hits_taken + clean_hits,
+    best_mode = case
+      when clean_score >= public.game_player_stats.highest_score then norm_mode
+      else public.game_player_stats.best_mode
+    end,
+    best_rank_title = case
+      when clean_score >= public.game_player_stats.highest_score and clean_rank is not null then clean_rank
+      else public.game_player_stats.best_rank_title
+    end,
+    last_played_at = now(),
+    updated_at = now();
+
+  return jsonb_build_object(
+    'is_new_personal_best', is_new_best,
+    'best_score', resulting_best,
+    'previous_best', coalesce(prev_best, 0),
+    'mode', norm_mode,
+    'player_name', resolved_name
+  );
+end;
+$$;
+
+revoke all on function public.record_game_run(text, text, integer, boolean, integer, integer, integer, numeric, text, integer) from public;
+grant execute on function public.record_game_run(text, text, integer, boolean, integer, integer, integer, numeric, text, integer) to authenticated;
+
+grant select on table public.game_leaderboard_entries to anon, authenticated;
+grant delete on table public.game_leaderboard_entries to authenticated;
+grant select on table public.game_player_stats to anon, authenticated;
+grant all on table public.game_leaderboard_entries, public.game_player_stats to service_role;
+
+alter table public.game_leaderboard_entries enable row level security;
+alter table public.game_player_stats enable row level security;
+
+drop policy if exists "Anyone can read game_leaderboard_entries" on public.game_leaderboard_entries;
+create policy "Anyone can read game_leaderboard_entries"
+  on public.game_leaderboard_entries
+  for select
+  to anon, authenticated
+  using (true);
+
+drop policy if exists "Admins can delete game_leaderboard_entries" on public.game_leaderboard_entries;
+create policy "Admins can delete game_leaderboard_entries"
+  on public.game_leaderboard_entries
+  for delete
+  to authenticated
+  using (public.is_admin());
+
+drop policy if exists "Anyone can read game_player_stats" on public.game_player_stats;
+create policy "Anyone can read game_player_stats"
+  on public.game_player_stats
+  for select
+  to anon, authenticated
+  using (true);
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'game_leaderboard_entries'
+  ) then
+    alter publication supabase_realtime add table public.game_leaderboard_entries;
+  end if;
+
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'game_player_stats'
+  ) then
+    alter publication supabase_realtime add table public.game_player_stats;
+  end if;
+end $$;
+
+notify pgrst, 'reload schema';
