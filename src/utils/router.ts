@@ -1,11 +1,18 @@
 import { useCallback, useEffect, useState, type MouseEvent } from 'react';
 
-export type AppPage = 'tracker' | 'calendar' | 'ideas';
+export type AppPage = 'landing' | 'lounge' | 'tracker' | 'calendar' | 'ideas';
+
+/** Returns true when the active page belongs to the isolated Attendance & Ops tools section. */
+export function isAttendancePage(page: AppPage): boolean {
+  return page === 'tracker' || page === 'calendar';
+}
 
 const ROUTE_TITLES: Record<AppPage, string> = {
-  tracker: 'Team SPIRIT — Personal Attendance Tracker',
-  calendar: 'Team SPIRIT — Session Calendar',
-  ideas: 'Team SPIRIT — Updates & Ideas',
+  landing: 'Team SPIRIT — Club Hub',
+  lounge: 'Team SPIRIT — Student Lounge',
+  tracker: 'Team SPIRIT — Attendance Tools',
+  calendar: 'Team SPIRIT — Attendance Calendar',
+  ideas: 'Team SPIRIT — Project Ideas',
 };
 
 const ROUTE_CHANGE_EVENT = 'team-spirit:route-change';
@@ -17,24 +24,37 @@ function normalizePathname(pathname: string): string {
 /** Resolves the active SPA page from a URL pathname, supporting clean and `.html` routes. */
 export function getPageFromPathname(pathname: string): AppPage {
   const normalized = normalizePathname(pathname).toLowerCase();
-  if (normalized.endsWith('/calendar') || normalized.endsWith('/calendar.html')) {
-    return 'calendar';
-  }
   if (
-    normalized.endsWith('/ideas') ||
-    normalized.endsWith('/ideas.html') ||
+    normalized.endsWith('/lounge') ||
+    normalized.endsWith('/lounge.html') ||
     normalized.endsWith('/updates') ||
     normalized.endsWith('/updates.html')
   ) {
+    return 'lounge';
+  }
+  if (
+    normalized.endsWith('/attendance') ||
+    normalized.endsWith('/attendance.html') ||
+    normalized.endsWith('/tracker') ||
+    normalized.endsWith('/tracker.html')
+  ) {
+    return 'tracker';
+  }
+  if (normalized.endsWith('/calendar') || normalized.endsWith('/calendar.html')) {
+    return 'calendar';
+  }
+  if (normalized.endsWith('/ideas') || normalized.endsWith('/ideas.html')) {
     return 'ideas';
   }
-  return 'tracker';
+  return 'landing';
 }
 
 /** Builds the canonical href for a given SPA page relative to Vite's configured base URL. */
 export function getRouteHref(page: AppPage): string {
   const baseUrl = import.meta.env.BASE_URL || '/';
   const normalizedBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+  if (page === 'lounge') return `${normalizedBase}lounge`;
+  if (page === 'tracker') return `${normalizedBase}attendance`;
   if (page === 'calendar') return `${normalizedBase}calendar`;
   if (page === 'ideas') return `${normalizedBase}ideas`;
   return normalizedBase;
@@ -74,7 +94,7 @@ export function navigateToPage(page: AppPage, options?: { replace?: boolean }): 
 /** React hook keeping the current SPA page synchronized with History API & browser navigation. */
 export function useAppRoute(): [AppPage, (page: AppPage) => void] {
   const [activePage, setActivePage] = useState<AppPage>(() =>
-    typeof window === 'undefined' ? 'tracker' : getPageFromPathname(window.location.pathname),
+    typeof window === 'undefined' ? 'landing' : getPageFromPathname(window.location.pathname),
   );
 
   useEffect(() => {
@@ -89,6 +109,8 @@ export function useAppRoute(): [AppPage, (page: AppPage) => void] {
     function handleCustomRoute(event: Event) {
       const customEvent = event as CustomEvent<AppPage>;
       if (
+        customEvent.detail === 'landing' ||
+        customEvent.detail === 'lounge' ||
         customEvent.detail === 'tracker' ||
         customEvent.detail === 'calendar' ||
         customEvent.detail === 'ideas'

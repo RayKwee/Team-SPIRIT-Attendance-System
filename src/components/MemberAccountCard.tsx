@@ -4,6 +4,7 @@ import {
   AdminAccountProvisionError,
   type AdminCreateAccountResult,
   type AdminProvisionErrorCode,
+  type AdminRemoveAccountResult,
 } from '../lib/adminApi';
 import type { ClubMember, UserProfileRecord } from '../types/attendance';
 import { formatClubLoginEmail, generateInitialPassword } from '../utils/attendance';
@@ -15,17 +16,18 @@ import {
   PixelCopyIcon,
   PixelEyeIcon,
   PixelEyeOffIcon,
-  PixelHelpIcon,
   PixelKeyIcon,
   PixelLinkIcon,
   PixelLockIcon,
   PixelRefreshIcon,
   PixelStarIcon,
+  PixelTrashIcon,
 } from './PixelIcons';
 
 interface MemberAccountCardProps {
   member: ClubMember;
   members: ClubMember[];
+  currentUserId?: string | null;
   adminProfiles: UserProfileRecord[];
   isProfilesLoading: boolean;
   onEnsureMemberSynced?: () => Promise<boolean>;
@@ -45,6 +47,8 @@ interface MemberAccountCardProps {
     targetUserId: string,
     targetMemberId: string | null,
   ) => Promise<UserProfileRecord>;
+  onResetMemberPassword?: (targetUserId: string, newPassword: string) => Promise<void>;
+  onRemoveAccount?: (targetUserId: string) => Promise<AdminRemoveAccountResult>;
   onSyncMemberEmailToRoster: (member: ClubMember, email: string) => void;
   onNotify?: (options: {
     tone: 'success' | 'info' | 'warning' | 'error';
@@ -54,6 +58,7 @@ interface MemberAccountCardProps {
 }
 
 type AccountPanelMode = 'collapsed' | 'create' | 'link';
+type ConfirmActionType = 'unlink' | 'delete' | null;
 
 interface AccountFeedbackState {
   tone: 'success' | 'warning' | 'error';
@@ -64,16 +69,19 @@ interface AccountFeedbackState {
 interface CreatedCredentialsNotice {
   email: string;
   password: string;
-  requiresEmailConfirmation: boolean;
 }
+
+const EMAIL_BASIC_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /**
  * Admin-only Club Login Account panel rendered directly on a member's profile
- * inside MemberManagerSidebar. Completely omitted for non-admin & local-only users.
+ * inside the right-hand MemberManagerSidebar. Supports auto-verified account creation,
+ * linking existing accounts, unlinking, and safe account deletion.
  */
 export function MemberAccountCard({
   member,
   members,
+  currentUserId = null,
   adminProfiles,
   isProfilesLoading,
   onEnsureMemberSynced,
@@ -81,6 +89,8 @@ export function MemberAccountCard({
   onCreateAndLinkAccount,
   onSyncAndLinkAccount,
   onLinkUserToMember,
+  onResetMemberPassword,
+  onRemoveAccount,
   onSyncMemberEmailToRoster,
   onNotify,
 }: MemberAccountCardProps) {
@@ -91,11 +101,29 @@ export function MemberAccountCard({
   const saveEmailCreateId = useId();
   const saveEmailLinkId = useId();
 
-  const defaultLoginEmail = useMemo(() => formatClubLoginEmail(member.name), [member.name]);
+  const defaultLoginEmail = useMemo(
+    () => member.email?.trim().toLowerCase() || formatClubLoginEmail(member.name),
+    [member.email, member.name],
+  );
 
   const linkedProfile = useMemo(
     () => adminProfiles.find((profile) => profile.linkedMemberId === member.id) ?? null,
     [adminProfiles, member.id],
+  );
+
+  const activeAdminCount = useMemo(
+    () => adminProfiles.filter((profile) => !profile.isDisabled && profile.role === 'admin').length,
+    [adminProfiles],
+  );
+
+  const isLinkedSelf = Boolean(
+    linkedProfile && currentUserId && linkedProfile.userId === currentUserId,
+  );
+  const isLinkedLastAdmin = Boolean(
+    linkedProfile &&
+      !linkedProfile.isDisabled &&
+      linkedProfile.role === 'admin' &&
+      activeAdminCount <= 1,
   );
 
   const memberById = useMemo(
@@ -105,16 +133,18 @@ export function MemberAccountCard({
 
   const matchingExistingProfile = useMemo(() => {
     if (linkedProfile) return null;
-    const candidates = [defaultLoginEmail, member.email?.trim().toLowerCase() ?? ''].filter(
-      (value) => value.length > 0,
-    );
+    const candidates = [
+      defaultLoginEmail,
+      formatClubLoginEmail(member.name),
+      member.email?.trim().toLowerCase() ?? '',
+    ].filter((value) => value.length > 0);
     if (candidates.length === 0) return null;
     return (
       adminProfiles.find((profile) =>
         candidates.includes(profile.email.trim().toLowerCase()),
       ) ?? null
     );
-  }, [adminProfiles, defaultLoginEmail, linkedProfile, member.email]);
+  }, [adminProfiles, defaultLoginEmail, linkedProfile, member.email, member.name]);
 
   const matchingProfileOwner = useMemo(() => {
     if (!matchingExistingProfile?.linkedMemberId) return null;
@@ -151,13 +181,15 @@ export function MemberAccountCard({
     null,
   );
   const [copiedLabel, setCopiedLabel] = useState<string | null>(null);
-  const [showSetupGuide, setShowSetupGuide] = useState(false);
-  const [isUnlinkConfirmOpen, setIsUnlinkConfirmOpen] = useState(false);
+  const [confirmAction, setConfirmAction] = useState<ConfirmActionType>(null);
+  const [isResetFormOpen, setIsResetFormOpen] = useState(false);
+  const [resetPasswordValue, setResetPasswordValue] = useState('');
+  const [showResetPassword, setShowResetPassword] = useState(false);
 
   // Reset form state whenever the admin switches to a different member profile.
   useEffect(() => {
     setPanelMode('collapsed');
-    setAccountEmail(formatClubLoginEmail(member.name));
+    setAccountEmail(member.email?.trim().toLowerCase() || formatClubLoginEmail(member.name));
     setHasEditedEmail(false);
     setInitialPassword('');
     setShowPassword(false);
@@ -166,11 +198,13 @@ export function MemberAccountCard({
     setFeedback(null);
     setCreatedCredentials(null);
     setCopiedLabel(null);
-    setShowSetupGuide(false);
-    setIsUnlinkConfirmOpen(false);
+    setConfirmAction(null);
+    setIsResetFormOpen(false);
+    setResetPasswordValue('');
+    setShowResetPassword(false);
   }, [member.id]);
 
-  // Keep the suggested email updated if the member's name is edited while the admin hasn't customized it.
+  // Keep the suggested email updated if the member's name or email changes before manual edit.
   useEffect(() => {
     if (!hasEditedEmail) {
       setAccountEmail(defaultLoginEmail);
@@ -239,7 +273,7 @@ export function MemberAccountCard({
       onNotify?.({
         tone: 'info',
         tag: 'Accounts Synced',
-        message: `Loaded ${list.length} registered Supabase ${list.length === 1 ? 'account' : 'accounts'}.`,
+        message: `Loaded ${list.length} registered ${list.length === 1 ? 'account' : 'accounts'}.`,
       });
     } catch (err) {
       setFeedback({
@@ -257,11 +291,11 @@ export function MemberAccountCard({
     if (isBusy) return;
 
     const normalizedEmail = accountEmail.trim().toLowerCase();
-    if (!normalizedEmail) {
+    if (!normalizedEmail || !EMAIL_BASIC_RE.test(normalizedEmail)) {
       setFeedback({
         tone: 'error',
         code: 'invalid_email',
-        message: 'Enter a club login email address (for example: jun.yuen@teamspirit.club).',
+        message: 'Enter a valid login email address (for example: jun.yuen@teamspirit.club).',
       });
       return;
     }
@@ -270,7 +304,20 @@ export function MemberAccountCard({
       setFeedback({
         tone: 'error',
         code: 'weak_password',
-        message: 'Set an initial password of at least 6 characters.',
+        message: 'Password must be at least 6 characters long.',
+      });
+      return;
+    }
+
+    // Pre-flight duplicate check against known accounts before issuing auth signUp.
+    const duplicateProfile = adminProfiles.find(
+      (profile) => profile.email.trim().toLowerCase() === normalizedEmail,
+    );
+    if (duplicateProfile) {
+      setFeedback({
+        tone: 'error',
+        code: 'already_exists',
+        message: `An account for "${normalizedEmail}" already exists. Switch to "Link Account" to connect it to ${member.name}.`,
       });
       return;
     }
@@ -304,34 +351,20 @@ export function MemberAccountCard({
       setCreatedCredentials({
         email: result.email,
         password: initialPassword,
-        requiresEmailConfirmation: result.requiresEmailConfirmation,
       });
       setInitialPassword('');
       setShowPassword(false);
       setPanelMode('collapsed');
 
-      if (result.requiresEmailConfirmation) {
-        setShowSetupGuide(true);
-        setFeedback({
-          tone: 'warning',
-          message: `Account "${result.email}" was created and linked to ${member.name}, but Supabase requires email confirmation before they can sign in. See the Setup Guide below to confirm or disable Confirm Email.`,
-        });
-        onNotify?.({
-          tone: 'warning',
-          tag: 'Account Linked (Unconfirmed)',
-          message: `Created & linked ${result.email}, but email confirmation is still enabled in Supabase Auth.`,
-        });
-      } else {
-        setFeedback({
-          tone: 'success',
-          message: `Created and linked "${result.email}" to ${member.name}. Their personal attendance and project ideas are now connected.`,
-        });
-        onNotify?.({
-          tone: 'success',
-          tag: 'Account Created',
-          message: `Created & linked ${result.email} for ${member.name}.`,
-        });
-      }
+      setFeedback({
+        tone: 'success',
+        message: `Created, verified, and linked "${result.email}" to ${member.name}. Ready for immediate sign-in.`,
+      });
+      onNotify?.({
+        tone: 'success',
+        tag: 'Account Created',
+        message: `Created & linked ${result.email} for ${member.name}.`,
+      });
     } catch (err) {
       if (err instanceof AdminAccountProvisionError) {
         setFeedback({
@@ -339,9 +372,6 @@ export function MemberAccountCard({
           code: err.code,
           message: err.message,
         });
-        if (err.needsSetupGuide) {
-          setShowSetupGuide(true);
-        }
         if (err.code === 'already_exists' && onSyncAdminProfiles) {
           void onSyncAdminProfiles().catch(() => {});
         }
@@ -392,12 +422,12 @@ export function MemberAccountCard({
       setPanelMode('collapsed');
       setFeedback({
         tone: 'success',
-        message: `Linked "${linked.email}" to ${member.name}. Personal attendance and submitted project ideas are now connected.`,
+        message: `Linked "${linked.email}" to ${member.name}. Personal attendance and project ideas are now connected.`,
       });
       onNotify?.({
         tone: 'success',
         tag: 'Account Linked',
-        message: `Synced & linked ${linked.email} to ${member.name}.`,
+        message: `Linked ${linked.email} to ${member.name}.`,
       });
     } catch (err) {
       if (err instanceof AdminAccountProvisionError) {
@@ -406,9 +436,6 @@ export function MemberAccountCard({
           code: err.code,
           message: err.message,
         });
-        if (err.needsSetupGuide) {
-          setShowSetupGuide(true);
-        }
       } else {
         setFeedback({
           tone: 'error',
@@ -428,7 +455,7 @@ export function MemberAccountCard({
       setFeedback({
         tone: 'error',
         code: 'invalid_email',
-        message: 'Enter the Supabase account email address to sync and link.',
+        message: 'Enter the account email address to sync and link.',
       });
       return;
     }
@@ -439,35 +466,106 @@ export function MemberAccountCard({
     if (!selectedExistingUserId) {
       setFeedback({
         tone: 'error',
-        message: 'Select a registered Supabase account from the list first.',
+        message: 'Select a registered account from the list first.',
       });
       return;
     }
     await executeSyncAndLink({ userId: selectedExistingUserId });
   }
 
-  async function handleConfirmUnlink() {
-    if (!linkedProfile || isBusy) return;
+  async function handleResetPasswordSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (
+      !linkedProfile ||
+      !onResetMemberPassword ||
+      isBusy ||
+      linkedProfile.role !== 'member' ||
+      linkedProfile.isDisabled
+    ) {
+      return;
+    }
+
+    if (resetPasswordValue.length < 6) {
+      setFeedback({
+        tone: 'error',
+        code: 'weak_password',
+        message: 'New password must be at least 6 characters long.',
+      });
+      return;
+    }
+
     setIsBusy(true);
     setFeedback(null);
     try {
-      await onLinkUserToMember(linkedProfile.userId, null);
-      setCreatedCredentials(null);
-      setIsUnlinkConfirmOpen(false);
+      await onResetMemberPassword(linkedProfile.userId, resetPasswordValue);
+      setCreatedCredentials({
+        email: linkedProfile.email,
+        password: resetPasswordValue,
+      });
+      setResetPasswordValue('');
+      setShowResetPassword(false);
+      setIsResetFormOpen(false);
       setFeedback({
         tone: 'success',
-        message: `Unlinked "${linkedProfile.email}" from ${member.name}.`,
+        message: `Updated password for "${linkedProfile.email}". ${member.name} can sign in with the new password immediately.`,
       });
       onNotify?.({
-        tone: 'info',
-        tag: 'Account Unlinked',
-        message: `Unlinked ${linkedProfile.email} from ${member.name}.`,
+        tone: 'success',
+        tag: 'Password Reset',
+        message: `Updated login password for ${member.name}.`,
       });
     } catch (err) {
-      setIsUnlinkConfirmOpen(false);
       setFeedback({
         tone: 'error',
-        message: err instanceof Error ? err.message : 'Unable to unlink account.',
+        message: err instanceof Error ? err.message : 'Unable to update member password.',
+      });
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function handleConfirmModalAction() {
+    if (!linkedProfile || !confirmAction || isBusy) return;
+    const action = confirmAction;
+    setIsBusy(true);
+    setFeedback(null);
+    setConfirmAction(null);
+
+    try {
+      if (action === 'unlink') {
+        await onLinkUserToMember(linkedProfile.userId, null);
+        setCreatedCredentials(null);
+        setFeedback({
+          tone: 'success',
+          message: `Unlinked "${linkedProfile.email}" from ${member.name}.`,
+        });
+        onNotify?.({
+          tone: 'info',
+          tag: 'Account Unlinked',
+          message: `Unlinked ${linkedProfile.email} from ${member.name}.`,
+        });
+      } else if (action === 'delete' && onRemoveAccount) {
+        const result = await onRemoveAccount(linkedProfile.userId);
+        setCreatedCredentials(null);
+        if (result.mode === 'deleted') {
+          const msg = `Deleted user account "${linkedProfile.email}". ${member.name}'s roster profile and attendance history remain preserved.`;
+          setFeedback({ tone: 'warning', message: msg });
+          onNotify?.({ tone: 'warning', tag: 'Account Deleted', message: msg });
+        } else {
+          const msg = `Revoked and disabled access for "${linkedProfile.email}" and unlinked it from ${member.name}.`;
+          setFeedback({ tone: 'warning', message: msg });
+          onNotify?.({ tone: 'warning', tag: 'Access Revoked', message: msg });
+        }
+      }
+    } catch (err) {
+      setFeedback({
+        tone: 'error',
+        message:
+          err instanceof Error
+            ? err.message
+            : action === 'delete'
+              ? 'Unable to delete user account.'
+              : 'Unable to unlink account.',
       });
     } finally {
       setIsBusy(false);
@@ -483,9 +581,9 @@ export function MemberAccountCard({
         className="member-account-panel"
         aria-label="Admin Club Login Account Management"
         onKeyDown={(event) => {
-          if (event.key === 'Escape' && isUnlinkConfirmOpen) {
+          if (event.key === 'Escape' && confirmAction) {
             event.stopPropagation();
-            setIsUnlinkConfirmOpen(false);
+            setConfirmAction(null);
           } else if (event.key === 'Escape' && panelMode !== 'collapsed' && !isBusy) {
             event.stopPropagation();
             setPanelMode('collapsed');
@@ -543,17 +641,36 @@ export function MemberAccountCard({
                 ) : (
                   <PixelCopyIcon width={12} height={12} />
                 )}
-                <span>{copiedLabel === 'Login email' ? 'Copied' : 'Copy Email'}</span>
+                <span>{copiedLabel === 'Login email' ? 'Copied' : 'Copy'}</span>
               </button>
               <button
                 type="button"
-                className="icon-btn icon-btn-danger member-account-unlink-btn"
-                onClick={() => setIsUnlinkConfirmOpen(true)}
+                className="btn-secondary btn-compact member-account-action-btn"
+                onClick={() => setConfirmAction('unlink')}
                 disabled={isBusy}
                 title={`Unlink ${linkedProfile.email} from ${member.name}`}
               >
                 <span>Unlink</span>
               </button>
+              {onRemoveAccount && (
+                <button
+                  type="button"
+                  className="icon-btn icon-btn-danger member-account-delete-btn"
+                  onClick={() => setConfirmAction('delete')}
+                  disabled={isBusy || isLinkedSelf || isLinkedLastAdmin}
+                  aria-label={`Delete user account ${linkedProfile.email}`}
+                  title={
+                    isLinkedSelf
+                      ? 'You cannot delete your own signed-in account'
+                      : isLinkedLastAdmin
+                        ? 'Cannot delete the last remaining Admin account'
+                        : `Delete account ${linkedProfile.email}`
+                  }
+                >
+                  <PixelTrashIcon width={12} height={12} />
+                  <span>Delete</span>
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -585,23 +702,98 @@ export function MemberAccountCard({
               </span>
             </div>
             <p className="member-account-linked-meta">
-              Personal attendance records &amp; submitted project ideas are synced to this login •
-              Registered {formatTimestamp(linkedProfile.createdAt)}
+              Auto-verified &amp; synced to this profile • Registered{' '}
+              {formatTimestamp(linkedProfile.createdAt)}
             </p>
 
+            {/* Admin Reset Password for Linked Normal Members ONLY (strictly hidden for Admin accounts) */}
+            {linkedProfile.role === 'member' && !linkedProfile.isDisabled && onResetMemberPassword && (
+              <div className="member-account-reset-wrap">
+                {!isResetFormOpen ? (
+                  <button
+                    type="button"
+                    className="btn-secondary btn-compact"
+                    disabled={isBusy}
+                    onClick={() => {
+                      setIsResetFormOpen(true);
+                      setResetPasswordValue('');
+                      setShowResetPassword(true);
+                      setFeedback(null);
+                    }}
+                  >
+                    <PixelKeyIcon width={12} height={12} />
+                    <span>Reset Member Password</span>
+                  </button>
+                ) : (
+                  <form
+                    className="accounts-reset-form"
+                    onSubmit={(event) => void handleResetPasswordSubmit(event)}
+                    noValidate
+                  >
+                    <div className="accounts-reset-top">
+                      <span className="accounts-reset-label">Set New Password for {member.name}</span>
+                      <button
+                        type="button"
+                        className="ring-reset-btn"
+                        disabled={isBusy}
+                        onClick={() => {
+                          setResetPasswordValue(generateInitialPassword(10));
+                          setShowResetPassword(true);
+                        }}
+                      >
+                        Generate
+                      </button>
+                    </div>
+                    <div className="member-account-password-wrap">
+                      <input
+                        type={showResetPassword ? 'text' : 'password'}
+                        className="form-control member-account-input"
+                        placeholder="New password (min. 6 chars)"
+                        value={resetPasswordValue}
+                        disabled={isBusy}
+                        autoComplete="new-password"
+                        onChange={(event) => setResetPasswordValue(event.target.value)}
+                        required
+                      />
+                      <button
+                        type="button"
+                        className="icon-btn member-account-eye-btn"
+                        onClick={() => setShowResetPassword((prev) => !prev)}
+                        aria-label={showResetPassword ? 'Hide password' : 'Show password'}
+                        title={showResetPassword ? 'Hide password' : 'Show password'}
+                      >
+                        {showResetPassword ? <PixelEyeOffIcon /> : <PixelEyeIcon />}
+                      </button>
+                    </div>
+                    <div className="accounts-reset-actions">
+                      <button
+                        type="button"
+                        className="btn-secondary btn-compact"
+                        disabled={isBusy}
+                        onClick={() => {
+                          setIsResetFormOpen(false);
+                          setResetPasswordValue('');
+                        }}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="submit"
+                        className="btn-primary btn-compact-primary"
+                        disabled={isBusy || resetPasswordValue.length < 6}
+                      >
+                        <span>{isBusy ? 'Saving...' : 'Save Password'}</span>
+                      </button>
+                    </div>
+                  </form>
+                )}
+              </div>
+            )}
+
             {createdCredentials && createdCredentials.email === linkedProfile.email && (
-              <div
-                className={`member-account-creds-box ${
-                  createdCredentials.requiresEmailConfirmation ? 'is-warning' : ''
-                }`}
-                role="status"
-              >
+              <div className="member-account-creds-box" role="status">
                 <div className="member-account-creds-header">
-                  <strong>
-                    {createdCredentials.requiresEmailConfirmation
-                      ? 'New Account Created (Confirmation Required)'
-                      : 'New Login Ready to Share'}
-                  </strong>
+                  <strong>New Login Ready (Auto-Verified)</strong>
                   <button
                     type="button"
                     className="btn-secondary btn-compact"
@@ -625,12 +817,12 @@ export function MemberAccountCard({
                     Email: <code>{createdCredentials.email}</code>
                   </span>
                   <span>
-                    Initial Password: <code>{createdCredentials.password}</code>
+                    Password: <code>{createdCredentials.password}</code>
                   </span>
                 </div>
                 <p className="member-account-creds-note">
-                  Share these credentials securely with {member.name}. The password is not stored in
-                  this browser after you close this profile.
+                  {member.name} can log in immediately without email confirmation. Copy these
+                  credentials now — the password is not stored locally after closing.
                 </p>
               </div>
             )}
@@ -641,16 +833,16 @@ export function MemberAccountCard({
         {!linkedProfile && panelMode === 'collapsed' && (
           <div className="member-account-preview-wrap">
             <div className="member-account-email-preview">
-              <span className="member-account-preview-label">Auto Login Email</span>
+              <span className="member-account-preview-label">Suggested Login Email</span>
               <code className="member-account-preview-code">
-                {defaultLoginEmail || 'Enter custom email in Create / Link'}
+                {defaultLoginEmail || 'Enter email in Create / Link'}
               </code>
             </div>
 
             {matchingExistingProfile && !matchingExistingProfile.linkedMemberId && (
               <div className="member-account-match-banner" role="status">
                 <div className="member-account-match-copy">
-                  <strong>Existing Supabase Account Found</strong>
+                  <strong>Existing Unlinked Account Found</strong>
                   <span>
                     <code>{matchingExistingProfile.email}</code> is already registered and unlinked.
                   </span>
@@ -667,7 +859,7 @@ export function MemberAccountCard({
                   }
                 >
                   <PixelLinkIcon width={12} height={12} />
-                  <span>{isBusy ? 'Linking...' : 'Sync & Link Now'}</span>
+                  <span>{isBusy ? 'Linking...' : 'Link Now'}</span>
                 </button>
               </div>
             )}
@@ -677,7 +869,7 @@ export function MemberAccountCard({
                 <div className="member-account-match-copy">
                   <strong>Email Already Linked Elsewhere</strong>
                   <span>
-                    <code>{matchingExistingProfile.email}</code> is currently linked to{' '}
+                    <code>{matchingExistingProfile.email}</code> is linked to{' '}
                     <strong>{matchingProfileOwner?.name ?? 'another roster profile'}</strong>. Use a
                     unique email or unlink it there first.
                   </span>
@@ -717,12 +909,12 @@ export function MemberAccountCard({
           </div>
         )}
 
-        {/* Expanded Mode: Create New Supabase Account */}
+        {/* Expanded Mode: Create New Auto-Verified Member Account */}
         {!linkedProfile && panelMode === 'create' && (
           <form className="member-account-form" onSubmit={(e) => void handleCreateSubmit(e)} noValidate>
             <div className="member-account-field">
               <div className="member-account-label-row">
-                <label htmlFor={createEmailInputId}>Club Login Email</label>
+                <label htmlFor={createEmailInputId}>Member Login Email</label>
                 {isEmailCustomized && (
                   <button
                     type="button"
@@ -732,7 +924,7 @@ export function MemberAccountCard({
                       setHasEditedEmail(false);
                     }}
                   >
-                    Reset to {defaultLoginEmail}
+                    Reset
                   </button>
                 )}
               </div>
@@ -753,21 +945,21 @@ export function MemberAccountCard({
                 required
               />
               <span className="member-account-helper">
-                Auto-formatted from <strong>{member.name}</strong> (lowercase, spaces replaced by
-                dots).
+                Auto-verified immediately &amp; linked as a <strong>Member</strong> account for{' '}
+                <strong>{member.name}</strong>.
               </span>
             </div>
 
             <div className="member-account-field">
               <div className="member-account-label-row">
-                <label htmlFor={createPasswordInputId}>Initial Password</label>
+                <label htmlFor={createPasswordInputId}>Password</label>
                 <button
                   type="button"
                   className="ring-reset-btn"
                   disabled={isBusy}
                   onClick={handleGeneratePassword}
                 >
-                  Generate Password
+                  Generate
                 </button>
               </div>
               <div className="member-account-password-wrap">
@@ -831,7 +1023,7 @@ export function MemberAccountCard({
           </form>
         )}
 
-        {/* Expanded Mode: Sync / Link Existing Supabase Account */}
+        {/* Expanded Mode: Link Existing Account */}
         {!linkedProfile && panelMode === 'link' && (
           <div className="member-account-form">
             <form
@@ -841,7 +1033,7 @@ export function MemberAccountCard({
             >
               <div className="member-account-field">
                 <div className="member-account-label-row">
-                  <label htmlFor={linkEmailInputId}>Sync Existing Account by Email</label>
+                  <label htmlFor={linkEmailInputId}>Link Existing Account by Email</label>
                   {isEmailCustomized && (
                     <button
                       type="button"
@@ -874,12 +1066,9 @@ export function MemberAccountCard({
                     disabled={isBusy || !accountEmail.trim()}
                   >
                     <PixelLinkIcon width={12} height={12} />
-                    <span>{isBusy ? 'Syncing...' : 'Sync & Link'}</span>
+                    <span>{isBusy ? 'Linking...' : 'Link'}</span>
                   </button>
                 </div>
-                <span className="member-account-helper">
-                  Looks up the user directly in Supabase Auth and links them to {member.name}.
-                </span>
               </div>
             </form>
 
@@ -890,7 +1079,7 @@ export function MemberAccountCard({
             <div className="member-account-field">
               <div className="member-account-label-row">
                 <label htmlFor={linkSelectInputId}>
-                  Registered Supabase Accounts ({adminProfiles.length})
+                  Registered Accounts ({adminProfiles.length})
                 </label>
                 {onSyncAdminProfiles && (
                   <button
@@ -916,7 +1105,7 @@ export function MemberAccountCard({
                   <option value="">
                     {sortedProfilesForPicker.length === 0
                       ? 'No accounts synced yet...'
-                      : 'Choose a Supabase account...'}
+                      : 'Choose an account...'}
                   </option>
                   {sortedProfilesForPicker.map((profile) => {
                     const otherOwner = profile.linkedMemberId
@@ -974,60 +1163,6 @@ export function MemberAccountCard({
             </div>
           </div>
         )}
-
-        {/* Collapsible Supabase Authentication Permission Setup Guide */}
-        <div className="member-account-guide-wrap">
-          <button
-            type="button"
-            className="member-account-guide-toggle"
-            aria-expanded={showSetupGuide}
-            onClick={() => setShowSetupGuide((prev) => !prev)}
-          >
-            <PixelHelpIcon width={12} height={12} />
-            <span>
-              {showSetupGuide
-                ? 'Hide Supabase Auth Setup Guide'
-                : 'Supabase Permission & Setup Guide'}
-            </span>
-          </button>
-
-          {showSetupGuide && (
-            <div className="member-account-setup-guide" role="note">
-              <p className="member-account-guide-intro">
-                To create <code>@teamspirit.club</code> login accounts directly from this Admin
-                panel, check these settings in your <strong>Supabase Dashboard</strong>:
-              </p>
-              <ol className="member-account-guide-steps">
-                <li>
-                  <strong>Install Latest SQL Schema:</strong> Open{' '}
-                  <em>SQL Editor → New Query</em> and run the updated{' '}
-                  <code>supabase/schema.sql</code> so direct account syncing and project-idea
-                  backfilling are active.
-                </li>
-                <li>
-                  <strong>Enable Signups:</strong> Go to{' '}
-                  <em>Authentication → Sign In / Providers</em> (or <em>Providers → Email</em>) and
-                  ensure <strong>Allow new users to sign up</strong> is toggled <strong>ON</strong>{' '}
-                  with the <strong>Email</strong> provider enabled.
-                </li>
-                <li>
-                  <strong>Disable Email Confirmation (Recommended):</strong> Under{' '}
-                  <em>Authentication → Sign In / Providers → Email</em>, toggle{' '}
-                  <strong>Confirm email</strong> <strong>OFF</strong> and click{' '}
-                  <strong>Save</strong>. Because <code>@teamspirit.club</code> logins do not use an
-                  external inbox, this lets members sign in immediately and avoids SMTP rate limits.
-                </li>
-                <li>
-                  <strong>Prefer Keeping Signups OFF?</strong> Create the user manually under{' '}
-                  <em>Authentication → Users → Add User</em> (check{' '}
-                  <strong>Auto Confirm User</strong>), then click{' '}
-                  <strong>Link Account → Sync &amp; Link</strong> right here to connect their
-                  profile.
-                </li>
-              </ol>
-            </div>
-          )}
-        </div>
       </section>
 
       {typeof document !== 'undefined' &&
@@ -1040,17 +1175,25 @@ export function MemberAccountCard({
             }}
           >
             <ConfirmDialog
-              isOpen={isUnlinkConfirmOpen && linkedProfile !== null}
-              badgeLabel="Unlink Login"
-              title={linkedProfile ? `Unlink "${linkedProfile.email}"?` : ''}
-              message={
+              isOpen={confirmAction !== null && linkedProfile !== null}
+              badgeLabel={confirmAction === 'delete' ? 'Delete Account' : 'Unlink Login'}
+              title={
                 linkedProfile
-                  ? `Unlinking "${linkedProfile.email}" from "${member.name}" will remove their access to this personal roster profile until linked again. Attendance history and submitted project ideas will NOT be deleted.`
+                  ? confirmAction === 'delete'
+                    ? `Delete account "${linkedProfile.email}"?`
+                    : `Unlink "${linkedProfile.email}"?`
                   : ''
               }
-              confirmLabel="Unlink Account"
-              onConfirm={() => void handleConfirmUnlink()}
-              onCancel={() => setIsUnlinkConfirmOpen(false)}
+              message={
+                linkedProfile
+                  ? confirmAction === 'delete'
+                    ? `Permanently delete user account "${linkedProfile.email}" from Team SPIRIT? Any active sessions will be revoked immediately. "${member.name}"'s roster profile, attendance history, and submitted project ideas will remain safely preserved.`
+                    : `Unlinking "${linkedProfile.email}" from "${member.name}" will remove their access to this personal roster profile until linked again. Attendance history and submitted project ideas will NOT be deleted.`
+                  : ''
+              }
+              confirmLabel={confirmAction === 'delete' ? 'Delete Account' : 'Unlink Account'}
+              onConfirm={() => void handleConfirmModalAction()}
+              onCancel={() => setConfirmAction(null)}
             />
           </div>,
           document.body,

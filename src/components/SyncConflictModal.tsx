@@ -6,7 +6,11 @@ import type {
   SyncedMemberRecord,
   SyncedSessionRecord,
 } from '../types/attendance';
-import { STATUS_LABELS } from '../utils/attendance';
+import {
+  MEETING_VISIBILITY_LABELS,
+  STATUS_LABELS,
+  normalizeMeetingVisibility,
+} from '../utils/attendance';
 import { formatTimestamp } from '../utils/date';
 import { PixelAlertIcon, PixelCheckIcon, PixelCloseIcon, PixelRefreshIcon } from './PixelIcons';
 
@@ -39,11 +43,13 @@ function summarizeRecord(item: SyncConflictItem, side: 'local' | 'remote'): stri
 
   if (item.entityType === 'session') {
     const s = record as SyncedSessionRecord;
+    const visLabel = MEETING_VISIBILITY_LABELS[normalizeMeetingVisibility(s.visibility)];
     return [
       `Name: ${s.name}`,
       `When: ${s.date} ${s.time}`,
       s.location ? `Location: ${s.location}` : null,
       s.eventType ? `Type: ${s.eventType}` : null,
+      `Visibility: ${visLabel}`,
       s.description ? `Notes: ${s.description}` : null,
     ].filter((line): line is string => Boolean(line));
   }

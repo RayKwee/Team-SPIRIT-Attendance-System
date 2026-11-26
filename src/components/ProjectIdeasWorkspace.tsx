@@ -13,10 +13,6 @@ import {
   PROJECT_IDEA_CATEGORIES,
   PROJECT_IDEA_STATUS_LABELS,
   canUserDeleteContent,
-  type ClubPost,
-  type ClubPostComment,
-  type ClubPostCommentInput,
-  type ClubPostInput,
   type ContentDeletionMode,
   type ProjectIdea,
   type ProjectIdeaReviewStatus,
@@ -32,12 +28,10 @@ import {
   PixelEditIcon,
   PixelEyeIcon,
   PixelEyeOffIcon,
-  PixelFlameIcon,
   PixelGridIcon,
   PixelIdeaIcon,
   PixelListIcon,
   PixelLockIcon,
-  PixelMegaphoneIcon,
   PixelPlusIcon,
   PixelRefreshIcon,
   PixelSearchIcon,
@@ -46,9 +40,7 @@ import {
   PixelTrashIcon,
   PixelUserIcon,
 } from './PixelIcons';
-import { PostsUpdatesFeed } from './PostsUpdatesFeed';
 
-type HubMobileSection = 'all' | 'updates' | 'ideas';
 type IdeaOwnershipFilter = 'all' | 'mine';
 
 interface ProjectIdeasWorkspaceProps {
@@ -56,23 +48,9 @@ interface ProjectIdeasWorkspaceProps {
   userEmail?: string;
   linkedMember?: ClubMember | null;
   isAdmin: boolean;
-  posts: ClubPost[];
-  comments: ClubPostComment[];
   sharedIdeaVisibility: boolean;
-  memberCanCommentOnPosts: boolean;
   contentDeletionMode: ContentDeletionMode;
-  isPostsLoading: boolean;
-  postsError: string | null;
-  isPostsLiveConnected: boolean;
-  isPublishingPost: boolean;
   isUpdatingSharedVisibility: boolean;
-  onRefreshPostsAndSettings: () => Promise<void>;
-  onPublishPost: (input: ClubPostInput) => Promise<ClubPost>;
-  onEditPost: (postId: string, input: ClubPostInput) => Promise<ClubPost>;
-  onTogglePinPost: (postId: string, nextPinned: boolean) => Promise<ClubPost>;
-  onDeletePost: (postId: string) => Promise<void>;
-  onAddComment: (input: ClubPostCommentInput) => Promise<ClubPostComment>;
-  onDeleteComment: (commentId: string) => Promise<void>;
   onSetSharedIdeaVisibility: (allowShared: boolean) => Promise<boolean>;
   onOpenCloudSync: () => void;
   onNotify?: (options: {
@@ -112,33 +90,17 @@ function resolveProfileAuthorName(
 }
 
 /**
- * Unified Team SPIRIT Updates & Project Ideas hub:
- * - Left: Public official Posts & Updates announcement feed (readable by everyone, admin-published).
- * - Right: Scoped Project Ideas board where signed-in members pitch under their logged-in profile
- *   and see personal feedback (plus club-wide ideas only if an admin enables Shared Idea Visibility).
+ * Dedicated Team SPIRIT Project Ideas space where signed-in members pitch ideas,
+ * browse featured builds (when shared visibility is enabled), and view private admin feedback.
  */
 export function ProjectIdeasWorkspace({
   userId,
   userEmail,
   linkedMember = null,
   isAdmin,
-  posts,
-  comments,
   sharedIdeaVisibility,
-  memberCanCommentOnPosts,
   contentDeletionMode,
-  isPostsLoading,
-  postsError,
-  isPostsLiveConnected,
-  isPublishingPost,
   isUpdatingSharedVisibility,
-  onRefreshPostsAndSettings,
-  onPublishPost,
-  onEditPost,
-  onTogglePinPost,
-  onDeletePost,
-  onAddComment,
-  onDeleteComment,
   onSetSharedIdeaVisibility,
   onOpenCloudSync,
   onNotify,
@@ -176,7 +138,6 @@ export function ProjectIdeasWorkspace({
     responderName: profileAuthorName,
   });
 
-  const [mobileSection, setMobileSection] = useState<HubMobileSection>('all');
   const [title, setTitle] = useState('');
   const [category, setCategory] = useState<string>('General');
   const [description, setDescription] = useState('');
@@ -235,11 +196,6 @@ export function ProjectIdeasWorkspace({
   const highlightedCount = useMemo(
     () => ideas.filter((item) => item.isHighlighted).length,
     [ideas],
-  );
-
-  const pinnedPostsCount = useMemo(
-    () => posts.filter((post) => post.isPinned).length,
-    [posts],
   );
 
   const myIdeasCount = useMemo(
@@ -519,156 +475,69 @@ export function ProjectIdeasWorkspace({
   }
 
   return (
-    <div className="ideas-workspace" data-tutorial-target="project-ideas-board">
-      <section className="stats-strip ideas-stats-strip" aria-label="Updates and Project Ideas HUD">
-        <article className="stat-card" data-accent="cyan">
-          <div className="stat-header">
-            <span className="stat-label">Posts &amp; Updates</span>
-            <span className="stat-icon">
-              <PixelMegaphoneIcon />
-            </span>
+    <div className="ideas-workspace ideas-standalone" data-tutorial-target="project-ideas-board">
+      <section className="lounge-welcome-banner ideas-hero-banner" aria-label="Project Ideas overview">
+        <div className="lounge-welcome-copy">
+          <div className="lounge-welcome-kicker">
+            <PixelIdeaIcon width={13} height={13} />
+            <span>Community Builds &amp; Proposals</span>
+            {userId && (
+              <>
+                <span className="lounge-welcome-dot" aria-hidden="true">
+                  ·
+                </span>
+                <span>
+                  {ideas.length} {ideas.length === 1 ? 'idea' : 'ideas'}
+                  {highlightedCount > 0 ? ` · ${highlightedCount} featured` : ''}
+                </span>
+              </>
+            )}
           </div>
-          <div className="stat-value">{posts.length}</div>
-          <div className="stat-meta">
-            {pinnedPostsCount > 0
-              ? `${pinnedPostsCount} pinned club announcement${pinnedPostsCount === 1 ? '' : 's'}`
-              : 'Public official club feed'}
-          </div>
-        </article>
+          <h2 className="lounge-welcome-heading">Project Ideas Board</h2>
+          <p className="lounge-welcome-subtitle">
+            Got a cool robot, app, workshop, or club event in mind? Pitch it here and track feedback from leads.
+          </p>
+        </div>
 
-        <article className="stat-card" data-accent="green">
-          <div className="stat-header">
-            <span className="stat-label">
-              {isAdmin ? 'All Club Ideas' : sharedIdeaVisibility ? 'Visible Ideas' : 'My Ideas'}
-            </span>
-            <span className="stat-icon">
-              <PixelIdeaIcon />
-            </span>
-          </div>
-          <div className="stat-value">{userId ? ideas.length : '—'}</div>
-          <div className="stat-meta">
-            {!userId
-              ? 'Sign in to submit & view your ideas'
-              : isAdmin
-                ? 'Full club moderation access'
-                : sharedIdeaVisibility
-                  ? `${myIdeasCount} submitted by you`
-                  : 'Private to you & club admins'}
-          </div>
-        </article>
-
-        <article className="stat-card" data-accent="gold">
-          <div className="stat-header">
-            <span className="stat-label">Highlighted Picks</span>
-            <span className="stat-icon">
-              <PixelStarIcon />
-            </span>
-          </div>
-          <div className="stat-value">{userId ? highlightedCount : '—'}</div>
-          <div className="stat-meta">Featured by Team SPIRIT leads</div>
-        </article>
-
-        <article className="stat-card" data-accent="red">
-          <div className="stat-header">
-            <span className="stat-label">Ideas Visibility</span>
-            <span className="stat-icon">
-              <PixelFlameIcon />
-            </span>
-          </div>
-          <div className="stat-value ideas-mode-value">
-            {isAdmin
-              ? sharedIdeaVisibility
-                ? 'Shared'
-                : 'Private'
-              : !userId
-                ? 'Updates Only'
-                : sharedIdeaVisibility
-                  ? 'Shared'
-                  : 'Self Only'}
-          </div>
-          <div className="stat-meta">
-            {isAdmin ? (
-              <button
-                type="button"
-                className="ideas-inline-link"
-                disabled={isUpdatingSharedVisibility}
-                onClick={() => void handleToggleSharedVisibility()}
-              >
+        <div className="lounge-welcome-actions">
+          {isAdmin ? (
+            <button
+              type="button"
+              className={`lounge-pitch-shortcut ${sharedIdeaVisibility ? 'is-shared' : ''}`}
+              disabled={isUpdatingSharedVisibility}
+              onClick={() => void handleToggleSharedVisibility()}
+            >
+              {sharedIdeaVisibility ? (
+                <PixelEyeIcon width={13} height={13} />
+              ) : (
+                <PixelEyeOffIcon width={13} height={13} />
+              )}
+              <span>
                 {isUpdatingSharedVisibility
                   ? 'Updating...'
                   : sharedIdeaVisibility
-                    ? 'Switch to Private (Author Only)'
-                    : 'Enable Shared Club Visibility'}
-              </button>
-            ) : !userId ? (
-              <button type="button" className="ideas-inline-link" onClick={onOpenCloudSync}>
-                Sign in with your club account
-              </button>
-            ) : sharedIdeaVisibility ? (
-              'Club ideas shared; feedback stays personal'
-            ) : (
-              'Only you & admins see your proposals'
-            )}
-          </div>
-        </article>
+                    ? 'Shared Visibility: ON'
+                    : 'Private (Author Only)'}
+              </span>
+            </button>
+          ) : !userId ? (
+            <button type="button" className="lounge-pitch-shortcut" onClick={onOpenCloudSync}>
+              <PixelUserIcon width={13} height={13} />
+              <span>Sign In to Pitch</span>
+            </button>
+          ) : (
+            <span className="lounge-next-meetup-pill is-static">
+              <span>
+                {sharedIdeaVisibility
+                  ? `Shared club board · ${myIdeasCount} yours`
+                  : 'Private to you & club leads'}
+              </span>
+            </span>
+          )}
+        </div>
       </section>
 
-      <div className="hub-section-switcher" role="tablist" aria-label="Mobile section view">
-        <button
-          type="button"
-          role="tab"
-          aria-selected={mobileSection === 'all'}
-          className={`filter-pill ${mobileSection === 'all' ? 'is-active' : ''}`}
-          onClick={() => setMobileSection('all')}
-        >
-          Updates &amp; Ideas
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={mobileSection === 'updates'}
-          className={`filter-pill ${mobileSection === 'updates' ? 'is-active' : ''}`}
-          onClick={() => setMobileSection('updates')}
-        >
-          Posts &amp; Updates ({posts.length})
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={mobileSection === 'ideas'}
-          className={`filter-pill ${mobileSection === 'ideas' ? 'is-active' : ''}`}
-          onClick={() => setMobileSection('ideas')}
-        >
-          Project Ideas {userId ? `(${ideas.length})` : ''}
-        </button>
-      </div>
-
-      <div className="updates-ideas-split" data-mobile-section={mobileSection}>
-        <div className="updates-feed-column">
-          <PostsUpdatesFeed
-            userId={userId}
-            posts={posts}
-            comments={comments}
-            isLoading={isPostsLoading}
-            error={postsError}
-            isLiveConnected={isPostsLiveConnected}
-            isPublishing={isPublishingPost}
-            isAdmin={isAdmin}
-            memberCanCommentOnPosts={memberCanCommentOnPosts}
-            contentDeletionMode={contentDeletionMode}
-            authorDisplayName={profileAuthorName}
-            onRefresh={onRefreshPostsAndSettings}
-            onPublishPost={onPublishPost}
-            onEditPost={onEditPost}
-            onTogglePinPost={onTogglePinPost}
-            onDeletePost={onDeletePost}
-            onAddComment={onAddComment}
-            onDeleteComment={onDeleteComment}
-            onOpenCloudSync={onOpenCloudSync}
-            onNotify={onNotify}
-          />
-        </div>
-
+      <div className="ideas-standalone-stack">
         <div className="ideas-column">
           {!userId ? (
             <section className="tracker-panel ideas-signin-gate" aria-label="Member login required for Project Ideas">
@@ -690,9 +559,9 @@ export function ProjectIdeasWorkspace({
                   </div>
                   <h3 className="empty-title">Sign in to pitch &amp; track your project ideas</h3>
                   <p className="empty-description">
-                    Official Posts &amp; Updates on the left are open to everyone. Project idea
-                    submissions are linked to each member&apos;s club account so personal proposals
-                    and admin feedback remain private.
+                    Club announcements and casual chat are always open in the Student Lounge.
+                    Project idea submissions are linked to each member&apos;s club account so
+                    personal proposals and admin feedback stay private.
                   </p>
                   <button type="button" className="btn-primary" onClick={onOpenCloudSync}>
                     <PixelUserIcon />

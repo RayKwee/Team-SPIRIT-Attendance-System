@@ -13,6 +13,7 @@ import {
 } from '../utils/attendance';
 import { formatSessionDate, formatSessionTime, formatTimestamp } from '../utils/date';
 import { ConfirmDialog } from './ConfirmDialog';
+import { MeetingVisibilityBadge } from './MeetingSettingsModal';
 import {
   PixelCalendarIcon,
   PixelChevronIcon,
@@ -26,6 +27,7 @@ import {
   PixelPlusIcon,
   PixelRefreshIcon,
   PixelSearchIcon,
+  PixelSettingsIcon,
   PixelTerminalIcon,
   PixelTrashIcon,
 } from './PixelIcons';
@@ -43,6 +45,7 @@ interface SessionHubProps {
   onRefreshRole?: () => void;
   onChangeViewMode: (mode: ViewMode) => void;
   onSelectSession: (sessionId: string) => void;
+  onEditSession: (session: AttendanceSession) => void;
   onDuplicateSession: (session: AttendanceSession) => void;
   onDeleteSession: (sessionId: string) => void;
   onOpenCreateSession: () => void;
@@ -62,6 +65,7 @@ export function SessionHub({
   onRefreshRole,
   onChangeViewMode,
   onSelectSession,
+  onEditSession,
   onDuplicateSession,
   onDeleteSession,
   onOpenCreateSession,
@@ -146,7 +150,10 @@ export function SessionHub({
   const isUnlinkedMember = accessScope === 'member_unlinked';
   const canCreateOrEditSessions = accessScope === 'local' || accessScope === 'admin';
   const showPendingLinkEmptyState =
-    isUnlinkedMember && !canViewCalendarDetails && !canViewAttendanceRates;
+    isUnlinkedMember &&
+    sessions.length === 0 &&
+    !canViewCalendarDetails &&
+    !canViewAttendanceRates;
   const showClubRateStats =
     accessScope === 'local' ||
     accessScope === 'admin' ||
@@ -363,6 +370,7 @@ export function SessionHub({
                         {session.eventType && (
                           <span className="session-type-tag">{session.eventType}</span>
                         )}
+                        <MeetingVisibilityBadge visibility={session.visibility} />
                       </div>
 
                       {canCreateOrEditSessions && (
@@ -371,6 +379,15 @@ export function SessionHub({
                           onClick={(event) => event.stopPropagation()}
                           onKeyDown={(event) => event.stopPropagation()}
                         >
+                          <button
+                            type="button"
+                            className="icon-btn session-hub-edit-btn"
+                            onClick={() => onEditSession(session)}
+                            aria-label={`Edit meeting settings for ${session.name}`}
+                            title="Edit meeting settings"
+                          >
+                            <PixelSettingsIcon width={12} height={12} />
+                          </button>
                           <button
                             type="button"
                             className="icon-btn session-hub-duplicate-btn"
@@ -531,6 +548,7 @@ export function SessionHub({
                         {session.eventType && (
                           <span className="session-type-tag">{session.eventType}</span>
                         )}
+                        <MeetingVisibilityBadge visibility={session.visibility} />
                       </div>
 
                       <div className="session-meta-pills">
@@ -605,6 +623,15 @@ export function SessionHub({
                           onClick={(event) => event.stopPropagation()}
                           onKeyDown={(event) => event.stopPropagation()}
                         >
+                          <button
+                            type="button"
+                            className="icon-btn session-hub-edit-btn"
+                            onClick={() => onEditSession(session)}
+                            aria-label={`Edit meeting settings for ${session.name}`}
+                            title="Edit meeting settings"
+                          >
+                            <PixelSettingsIcon width={12} height={12} />
+                          </button>
                           <button
                             type="button"
                             className="icon-btn session-hub-duplicate-btn"

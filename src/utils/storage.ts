@@ -13,6 +13,7 @@ import type {
 } from '../types/attendance';
 import {
   normalizeAcademicYear,
+  normalizeMeetingVisibility,
   normalizeMemberType,
   resolveStudentClassFields,
 } from './attendance';
@@ -205,6 +206,8 @@ function normalizeSession(raw: AttendanceSession): AttendanceSession {
         : undefined,
     eventType:
       typeof raw.eventType === 'string' && raw.eventType.trim() ? raw.eventType.trim() : undefined,
+    visibility: normalizeMeetingVisibility(raw.visibility),
+    createdByUserId: cleanOptionalString(raw.createdByUserId),
     createdAt: raw.createdAt,
     updatedAt: cleanOptionalString(raw.updatedAt),
     memberIds: sanitizeMemberIds(raw.memberIds, attendance),

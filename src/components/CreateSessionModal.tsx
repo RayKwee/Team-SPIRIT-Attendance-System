@@ -1,6 +1,15 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
-import type { AttendanceSession, NewSessionInput } from '../types/attendance';
+import type {
+  AttendanceSession,
+  MeetingVisibility,
+  NewSessionInput,
+} from '../types/attendance';
+import { normalizeMeetingVisibility } from '../utils/attendance';
 import { addDaysToDateKey, toIsoDateString } from '../utils/date';
+import {
+  MEETING_EVENT_TYPE_OPTIONS,
+  MeetingVisibilityControl,
+} from './MeetingSettingsModal';
 import {
   PixelCalendarIcon,
   PixelCloseIcon,
@@ -13,21 +22,13 @@ interface CreateSessionModalProps {
   defaultDate?: string;
   duplicateSource?: AttendanceSession | null;
   duplicateMemberCount?: number;
+  showVisibilityControls?: boolean;
   onClose: () => void;
   onCreateSession: (
     input: NewSessionInput,
     options?: { includeSourceMembers?: boolean },
   ) => void;
 }
-
-const EVENT_TYPE_OPTIONS = [
-  'Practice',
-  'Meeting',
-  'Workshop',
-  'Competition',
-  'Social',
-  'Other',
-];
 
 function getDefaultTimeValue(): string {
   const now = new Date();
@@ -42,6 +43,7 @@ export function CreateSessionModal({
   defaultDate,
   duplicateSource = null,
   duplicateMemberCount = 0,
+  showVisibilityControls = false,
   onClose,
   onCreateSession,
 }: CreateSessionModalProps) {
@@ -52,6 +54,7 @@ export function CreateSessionModal({
   const locationInputId = useId();
   const eventTypeInputId = useId();
   const descriptionInputId = useId();
+  const visibilityLabelId = useId();
   const includeMembersId = useId();
 
   const nameInputRef = useRef<HTMLInputElement | null>(null);
@@ -63,6 +66,7 @@ export function CreateSessionModal({
   const [location, setLocation] = useState('');
   const [eventType, setEventType] = useState('');
   const [description, setDescription] = useState('');
+  const [visibility, setVisibility] = useState<MeetingVisibility>('public');
   const [includeSourceMembers, setIncludeSourceMembers] = useState(true);
   const [errorMessage, setErrorMessage] = useState('');
 
@@ -76,6 +80,7 @@ export function CreateSessionModal({
       setLocation(duplicateSource.location ?? '');
       setEventType(duplicateSource.eventType ?? '');
       setDescription(duplicateSource.description ?? '');
+      setVisibility(normalizeMeetingVisibility(duplicateSource.visibility));
       setIncludeSourceMembers(true);
     } else {
       setName('');
@@ -84,6 +89,7 @@ export function CreateSessionModal({
       setLocation('');
       setEventType('');
       setDescription('');
+      setVisibility('public');
       setIncludeSourceMembers(false);
     }
     setErrorMessage('');
@@ -141,6 +147,7 @@ export function CreateSessionModal({
         location: location.trim() || undefined,
         eventType: eventType.trim() || undefined,
         description: description.trim() || undefined,
+        visibility: showVisibilityControls ? visibility : 'public',
       },
       isDuplicateMode ? { includeSourceMembers } : undefined,
     );
@@ -273,7 +280,7 @@ export function CreateSessionModal({
                 onChange={(event) => setEventType(event.target.value)}
               >
                 <option value="">Unspecified</option>
-                {EVENT_TYPE_OPTIONS.map((option) => (
+                {MEETING_EVENT_TYPE_OPTIONS.map((option) => (
                   <option key={option} value={option}>
                     {option}
                   </option>
@@ -295,6 +302,23 @@ export function CreateSessionModal({
               onChange={(event) => setDescription(event.target.value)}
             />
           </div>
+
+          {showVisibilityControls && (
+            <div className="meeting-visibility-section">
+              <div className="meeting-visibility-header">
+                <span id={visibilityLabelId} className="meeting-visibility-label">
+                  Visibility
+                </span>
+                <span className="meeting-visibility-admin-pill">Admin</span>
+              </div>
+              <MeetingVisibilityControl
+                value={visibility}
+                onChange={setVisibility}
+                allowPrivate
+                labelId={visibilityLabelId}
+              />
+            </div>
+          )}
 
           {isDuplicateMode && duplicateMemberCount > 0 && (
             <label className="cloud-sync-merge-option" htmlFor={includeMembersId}>

@@ -4,6 +4,7 @@ import type {
   ClassLetter,
   ClassYear,
   ClubMember,
+  MeetingVisibility,
   MemberProfileInput,
   MemberType,
 } from '../types/attendance';
@@ -14,6 +15,57 @@ export const STATUS_LABELS: Record<AttendanceStatus, string> = {
   absent_without_reason: 'Absent w/o Reason',
   unmarked: 'Unmarked',
 };
+
+export const MEETING_VISIBILITY_OPTIONS: readonly MeetingVisibility[] = [
+  'public',
+  'admins_only',
+  'private',
+];
+
+export const MEETING_VISIBILITY_LABELS: Record<MeetingVisibility, string> = {
+  public: 'Public',
+  admins_only: 'Admins Only',
+  private: 'Private',
+};
+
+export const MEETING_VISIBILITY_DESCRIPTIONS: Record<MeetingVisibility, string> = {
+  public: 'Viewable by everyone in the club.',
+  admins_only: 'Restricted to club administrators only.',
+  private: 'Visible only to you as the creator.',
+};
+
+/** Normalizes any unknown or legacy session visibility value to a valid MeetingVisibility. */
+export function normalizeMeetingVisibility(value: unknown): MeetingVisibility {
+  if (value === 'admins_only' || value === 'private' || value === 'public') {
+    return value;
+  }
+  return 'public';
+}
+
+/** Returns true when the current user is allowed to set a meeting's visibility to Private. */
+export function canUserSetSessionPrivate(
+  session: Pick<AttendanceSession, 'createdByUserId'>,
+  currentUserId: string | null,
+): boolean {
+  if (!session.createdByUserId) return true;
+  return Boolean(currentUserId && session.createdByUserId === currentUserId);
+}
+
+/** Client-side defense-in-depth visibility check mirroring Supabase attendance_sessions RLS. */
+export function canUserViewSession(
+  session: Pick<AttendanceSession, 'visibility' | 'createdByUserId'>,
+  context: {
+    isCloudConnected: boolean;
+    isAdmin: boolean;
+    currentUserId: string | null;
+  },
+): boolean {
+  if (!context.isCloudConnected) return true;
+  const visibility = normalizeMeetingVisibility(session.visibility);
+  if (visibility === 'public') return true;
+  if (visibility === 'admins_only') return context.isAdmin;
+  return Boolean(context.currentUserId && session.createdByUserId === context.currentUserId);
+}
 
 export const MEMBER_TYPE_LABELS: Record<MemberType, string> = {
   student: 'Student',

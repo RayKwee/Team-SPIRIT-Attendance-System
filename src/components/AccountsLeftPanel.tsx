@@ -2,21 +2,46 @@ import {
   useEffect,
   useId,
   useMemo,
+  useRef,
   useState,
+  type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import { createPortal } from 'react-dom';
-import type { AdminRemoveAccountResult } from '../lib/adminApi';
+import {
+  AdminAccountProvisionError,
+  type AdminCreateAccountResult,
+  type AdminRemoveAccountResult,
+} from '../lib/adminApi';
 import type { ClubMember, UserProfileRecord } from '../types/attendance';
-import { getMemberInitials } from '../utils/attendance';
+import {
+  formatClubLoginEmail,
+  generateInitialPassword,
+  getMemberInitials,
+  isLegacyMember,
+} from '../utils/attendance';
 import { formatTimestamp } from '../utils/date';
+import {
+  buildMemberCredentialsClipboardText,
+  exportMemberCredentialsCsv,
+  exportMemberCredentialsText,
+  type MemberCredentialExportRow,
+} from '../utils/export';
 import { ConfirmDialog } from './ConfirmDialog';
 import {
   PixelAlertIcon,
   PixelBanIcon,
   PixelCheckIcon,
+  PixelChevronIcon,
   PixelCloseIcon,
+  PixelCopyIcon,
+  PixelDownloadIcon,
+  PixelEyeIcon,
+  PixelEyeOffIcon,
+  PixelKeyIcon,
   PixelLinkIcon,
+  PixelLockIcon,
+  PixelPlusIcon,
   PixelRefreshIcon,
   PixelRestoreIcon,
   PixelSearchIcon,
@@ -31,11 +56,21 @@ interface AccountsLeftPanelProps {
   isOpen: boolean;
   currentUserId: string | null;
   profiles: UserProfileRecord[];
+  memberCredentials?: Record<string, string>;
   members: ClubMember[];
   isProfilesLoading: boolean;
   profilesError?: string | null;
   onClose: () => void;
   onSyncProfiles: () => Promise<UserProfileRecord[]>;
+  onEnsureMemberSynced?: () => Promise<boolean>;
+  onCreateAndLinkMemberAccount?: (params: {
+    memberId?: string | null;
+    memberName?: string;
+    email: string;
+    password: string;
+  }) => Promise<AdminCreateAccountResult>;
+  onResetMemberPassword?: (targetUserId: string, newPassword: string) => Promise<void>;
+  onSyncMemberEmailToRoster?: (member: ClubMember, email: string) => void;
   onUpdateUserAdminRole: (targetUserId: string, makeAdmin: boolean) => Promise<UserProfileRecord>;
   onLinkUserToMember: (
     targetUserId: string,
@@ -61,20 +96,28 @@ type PendingAccountAction =
   | { type: 'enable'; profile: UserProfileRecord }
   | { type: 'remove'; profile: UserProfileRecord };
 
+const EMAIL_BASIC_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 /**
- * Admin-only dockable left-hand Accounts panel displaying every registered Supabase account,
- * its linked club member name, email, power level badge, and quick row-level Admin Actions.
+ * Admin-only dockable left-hand Accounts panel displaying every registered account,
+ * direct member account creation, strictly member-only password viewing & quick export,
+ * and quick row-level Admin Actions.
  */
 export function AccountsLeftPanel({
   id,
   isOpen,
   currentUserId,
   profiles,
+  memberCredentials = {},
   members,
   isProfilesLoading,
   profilesError,
   onClose,
   onSyncProfiles,
+  onEnsureMemberSynced,
+  onCreateAndLinkMemberAccount,
+  onResetMemberPassword,
+  onSyncMemberEmailToRoster,
   onUpdateUserAdminRole,
   onLinkUserToMember,
   onSetAccountDisabled,
@@ -83,6 +126,12 @@ export function AccountsLeftPanel({
   onNotify,
 }: AccountsLeftPanelProps) {
   const titleId = useId();
+  const createMemberSelectId = useId();
+  const createEmailInputId = useId();
+  const createPasswordInputId = useId();
+  const saveRosterEmailId = useId();
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
+
   const [searchQuery, setSearchQuery] = useState('');
   const [filterTab, setFilterTab] = useState<AccountFilterTab>('all');
   const [busyUserId, setBusyUserId] = useState<string | null>(null);
@@ -94,21 +143,151 @@ export function AccountsLeftPanel({
     message: string;
   } | null>(null);
 
+  // Direct inline Member Account creation state
+  const [isCreateFormOpen, setIsCreateFormOpen] = useState(false);
+  const [selectedCreateMemberId, setSelectedCreateMemberId] = useState('');
+  const [createEmail, setCreateEmail] = useState('');
+  const [hasEditedCreateEmail, setHasEditedCreateEmail] = useState(false);
+  const [createPassword, setCreatePassword] = useState('');
+  const [showCreatePassword, setShowCreatePassword] = useState(false);
+  const [saveEmailToRoster, setSaveEmailToRoster] = useState(true);
+  const [isCreatingMember, setIsCreatingMember] = useState(false);
+  const [createFormError, setCreateFormError] = useState<string | null>(null);
+
+  // Member-only password visibility, inline reset & quick copy/export state
+  const [revealAllPasswords, setRevealAllPasswords] = useState(false);
+  const [revealedPasswordIds, setRevealedPasswordIds] = useState<Set<string>>(() => new Set());
+  const [copiedPasswordUserId, setCopiedPasswordUserId] = useState<string | null>(null);
+  const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+  const [resettingUserId, setResettingUserId] = useState<string | null>(null);
+  const [resetPasswordValue, setResetPasswordValue] = useState('');
+  const [showResetPassword, setShowResetPassword] = useState(false);
+  const [resetFormError, setResetFormError] = useState<string | null>(null);
+
   useEffect(() => {
     if (!isOpen) {
       setReassigningUserId(null);
       setPendingAction(null);
+      setIsExportMenuOpen(false);
+      setRevealAllPasswords(false);
+      setRevealedPasswordIds(new Set());
+      setResettingUserId(null);
+      setResetPasswordValue('');
+      setShowResetPassword(false);
+      setResetFormError(null);
     }
   }, [isOpen]);
+
+  useEffect(() => {
+    if (!isExportMenuOpen) return;
+    function handleDocumentMouseDown(event: MouseEvent) {
+      if (
+        exportMenuRef.current &&
+        event.target instanceof Node &&
+        !exportMenuRef.current.contains(event.target)
+      ) {
+        setIsExportMenuOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleDocumentMouseDown);
+    return () => document.removeEventListener('mousedown', handleDocumentMouseDown);
+  }, [isExportMenuOpen]);
 
   const memberById = useMemo(
     () => new Map(members.map((member) => [member.id, member])),
     [members],
   );
 
+  const linkedProfileByMemberId = useMemo(() => {
+    const map = new Map<string, UserProfileRecord>();
+    for (const profile of profiles) {
+      if (profile.linkedMemberId) {
+        map.set(profile.linkedMemberId, profile);
+      }
+    }
+    return map;
+  }, [profiles]);
+
   const sortedMembers = useMemo(
     () => [...members].sort((a, b) => a.name.localeCompare(b.name)),
     [members],
+  );
+
+  const membersForCreation = useMemo(() => {
+    return [...members].sort((a, b) => {
+      const aLinked = linkedProfileByMemberId.has(a.id) ? 1 : 0;
+      const bLinked = linkedProfileByMemberId.has(b.id) ? 1 : 0;
+      if (aLinked !== bLinked) return aLinked - bLinked;
+
+      const aLegacy = isLegacyMember(a) ? 1 : 0;
+      const bLegacy = isLegacyMember(b) ? 1 : 0;
+      if (aLegacy !== bLegacy) return aLegacy - bLegacy;
+
+      return a.name.localeCompare(b.name);
+    });
+  }, [linkedProfileByMemberId, members]);
+
+  const unlinkedMembers = useMemo(
+    () => membersForCreation.filter((member) => !linkedProfileByMemberId.has(member.id)),
+    [linkedProfileByMemberId, membersForCreation],
+  );
+
+  const selectedCreateMember = useMemo(
+    () => (selectedCreateMemberId ? memberById.get(selectedCreateMemberId) ?? null : null),
+    [memberById, selectedCreateMemberId],
+  );
+
+  const suggestedCreateEmail = useMemo(() => {
+    if (!selectedCreateMember) return '';
+    return (
+      selectedCreateMember.email?.trim().toLowerCase() ||
+      formatClubLoginEmail(selectedCreateMember.name)
+    );
+  }, [selectedCreateMember]);
+
+  // If a previously selected member becomes linked or deleted, revert cleanly to standalone mode.
+  useEffect(() => {
+    if (!selectedCreateMemberId) return;
+    if (!linkedProfileByMemberId.has(selectedCreateMemberId) && memberById.has(selectedCreateMemberId)) {
+      return;
+    }
+    setSelectedCreateMemberId('');
+    setHasEditedCreateEmail(false);
+  }, [linkedProfileByMemberId, memberById, selectedCreateMemberId]);
+
+  useEffect(() => {
+    if (!hasEditedCreateEmail) {
+      setCreateEmail(suggestedCreateEmail);
+    }
+  }, [hasEditedCreateEmail, suggestedCreateEmail]);
+
+  useEffect(() => {
+    if (selectedCreateMember) {
+      setSaveEmailToRoster(!selectedCreateMember.email?.trim());
+    }
+  }, [selectedCreateMember?.id]);
+
+  // Strictly member-only export rows (Admin accounts are NEVER included).
+  const memberExportRows = useMemo<MemberCredentialExportRow[]>(() => {
+    return profiles
+      .filter((profile) => profile.role === 'member' && !profile.isDisabled)
+      .map((profile) => {
+        const linked = profile.linkedMemberId ? memberById.get(profile.linkedMemberId) ?? null : null;
+        return {
+          memberName: linked?.name || 'Unlinked Member',
+          className: linked?.className || '',
+          clubRole: linked?.role || '',
+          email: profile.email || profile.userId,
+          password: memberCredentials[profile.userId] || '',
+          status: linked ? 'Linked' : 'Unlinked',
+        };
+      })
+      .sort((a, b) => a.memberName.localeCompare(b.memberName) || a.email.localeCompare(b.email));
+  }, [memberById, memberCredentials, profiles]);
+
+  const recordedMemberPasswordCount = useMemo(
+    () => memberExportRows.filter((row) => row.password.length > 0).length,
+    [memberExportRows],
   );
 
   const counts = useMemo(() => {
@@ -194,14 +373,33 @@ export function AccountsLeftPanel({
   }, [effectiveFilterTab, memberById, profiles, searchQuery]);
 
   function handleKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
+    if (event.key === 'Escape' && isExportMenuOpen) {
+      event.stopPropagation();
+      setIsExportMenuOpen(false);
+      return;
+    }
     if (event.key === 'Escape' && pendingAction) {
       event.stopPropagation();
       setPendingAction(null);
       return;
     }
+    if (event.key === 'Escape' && resettingUserId && !busyUserId) {
+      event.stopPropagation();
+      setResettingUserId(null);
+      setResetPasswordValue('');
+      setShowResetPassword(false);
+      setResetFormError(null);
+      return;
+    }
     if (event.key === 'Escape' && reassigningUserId) {
       event.stopPropagation();
       setReassigningUserId(null);
+      return;
+    }
+    if (event.key === 'Escape' && isCreateFormOpen && !isCreatingMember) {
+      event.stopPropagation();
+      setIsCreateFormOpen(false);
+      setCreateFormError(null);
       return;
     }
     if (event.key === 'Escape' && isOpen) {
@@ -210,8 +408,229 @@ export function AccountsLeftPanel({
     }
   }
 
+  function toggleCardPasswordVisibility(targetUserId: string) {
+    setRevealedPasswordIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(targetUserId)) {
+        next.delete(targetUserId);
+      } else {
+        next.add(targetUserId);
+      }
+      return next;
+    });
+  }
+
+  function handleToggleRevealAll() {
+    if (revealAllPasswords) {
+      setRevealAllPasswords(false);
+      setRevealedPasswordIds(new Set());
+    } else {
+      setRevealAllPasswords(true);
+    }
+  }
+
+  async function handleCopySinglePassword(userId: string, password: string, label: string) {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(password);
+        setCopiedPasswordUserId(userId);
+        window.setTimeout(() => {
+          setCopiedPasswordUserId((current) => (current === userId ? null : current));
+        }, 1800);
+        onNotify?.({
+          tone: 'info',
+          tag: 'Copied',
+          message: `Copied member password for ${label}.`,
+        });
+      }
+    } catch {
+      onNotify?.({
+        tone: 'warning',
+        tag: 'Copy Failed',
+        message: 'Clipboard access was blocked by the browser.',
+      });
+    }
+  }
+
+  async function handleCopyAllMemberCredentials() {
+    setIsExportMenuOpen(false);
+    if (memberExportRows.length === 0) {
+      setPanelNotice({ tone: 'warning', message: 'No active member accounts to export.' });
+      return;
+    }
+    try {
+      const text = buildMemberCredentialsClipboardText(memberExportRows);
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        const msg = `Copied ${memberExportRows.length} member ${
+          memberExportRows.length === 1 ? 'account' : 'accounts'
+        } (member-only; admins excluded).`;
+        setPanelNotice({ tone: 'success', message: msg });
+        onNotify?.({ tone: 'success', tag: 'Credentials Copied', message: msg });
+      }
+    } catch {
+      setPanelNotice({ tone: 'error', message: 'Clipboard access was blocked by the browser.' });
+    }
+  }
+
+  function handleExportCsv() {
+    setIsExportMenuOpen(false);
+    if (memberExportRows.length === 0) {
+      setPanelNotice({ tone: 'warning', message: 'No active member accounts to export.' });
+      return;
+    }
+    exportMemberCredentialsCsv(memberExportRows);
+    const msg = `Exported CSV for ${memberExportRows.length} member ${
+      memberExportRows.length === 1 ? 'account' : 'accounts'
+    } (admins excluded).`;
+    setPanelNotice({ tone: 'success', message: msg });
+    onNotify?.({ tone: 'info', tag: 'CSV Exported', message: msg });
+  }
+
+  function handleExportText() {
+    setIsExportMenuOpen(false);
+    if (memberExportRows.length === 0) {
+      setPanelNotice({ tone: 'warning', message: 'No active member accounts to export.' });
+      return;
+    }
+    exportMemberCredentialsText(memberExportRows);
+    const msg = `Downloaded TXT sheet for ${memberExportRows.length} member ${
+      memberExportRows.length === 1 ? 'account' : 'accounts'
+    } (admins excluded).`;
+    setPanelNotice({ tone: 'success', message: msg });
+    onNotify?.({ tone: 'info', tag: 'TXT Exported', message: msg });
+  }
+
+  async function handleCreateMemberAccountSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!onCreateAndLinkMemberAccount || isCreatingMember) return;
+
+    const normalizedEmail = createEmail.trim().toLowerCase();
+    if (!normalizedEmail || !EMAIL_BASIC_RE.test(normalizedEmail)) {
+      setCreateFormError('Enter a valid login email address (e.g. jun.yuen@teamspirit.club).');
+      return;
+    }
+
+    if (createPassword.length < 6) {
+      setCreateFormError('Password must be at least 6 characters long.');
+      return;
+    }
+
+    const existingDuplicate = profiles.find(
+      (profile) => profile.email.trim().toLowerCase() === normalizedEmail,
+    );
+    if (existingDuplicate) {
+      setCreateFormError(
+        `An account for "${normalizedEmail}" already exists. Link it below instead.`,
+      );
+      return;
+    }
+
+    setIsCreatingMember(true);
+    setCreateFormError(null);
+    setPanelNotice(null);
+
+    try {
+      if (selectedCreateMember && onEnsureMemberSynced) {
+        const synced = await onEnsureMemberSynced();
+        if (!synced) {
+          setCreateFormError(
+            'Could not sync roster changes to Supabase Cloud first. Check your connection and retry.',
+          );
+          return;
+        }
+      }
+
+      const result = await onCreateAndLinkMemberAccount({
+        memberId: selectedCreateMember?.id ?? null,
+        memberName: selectedCreateMember?.name,
+        email: normalizedEmail,
+        password: createPassword,
+      });
+
+      if (
+        selectedCreateMember &&
+        saveEmailToRoster &&
+        onSyncMemberEmailToRoster &&
+        selectedCreateMember.email?.trim().toLowerCase() !== result.email.toLowerCase()
+      ) {
+        onSyncMemberEmailToRoster(selectedCreateMember, result.email);
+      }
+
+      setCreatePassword('');
+      setCreateEmail('');
+      setSelectedCreateMemberId('');
+      setShowCreatePassword(false);
+      setHasEditedCreateEmail(false);
+      setIsCreateFormOpen(false);
+      const msg = selectedCreateMember
+        ? `Created, auto-verified, and linked "${result.email}" to ${selectedCreateMember.name}.`
+        : `Created and auto-verified standalone member account "${result.email}". You can link it to a roster profile anytime.`;
+      setPanelNotice({ tone: 'success', message: msg });
+      onNotify?.({ tone: 'success', tag: 'Account Created', message: msg });
+    } catch (err) {
+      setCreateFormError(
+        err instanceof AdminAccountProvisionError || err instanceof Error
+          ? err.message
+          : 'Unable to create member account.',
+      );
+    } finally {
+      setIsCreatingMember(false);
+    }
+  }
+
+  function handleToggleResetPasswordForm(profile: UserProfileRecord) {
+    if (busyUserId || profile.role !== 'member' || profile.isDisabled) return;
+    if (resettingUserId === profile.userId) {
+      setResettingUserId(null);
+      setResetPasswordValue('');
+      setShowResetPassword(false);
+      setResetFormError(null);
+      return;
+    }
+    setResettingUserId(profile.userId);
+    setResetPasswordValue('');
+    setShowResetPassword(true);
+    setResetFormError(null);
+  }
+
+  async function handleResetMemberPasswordSubmit(
+    event: FormEvent<HTMLFormElement>,
+    profile: UserProfileRecord,
+  ) {
+    event.preventDefault();
+    if (!onResetMemberPassword || busyUserId || profile.role !== 'member' || profile.isDisabled) {
+      return;
+    }
+
+    if (resetPasswordValue.length < 6) {
+      setResetFormError('New password must be at least 6 characters long.');
+      return;
+    }
+
+    setBusyUserId(profile.userId);
+    setResetFormError(null);
+    setPanelNotice(null);
+
+    try {
+      await onResetMemberPassword(profile.userId, resetPasswordValue);
+      setResettingUserId(null);
+      setResetPasswordValue('');
+      setShowResetPassword(false);
+      const msg = `Updated login password for member "${profile.email || profile.userId}".`;
+      setPanelNotice({ tone: 'success', message: msg });
+      onNotify?.({ tone: 'success', tag: 'Password Reset', message: msg });
+    } catch (err) {
+      setResetFormError(
+        err instanceof Error ? err.message : 'Unable to update member password.',
+      );
+    } finally {
+      setBusyUserId(null);
+    }
+  }
+
   async function handleSyncClick() {
-    if (isSyncing || busyUserId) return;
+    if (isSyncing || busyUserId || isCreatingMember) return;
     setIsSyncing(true);
     setPanelNotice(null);
     try {
@@ -275,7 +694,7 @@ export function AccountsLeftPanel({
     try {
       if (action.type === 'promote') {
         await onUpdateUserAdminRole(action.profile.userId, true);
-        const msg = `Promoted ${label} to Admin.`;
+        const msg = `Promoted ${label} to Admin. Stored member password was automatically purged.`;
         setPanelNotice({ tone: 'success', message: msg });
         onNotify?.({ tone: 'success', tag: 'Promoted', message: msg });
       } else if (action.type === 'demote') {
@@ -303,9 +722,9 @@ export function AccountsLeftPanel({
         if (result.mode === 'deleted') {
           const msg = `Permanently removed account ${label}. Historical attendance and project ideas remain preserved.`;
           setPanelNotice({ tone: 'warning', message: msg });
-          onNotify?.({ tone: 'warning', tag: 'Account Removed', message: msg });
+          onNotify?.({ tone: 'warning', tag: 'Account Deleted', message: msg });
         } else {
-          const msg = `Revoked and disabled all access for ${label}. To also delete the Auth user entry, remove it under Supabase Dashboard → Authentication → Users.`;
+          const msg = `Revoked and disabled all access for ${label}.`;
           setPanelNotice({ tone: 'warning', message: msg });
           onNotify?.({ tone: 'warning', tag: 'Access Revoked', message: msg });
         }
@@ -339,7 +758,7 @@ export function AccountsLeftPanel({
           badgeLabel: 'Promote to Admin',
           title: `Promote "${emailLabel}" to Admin?`,
           message:
-            'This account will gain full Administrator power: managing club members, sessions, attendance, global visibility permissions, and other user accounts.',
+            'This account will gain full Administrator power and its stored member password will be automatically purged so admin passwords remain strictly private.',
           confirmLabel: 'Promote to Admin',
         };
       case 'demote':
@@ -378,17 +797,17 @@ export function AccountsLeftPanel({
         };
       case 'remove':
         return {
-          badgeLabel: 'Remove Account',
-          title: `Remove "${emailLabel}" permanently?`,
+          badgeLabel: 'Delete Account',
+          title: `Delete "${emailLabel}" permanently?`,
           message:
-            'This revokes all permissions, unlinks any connected roster member, and removes the account from Supabase. Past club attendance history and submitted project ideas remain safely preserved.',
-          confirmLabel: 'Remove Account',
+            'This revokes all permissions, terminates active sessions, unlinks any connected roster member, and deletes the user account from Team SPIRIT. Past club attendance history and submitted project ideas remain safely preserved.',
+          confirmLabel: 'Delete Account',
         };
     }
   }
 
   const dialogMeta = getConfirmDialogMeta(pendingAction);
-  const isAnyBusy = Boolean(busyUserId) || isSyncing;
+  const isAnyBusy = Boolean(busyUserId) || isSyncing || isCreatingMember;
 
   return (
     <>
@@ -422,7 +841,7 @@ export function AccountsLeftPanel({
               className="btn-secondary btn-compact"
               onClick={() => void handleSyncClick()}
               disabled={isAnyBusy || isProfilesLoading}
-              title="Sync registered accounts from Supabase Auth"
+              title="Sync registered accounts and member credentials from Supabase"
             >
               <PixelRefreshIcon />
               <span>{isSyncing || isProfilesLoading ? 'Syncing...' : 'Sync'}</span>
@@ -440,6 +859,295 @@ export function AccountsLeftPanel({
         </div>
 
         <div className="accounts-drawer-body">
+          {/* Quick Direct Actions: Create Member Account + Member Credentials Export & Reveal */}
+          <div className="accounts-quick-toolbar">
+            {onCreateAndLinkMemberAccount && (
+              <button
+                type="button"
+                className={`btn-primary btn-compact-primary accounts-create-trigger ${
+                  isCreateFormOpen ? 'is-active' : ''
+                }`}
+                aria-expanded={isCreateFormOpen}
+                disabled={isAnyBusy}
+                onClick={() => {
+                  setIsCreateFormOpen((prev) => !prev);
+                  setCreateFormError(null);
+                }}
+                title="Create an auto-verified login account for an existing member"
+              >
+                <PixelPlusIcon width={12} height={12} />
+                <span>{isCreateFormOpen ? 'Close Form' : 'Create Member'}</span>
+              </button>
+            )}
+
+            <div className="accounts-toolbar-right">
+              {recordedMemberPasswordCount > 0 && (
+                <button
+                  type="button"
+                  className={`btn-secondary btn-compact accounts-reveal-all-btn ${
+                    revealAllPasswords ? 'is-active' : ''
+                  }`}
+                  onClick={handleToggleRevealAll}
+                  title={
+                    revealAllPasswords
+                      ? 'Hide all member passwords'
+                      : 'Reveal all recorded member passwords (admin passwords remain hidden)'
+                  }
+                >
+                  {revealAllPasswords ? (
+                    <PixelEyeOffIcon width={12} height={12} />
+                  ) : (
+                    <PixelEyeIcon width={12} height={12} />
+                  )}
+                  <span>{revealAllPasswords ? 'Hide' : 'Passwords'}</span>
+                </button>
+              )}
+
+              <div className="export-menu-wrap" ref={exportMenuRef}>
+                <button
+                  type="button"
+                  className={`btn-secondary btn-compact ${isExportMenuOpen ? 'is-active' : ''}`}
+                  aria-expanded={isExportMenuOpen}
+                  aria-haspopup="menu"
+                  disabled={memberExportRows.length === 0}
+                  onClick={() => setIsExportMenuOpen((prev) => !prev)}
+                  title={
+                    memberExportRows.length === 0
+                      ? 'No member accounts available to export'
+                      : 'Copy or download standard member login credentials (excludes admins)'
+                  }
+                >
+                  <PixelDownloadIcon width={12} height={12} />
+                  <span>Export</span>
+                  <PixelChevronIcon width={10} height={10} className="export-chevron-icon" />
+                </button>
+
+                {isExportMenuOpen && (
+                  <div
+                    className="export-menu-dropdown export-menu-dropdown-right"
+                    role="menu"
+                    aria-label="Export member credentials"
+                  >
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="export-menu-item"
+                      onClick={() => void handleCopyAllMemberCredentials()}
+                    >
+                      <PixelCopyIcon width={12} height={12} />
+                      <span>Copy All Member Logins</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="export-menu-item"
+                      onClick={handleExportCsv}
+                    >
+                      <PixelDownloadIcon width={12} height={12} />
+                      <span>Download CSV (.csv)</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="export-menu-item"
+                      onClick={handleExportText}
+                    >
+                      <PixelKeyIcon width={12} height={12} />
+                      <span>Download TXT (.txt)</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Direct Inline Member Account Creation Drawer */}
+          {isCreateFormOpen && onCreateAndLinkMemberAccount && (
+            <section className="accounts-inline-create-card" aria-label="Create Member Account">
+              <div className="accounts-inline-create-header">
+                <span className="member-section-label member-account-heading">
+                  <PixelKeyIcon width={12} height={12} />
+                  <span>New Member Login</span>
+                </span>
+                <span className="member-account-status-pill is-linked">Auto-Verified</span>
+              </div>
+
+              {createFormError && (
+                <div className="member-account-feedback is-error" role="alert">
+                  <div className="member-account-feedback-row">
+                    <PixelAlertIcon width={13} height={13} />
+                    <span>{createFormError}</span>
+                  </div>
+                </div>
+              )}
+
+              <form
+                className="member-account-form"
+                onSubmit={(event) => void handleCreateMemberAccountSubmit(event)}
+                noValidate
+              >
+                <div className="member-account-field">
+                  <div className="member-account-label-row">
+                    <label htmlFor={createMemberSelectId}>
+                      Link to Member <span className="optional-mark">(Optional)</span>
+                    </label>
+                    {unlinkedMembers.length > 0 && (
+                      <span className="accounts-optional-hint">
+                        {unlinkedMembers.length} unlinked
+                      </span>
+                    )}
+                  </div>
+                  <select
+                    id={createMemberSelectId}
+                    className="form-control member-account-select"
+                    value={selectedCreateMemberId}
+                    disabled={isCreatingMember}
+                    onChange={(event) => {
+                      setSelectedCreateMemberId(event.target.value);
+                      setHasEditedCreateEmail(false);
+                      setCreateFormError(null);
+                    }}
+                  >
+                    <option value="">No member profile (Standalone account)</option>
+                    {membersForCreation.map((member) => {
+                      const existing = linkedProfileByMemberId.get(member.id);
+                      const classPart = member.className ? ` (${member.className})` : '';
+                      const legacyPart = isLegacyMember(member) ? ' [Legacy]' : '';
+                      const suffix = existing ? ' — Linked' : '';
+                      return (
+                        <option key={member.id} value={member.id} disabled={Boolean(existing)}>
+                          {member.name}
+                          {classPart}
+                          {legacyPart}
+                          {suffix}
+                        </option>
+                      );
+                    })}
+                  </select>
+                </div>
+
+                <div className="member-account-field">
+                  <div className="member-account-label-row">
+                    <label htmlFor={createEmailInputId}>Login Email</label>
+                    {hasEditedCreateEmail &&
+                      suggestedCreateEmail &&
+                      createEmail.trim().toLowerCase() !== suggestedCreateEmail && (
+                        <button
+                          type="button"
+                          className="ring-reset-btn"
+                          onClick={() => {
+                            setCreateEmail(suggestedCreateEmail);
+                            setHasEditedCreateEmail(false);
+                          }}
+                        >
+                          Reset
+                        </button>
+                      )}
+                  </div>
+                  <input
+                    id={createEmailInputId}
+                    type="email"
+                    className="form-control member-account-input"
+                    placeholder="member@teamspirit.club"
+                    value={createEmail}
+                    disabled={isCreatingMember}
+                    onChange={(event) => {
+                      setCreateEmail(event.target.value);
+                      setHasEditedCreateEmail(true);
+                      if (createFormError) setCreateFormError(null);
+                    }}
+                    required
+                  />
+                </div>
+
+                <div className="member-account-field">
+                  <div className="member-account-label-row">
+                    <label htmlFor={createPasswordInputId}>Password</label>
+                    <button
+                      type="button"
+                      className="ring-reset-btn"
+                      disabled={isCreatingMember}
+                      onClick={() => {
+                        setCreatePassword(generateInitialPassword(10));
+                        setShowCreatePassword(true);
+                        setCreateFormError(null);
+                      }}
+                    >
+                      Generate
+                    </button>
+                  </div>
+                  <div className="member-account-password-wrap">
+                    <input
+                      id={createPasswordInputId}
+                      type={showCreatePassword ? 'text' : 'password'}
+                      className="form-control member-account-input"
+                      placeholder="Min. 6 characters"
+                      value={createPassword}
+                      disabled={isCreatingMember}
+                      autoComplete="new-password"
+                      onChange={(event) => {
+                        setCreatePassword(event.target.value);
+                        if (createFormError) setCreateFormError(null);
+                      }}
+                      required
+                    />
+                    <button
+                      type="button"
+                      className="icon-btn member-account-eye-btn"
+                      onClick={() => setShowCreatePassword((prev) => !prev)}
+                      aria-label={showCreatePassword ? 'Hide password' : 'Show password'}
+                      title={showCreatePassword ? 'Hide password' : 'Show password'}
+                    >
+                      {showCreatePassword ? <PixelEyeOffIcon /> : <PixelEyeIcon />}
+                    </button>
+                  </div>
+                </div>
+
+                {selectedCreateMember && onSyncMemberEmailToRoster && (
+                  <label className="member-account-checkbox-row" htmlFor={saveRosterEmailId}>
+                    <input
+                      id={saveRosterEmailId}
+                      type="checkbox"
+                      className="selection-checkbox"
+                      checked={saveEmailToRoster}
+                      disabled={isCreatingMember}
+                      onChange={(event) => setSaveEmailToRoster(event.target.checked)}
+                    />
+                    <span>Save email to member&apos;s roster profile</span>
+                  </label>
+                )}
+
+                <div className="member-account-form-footer">
+                  <button
+                    type="button"
+                    className="btn-secondary btn-compact"
+                    disabled={isCreatingMember}
+                    onClick={() => {
+                      setIsCreateFormOpen(false);
+                      setCreateFormError(null);
+                    }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn-primary btn-compact-primary"
+                    disabled={isCreatingMember}
+                  >
+                    <PixelLockIcon width={12} height={12} />
+                    <span>
+                      {isCreatingMember
+                        ? 'Creating...'
+                        : selectedCreateMember
+                          ? 'Create & Link'
+                          : 'Create Account'}
+                    </span>
+                  </button>
+                </div>
+              </form>
+            </section>
+          )}
+
           {/* Power Level Summary Strip */}
           <div className="accounts-summary-strip" aria-label="Account power level summary">
             <span className="accounts-summary-chip is-admin">
@@ -567,7 +1275,7 @@ export function AccountsLeftPanel({
               </strong>
               <span>
                 {profiles.length === 0
-                  ? 'Click Sync above to pull accounts from Supabase Auth, or create member logins from the Member Manager sidebar.'
+                  ? 'Click Create Member above to add a member login, or click Sync to load existing accounts.'
                   : 'Try clearing your search query or switching the role filter.'}
               </span>
             </div>
@@ -576,6 +1284,7 @@ export function AccountsLeftPanel({
               {filteredProfiles.map((profile) => {
                 const isDisabled = Boolean(profile.isDisabled);
                 const isTargetAdmin = !isDisabled && profile.role === 'admin';
+                const isStandardMember = !isDisabled && profile.role === 'member';
                 const isSelf = Boolean(currentUserId && profile.userId === currentUserId);
                 const isLastActiveAdmin = isTargetAdmin && counts.activeAdmins <= 1;
                 const isRowBusy = busyUserId === profile.userId;
@@ -586,6 +1295,15 @@ export function AccountsLeftPanel({
                 const displayInitials = linkedMember
                   ? getMemberInitials(linkedMember.name)
                   : (profile.email.slice(0, 2).toUpperCase() || 'TS');
+
+                // Strictly only read passwords for standard 'member' accounts (NEVER for admins).
+                const memberPassword = isStandardMember
+                  ? memberCredentials[profile.userId] ?? null
+                  : null;
+                const isPasswordVisible =
+                  isStandardMember &&
+                  Boolean(memberPassword) &&
+                  (revealAllPasswords || revealedPasswordIds.has(profile.userId));
 
                 return (
                   <li
@@ -667,6 +1385,166 @@ export function AccountsLeftPanel({
                         </span>
                       </div>
                     </div>
+
+                    {/* Member-Only Password Strip & Inline Reset (Strictly omitted for Admin accounts) */}
+                    {isStandardMember ? (
+                      <div className="accounts-credential-block">
+                        <div className="accounts-credential-strip" aria-label="Member login password">
+                          <div className="accounts-credential-value-wrap">
+                            <span className="accounts-credential-label">
+                              <PixelKeyIcon width={10} height={10} />
+                              <span>PWD</span>
+                            </span>
+                            {memberPassword ? (
+                              <code
+                                className={`accounts-credential-code ${
+                                  isPasswordVisible ? 'is-visible' : 'is-masked'
+                                }`}
+                              >
+                                {isPasswordVisible ? memberPassword : '••••••••••'}
+                              </code>
+                            ) : (
+                              <span className="accounts-credential-missing">Not recorded</span>
+                            )}
+                          </div>
+
+                          <div className="accounts-credential-actions">
+                            {memberPassword && (
+                              <>
+                                <button
+                                  type="button"
+                                  className="icon-btn accounts-cred-btn"
+                                  onClick={() => toggleCardPasswordVisibility(profile.userId)}
+                                  aria-label={isPasswordVisible ? 'Hide password' : 'Show password'}
+                                  title={isPasswordVisible ? 'Hide password' : 'Show password'}
+                                >
+                                  {isPasswordVisible ? (
+                                    <PixelEyeOffIcon width={12} height={12} />
+                                  ) : (
+                                    <PixelEyeIcon width={12} height={12} />
+                                  )}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="icon-btn accounts-cred-btn"
+                                  onClick={() =>
+                                    void handleCopySinglePassword(
+                                      profile.userId,
+                                      memberPassword,
+                                      linkedMember?.name || profile.email,
+                                    )
+                                  }
+                                  aria-label={`Copy password for ${profile.email}`}
+                                  title="Copy password"
+                                >
+                                  {copiedPasswordUserId === profile.userId ? (
+                                    <PixelCheckIcon width={12} height={12} />
+                                  ) : (
+                                    <PixelCopyIcon width={12} height={12} />
+                                  )}
+                                </button>
+                              </>
+                            )}
+
+                            {onResetMemberPassword && (
+                              <button
+                                type="button"
+                                className={`btn-secondary btn-compact accounts-reset-trigger-btn ${
+                                  resettingUserId === profile.userId ? 'is-active' : ''
+                                }`}
+                                disabled={isAnyBusy}
+                                onClick={() => handleToggleResetPasswordForm(profile)}
+                                title={`Reset or change password for member ${profile.email}`}
+                              >
+                                <span>{resettingUserId === profile.userId ? 'Close' : 'Reset'}</span>
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        {resettingUserId === profile.userId && onResetMemberPassword && (
+                          <form
+                            className="accounts-reset-form"
+                            onSubmit={(event) =>
+                              void handleResetMemberPasswordSubmit(event, profile)
+                            }
+                            noValidate
+                          >
+                            <div className="accounts-reset-top">
+                              <span className="accounts-reset-label">Set New Member Password</span>
+                              <button
+                                type="button"
+                                className="ring-reset-btn"
+                                disabled={isRowBusy}
+                                onClick={() => {
+                                  setResetPasswordValue(generateInitialPassword(10));
+                                  setShowResetPassword(true);
+                                  setResetFormError(null);
+                                }}
+                              >
+                                Generate
+                              </button>
+                            </div>
+
+                            <div className="member-account-password-wrap">
+                              <input
+                                type={showResetPassword ? 'text' : 'password'}
+                                className="form-control member-account-input"
+                                placeholder="New password (min. 6 chars)"
+                                value={resetPasswordValue}
+                                disabled={isRowBusy}
+                                autoComplete="new-password"
+                                onChange={(event) => {
+                                  setResetPasswordValue(event.target.value);
+                                  if (resetFormError) setResetFormError(null);
+                                }}
+                                required
+                              />
+                              <button
+                                type="button"
+                                className="icon-btn member-account-eye-btn"
+                                onClick={() => setShowResetPassword((prev) => !prev)}
+                                aria-label={showResetPassword ? 'Hide new password' : 'Show new password'}
+                                title={showResetPassword ? 'Hide new password' : 'Show new password'}
+                              >
+                                {showResetPassword ? <PixelEyeOffIcon /> : <PixelEyeIcon />}
+                              </button>
+                            </div>
+
+                            {resetFormError && (
+                              <div className="accounts-reset-error" role="alert">
+                                {resetFormError}
+                              </div>
+                            )}
+
+                            <div className="accounts-reset-actions">
+                              <button
+                                type="button"
+                                className="btn-secondary btn-compact"
+                                disabled={isRowBusy}
+                                onClick={() => handleToggleResetPasswordForm(profile)}
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                type="submit"
+                                className="btn-primary btn-compact-primary"
+                                disabled={isRowBusy || resetPasswordValue.length < 6}
+                              >
+                                <span>{isRowBusy ? 'Saving...' : 'Save Password'}</span>
+                              </button>
+                            </div>
+                          </form>
+                        )}
+                      </div>
+                    ) : isTargetAdmin ? (
+                      <div className="accounts-credential-strip is-private">
+                        <span className="accounts-credential-private-note">
+                          <PixelLockIcon width={10} height={10} />
+                          <span>Admin password private (cannot view or reset)</span>
+                        </span>
+                      </div>
+                    ) : null}
 
                     {/* Quick Inline Member Link / Reassign Picker */}
                     {!isDisabled && (isReassignOpen || !linkedMember) && (
@@ -821,18 +1699,18 @@ export function AccountsLeftPanel({
                         type="button"
                         className="icon-btn icon-btn-danger accounts-remove-btn"
                         disabled={isAnyBusy || isSelf || isLastActiveAdmin}
-                        aria-label={`Remove account ${profile.email}`}
+                        aria-label={`Delete account ${profile.email}`}
                         title={
                           isSelf
-                            ? 'You cannot remove your own signed-in account'
+                            ? 'You cannot delete your own signed-in account'
                             : isLastActiveAdmin
-                              ? 'Cannot remove the last remaining Admin'
-                              : `Remove account ${profile.email}`
+                              ? 'Cannot delete the last remaining Admin'
+                              : `Delete account ${profile.email}`
                         }
                         onClick={() => setPendingAction({ type: 'remove', profile })}
                       >
                         <PixelTrashIcon width={12} height={12} />
-                        <span>Remove</span>
+                        <span>Delete</span>
                       </button>
                     </div>
                   </li>

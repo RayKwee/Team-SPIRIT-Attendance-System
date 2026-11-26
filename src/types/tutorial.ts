@@ -11,13 +11,14 @@ export interface TutorialStorageState {
 
 export type TutorialStepId =
   | 'header-nav'
+  | 'lounge-hub'
+  | 'project-ideas'
   | 'stats-strip'
   | 'session-hub'
   | 'attendance-assign'
   | 'attendance-checklist'
   | 'calendar-views'
   | 'member-sidebar'
-  | 'project-ideas'
   | 'settings-panel';
 
 export type TutorialPlacement = 'top' | 'bottom' | 'left' | 'right';

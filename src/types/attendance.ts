@@ -64,6 +64,8 @@ export interface SessionAttendanceEntry {
   updatedAt: string;
 }
 
+export type MeetingVisibility = 'public' | 'admins_only' | 'private';
+
 /** Input payload collected when creating a new attendance session. */
 export interface NewSessionInput {
   name: string;
@@ -72,11 +74,25 @@ export interface NewSessionInput {
   location?: string;
   description?: string;
   eventType?: string;
+  visibility?: MeetingVisibility;
+}
+
+/** Input payload collected when editing an existing meeting's general details and/or visibility. */
+export interface SessionUpdateInput {
+  name: string;
+  date: string;
+  time: string;
+  location?: string;
+  description?: string;
+  eventType?: string;
+  visibility?: MeetingVisibility;
 }
 
 /** Persisted session record containing metadata, assigned member IDs, and attendance entries. */
 export interface AttendanceSession extends NewSessionInput {
   id: string;
+  visibility?: MeetingVisibility;
+  createdByUserId?: string;
   createdAt: string;
   updatedAt?: string;
   memberIds: string[];
@@ -94,6 +110,8 @@ export interface SyncedMemberRecord extends ClubMember {
 /** Synchronized session record carrying timestamped modification, CAS version & soft-delete metadata. */
 export interface SyncedSessionRecord extends NewSessionInput {
   id: string;
+  visibility?: MeetingVisibility;
+  createdByUserId?: string;
   createdAt: string;
   updatedAt: string;
   deletedAt: string | null;

@@ -30,7 +30,7 @@ export class AdminAccountProvisionError extends Error {
 export interface AdminCreateAccountResult {
   profile: UserProfileRecord;
   email: string;
-  requiresEmailConfirmation: boolean;
+  password: string;
 }
 
 export interface AdminRemoveAccountResult {
@@ -421,18 +421,65 @@ export async function adminSyncAndLinkMemberAccount(params: {
 }
 
 /**
- * Admin-only workflow: creates a new Supabase Auth user via an isolated non-persisting
- * auth client (never replacing the Admin's active session) and immediately links the new
- * account to the target `club_members` roster record.
+ * Admin-only RPC: finalizes a standalone (unlinked) newly created member account
+ * in `public.user_profiles` and guarantees immediate verification in `auth.users`.
+ */
+export async function adminSyncUnlinkedMemberAccount(params: {
+  userId?: string;
+  email?: string;
+}): Promise<UserProfileRecord> {
+  const targetUserId = params.userId?.trim() || null;
+  const normalizedEmail = params.email?.trim().toLowerCase() || null;
+
+  const { data, error } = await supabase.rpc('admin_sync_unlinked_member_account', {
+    target_user_id: targetUserId,
+    target_email: normalizedEmail,
+  });
+
+  if (error) {
+    if (isMissingRpcError(error)) {
+      const syncedList = await syncAuthProfiles();
+      const matched = syncedList.find(
+        (profile) =>
+          (targetUserId && profile.userId === targetUserId) ||
+          (normalizedEmail && profile.email.trim().toLowerCase() === normalizedEmail),
+      );
+      if (matched) return matched;
+      throw new AdminAccountProvisionError(
+        'schema_outdated',
+        'Run the updated supabase/schema.sql in Supabase SQL Editor to enable standalone member account finalization.',
+        true,
+      );
+    }
+    throw classifyLinkRpcFailure(error, 'Unable to finalize the new member account.');
+  }
+
+  if (!data) {
+    throw new AdminAccountProvisionError(
+      'unknown',
+      'Supabase did not return the new account profile.',
+    );
+  }
+
+  return userProfileFromDbRow(data as DbUserProfileRow);
+}
+
+/**
+ * Admin-only workflow: creates a new auto-verified Supabase Auth member account via an
+ * isolated non-persisting auth client (never replacing the Admin's active session).
+ * Linking to an existing `club_members` profile is optional: when `memberId` is provided
+ * the account is linked immediately; otherwise it is created as a standalone unlinked member.
  */
 export async function adminCreateAndLinkMemberAccount(params: {
-  memberId: string;
-  memberName: string;
+  memberId?: string | null;
+  memberName?: string;
   email: string;
   password: string;
 }): Promise<AdminCreateAccountResult> {
   const normalizedEmail = params.email.trim().toLowerCase();
   const password = params.password;
+  const cleanedMemberId = params.memberId?.trim() || '';
+  const cleanedMemberName = params.memberName?.trim() || '';
 
   if (!normalizedEmail || !EMAIL_BASIC_RE.test(normalizedEmail)) {
     throw new AdminAccountProvisionError(
@@ -450,17 +497,23 @@ export async function adminCreateAndLinkMemberAccount(params: {
 
   const ephemeralClient = createEphemeralAuthClient();
   let createdUserId: string | null = null;
-  let requiresEmailConfirmation = false;
 
   try {
+    const metadata: Record<string, string> = {
+      signup_flow: 'admin_member_provision',
+    };
+    if (cleanedMemberName) {
+      metadata.full_name = cleanedMemberName;
+    }
+    if (cleanedMemberId) {
+      metadata.club_member_id = cleanedMemberId;
+    }
+
     const { data, error } = await ephemeralClient.auth.signUp({
       email: normalizedEmail,
       password,
       options: {
-        data: {
-          full_name: params.memberName.trim(),
-          club_member_id: params.memberId,
-        },
+        data: metadata,
       },
     });
 
@@ -481,50 +534,158 @@ export async function adminCreateAndLinkMemberAccount(params: {
     if (Array.isArray(createdUser.identities) && createdUser.identities.length === 0) {
       throw new AdminAccountProvisionError(
         'already_exists',
-        `An account for "${normalizedEmail}" already exists in Supabase. Switch to "Link Account" to sync and bind it to ${params.memberName.trim()}.`,
+        cleanedMemberName
+          ? `An account for "${normalizedEmail}" already exists in Supabase. Switch to "Link Account" to sync and bind it to ${cleanedMemberName}.`
+          : `An account for "${normalizedEmail}" already exists in Supabase.`,
       );
     }
 
     createdUserId = createdUser.id;
-    requiresEmailConfirmation = Boolean(
-      !data.session && !createdUser.email_confirmed_at && !createdUser.confirmed_at,
-    );
   } catch (err) {
     throw classifySignUpFailure(err);
   } finally {
     await ephemeralClient.auth.signOut({ scope: 'local' }).catch(() => {});
   }
 
-  // Link using the primary Admin-authenticated Supabase client.
-  let linkedProfile: UserProfileRecord;
+  // Finalize (and optionally link) using the primary Admin-authenticated Supabase client.
+  let finalizedProfile: UserProfileRecord;
   try {
-    linkedProfile = await adminSyncAndLinkMemberAccount({
-      memberId: params.memberId,
-      userId: createdUserId,
-      email: normalizedEmail,
-    });
-  } catch (firstLinkErr) {
+    finalizedProfile = cleanedMemberId
+      ? await adminSyncAndLinkMemberAccount({
+          memberId: cleanedMemberId,
+          userId: createdUserId,
+          email: normalizedEmail,
+        })
+      : await adminSyncUnlinkedMemberAccount({
+          userId: createdUserId,
+          email: normalizedEmail,
+        });
+  } catch (firstFinalizeErr) {
     const classified = classifyLinkRpcFailure(
-      firstLinkErr,
-      'Account was created in Supabase Auth, but linking to the roster profile failed.',
+      firstFinalizeErr,
+      cleanedMemberId
+        ? 'Account was created in Supabase Auth, but linking to the roster profile failed.'
+        : 'Account was created in Supabase Auth, but finalizing the member profile failed.',
     );
     if (classified.code === 'not_found' || classified.code === 'unknown') {
       await new Promise((resolve) => window.setTimeout(resolve, 400));
-      linkedProfile = await adminSyncAndLinkMemberAccount({
-        memberId: params.memberId,
-        userId: createdUserId,
-        email: normalizedEmail,
-      });
+      finalizedProfile = cleanedMemberId
+        ? await adminSyncAndLinkMemberAccount({
+            memberId: cleanedMemberId,
+            userId: createdUserId,
+            email: normalizedEmail,
+          })
+        : await adminSyncUnlinkedMemberAccount({
+            userId: createdUserId,
+            email: normalizedEmail,
+          });
     } else {
       throw classified;
     }
   }
 
+  // Store the member password in the strictly member-only credential vault (never for admins).
+  if (finalizedProfile.role === 'member') {
+    await storeMemberCredential(finalizedProfile.userId, password);
+  }
+
   return {
-    profile: linkedProfile,
-    email: linkedProfile.email || normalizedEmail,
-    requiresEmailConfirmation,
+    profile: finalizedProfile,
+    email: finalizedProfile.email || normalizedEmail,
+    password,
   };
+}
+
+/**
+ * Admin-only: fetches stored passwords strictly for standard `member` accounts.
+ * Postgres RLS ensures admin passwords are never stored or returned.
+ */
+export async function fetchMemberCredentials(): Promise<Record<string, string>> {
+  const { data, error, status } = await supabase
+    .from('member_account_credentials')
+    .select('user_id, login_password');
+
+  if (error) {
+    const syncErr = toSupabaseSyncError(error, 'Failed to load member credentials.', status);
+    if (syncErr.isMissingTable || syncErr.isMissingColumn) {
+      return {};
+    }
+    throw normalizeAdminError(error, 'Failed to load member credentials.', status);
+  }
+
+  const map: Record<string, string> = {};
+  for (const row of (data ?? []) as { user_id?: string; login_password?: string }[]) {
+    if (row.user_id && typeof row.login_password === 'string' && row.login_password.length > 0) {
+      map[row.user_id] = row.login_password;
+    }
+  }
+  return map;
+}
+
+/**
+ * Admin-only RPC: persists a standard member's password in `public.member_account_credentials`.
+ * Strictly rejects any Admin target on the server.
+ */
+export async function storeMemberCredential(
+  targetUserId: string,
+  plainPassword: string,
+): Promise<boolean> {
+  const { error } = await supabase.rpc('admin_store_member_credential', {
+    target_user_id: targetUserId,
+    plain_password: plainPassword,
+  });
+
+  if (error) {
+    if (isMissingRpcError(error)) {
+      return false;
+    }
+    // Never fail member creation if credential storage is unavailable or target is admin.
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Admin-only RPC: resets or changes the password of a standard `member` account ONLY.
+ * Server strictly rejects any attempt to modify an Admin account's password.
+ */
+export async function adminResetMemberPassword(
+  targetUserId: string,
+  newPassword: string,
+): Promise<void> {
+  if (!newPassword || newPassword.length < 6) {
+    throw new Error('New password must be at least 6 characters long.');
+  }
+
+  const { error, status } = await supabase.rpc('admin_reset_member_password', {
+    target_user_id: targetUserId,
+    new_password: newPassword,
+  });
+
+  if (error) {
+    if (isMissingRpcError(error)) {
+      throw new Error(
+        'Run the updated supabase/schema.sql in your Supabase SQL Editor to enable admin member password resets.',
+      );
+    }
+    throw normalizeAdminError(error, 'Unable to update member password.', status);
+  }
+}
+
+/**
+ * Syncs a standard member's updated password into `public.member_account_credentials`.
+ * Server RPC strictly ignores Admin callers so admin passwords are never persisted.
+ */
+export async function syncMyMemberCredential(newPassword: string): Promise<void> {
+  if (!newPassword || newPassword.length < 6) return;
+  try {
+    await supabase.rpc('sync_my_member_credential', {
+      new_password: newPassword,
+    });
+  } catch {
+    // Non-blocking sync; ignore if schema has not been updated yet.
+  }
 }
 
 /** Admin-only RPC: disables or re-enables a user account with self & last-admin protection. */

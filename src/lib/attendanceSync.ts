@@ -3,6 +3,7 @@ import type {
   AttendanceStatus,
   ClubMember,
   LocalSyncStore,
+  MeetingVisibility,
   MemberType,
   SyncConflictItem,
   SyncConflictResolution,
@@ -13,6 +14,7 @@ import type {
 import {
   compareMembersByRoleAndName,
   normalizeAcademicYear,
+  normalizeMeetingVisibility,
   normalizeMemberType,
   resolveStudentClassFields,
 } from '../utils/attendance';
@@ -94,6 +96,8 @@ interface DbSessionRow {
   location: string | null;
   description: string | null;
   event_type: string | null;
+  visibility?: MeetingVisibility | null;
+  created_by_user_id?: string | null;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
@@ -123,7 +127,7 @@ const MISSING_TABLE_USER_MESSAGE =
   'Supabase tables (club_members, attendance_sessions, session_attendance) were not found. Run supabase/schema.sql in your Supabase SQL Editor, then click to retry.';
 
 const MISSING_COLUMN_USER_MESSAGE =
-  'Supabase columns (e.g. sync_version, last_edited_by, or club_members profile fields) are missing. Run the updated supabase/schema.sql in your Supabase SQL Editor, then click to retry.';
+  'Supabase columns (e.g. sync_version, last_edited_by, meeting visibility/creator, or club_members profile fields) are missing. Run the updated supabase/schema.sql in your Supabase SQL Editor, then click to retry.';
 
 const PERMISSION_DENIED_USER_MESSAGE =
   'Supabase denied access (403 Forbidden). Run the updated GRANT & RLS script in supabase/schema.sql in your Supabase SQL Editor, then click to retry.';
@@ -411,6 +415,8 @@ export function sessionFromDbRow(row: DbSessionRow): SyncedSessionRecord {
     location: cleanOptionalText(row.location),
     description: cleanOptionalText(row.description),
     eventType: cleanOptionalText(row.event_type),
+    visibility: normalizeMeetingVisibility(row.visibility),
+    createdByUserId: cleanOptionalText(row.created_by_user_id),
     createdAt: row.created_at,
     updatedAt: row.updated_at || row.created_at,
     deletedAt: row.deleted_at ?? null,
@@ -428,6 +434,8 @@ export function sessionToDbRow(session: SyncedSessionRecord, editorTabId?: strin
     location: session.location ?? null,
     description: session.description ?? null,
     event_type: session.eventType ?? null,
+    visibility: normalizeMeetingVisibility(session.visibility),
+    created_by_user_id: session.createdByUserId ?? null,
     created_at: session.createdAt,
     updated_at: session.updatedAt,
     deleted_at: session.deletedAt ?? null,
@@ -512,6 +520,43 @@ function normalizeMembersRecordMap(
   return normalized;
 }
 
+function normalizeSessionRecord(rec: Partial<SyncedSessionRecord>): SyncedSessionRecord | null {
+  if (
+    !rec ||
+    typeof rec !== 'object' ||
+    typeof rec.id !== 'string' ||
+    typeof rec.name !== 'string' ||
+    typeof rec.date !== 'string' ||
+    typeof rec.time !== 'string'
+  ) {
+    return null;
+  }
+  return {
+    ...(rec as SyncedSessionRecord),
+    location: cleanOptionalText(rec.location),
+    description: cleanOptionalText(rec.description),
+    eventType: cleanOptionalText(rec.eventType),
+    visibility: normalizeMeetingVisibility(rec.visibility),
+    createdByUserId: cleanOptionalText(rec.createdByUserId),
+    syncVersion: typeof rec.syncVersion === 'number' ? rec.syncVersion : undefined,
+    lastEditedBy: cleanOptionalText(rec.lastEditedBy),
+  };
+}
+
+function normalizeSessionsRecordMap(
+  rawMap: unknown,
+): Record<string, SyncedSessionRecord> {
+  const normalized: Record<string, SyncedSessionRecord> = {};
+  if (!rawMap || typeof rawMap !== 'object') return normalized;
+  for (const [id, rec] of Object.entries(rawMap as Record<string, Partial<SyncedSessionRecord>>)) {
+    const session = normalizeSessionRecord(rec);
+    if (session) {
+      normalized[id] = session;
+    }
+  }
+  return normalized;
+}
+
 function loadStoreByKey(storageKey: string): LocalSyncStore {
   let store = createEmptySyncStore();
   try {
@@ -520,14 +565,11 @@ function loadStoreByKey(storageKey: string): LocalSyncStore {
       const parsed = JSON.parse(raw) as Partial<LocalSyncStore>;
       store = {
         members: normalizeMembersRecordMap(parsed.members),
-        sessions: parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {},
+        sessions: normalizeSessionsRecordMap(parsed.sessions),
         attendance:
           parsed.attendance && typeof parsed.attendance === 'object' ? parsed.attendance : {},
         baseMembers: normalizeMembersRecordMap(parsed.baseMembers),
-        baseSessions:
-          parsed.baseSessions && typeof parsed.baseSessions === 'object'
-            ? parsed.baseSessions
-            : {},
+        baseSessions: normalizeSessionsRecordMap(parsed.baseSessions),
         baseAttendance:
           parsed.baseAttendance && typeof parsed.baseAttendance === 'object'
             ? parsed.baseAttendance
@@ -573,6 +615,8 @@ function loadStoreByKey(storageKey: string): LocalSyncStore {
           location: session.location,
           description: session.description,
           eventType: session.eventType,
+          visibility: normalizeMeetingVisibility(session.visibility),
+          createdByUserId: session.createdByUserId,
           createdAt: session.createdAt,
           updatedAt: session.updatedAt ?? session.createdAt,
           deletedAt: null,
@@ -788,6 +832,8 @@ export function deriveWorkspaceState(store: LocalSyncStore): {
         location: session.location,
         description: session.description,
         eventType: session.eventType,
+        visibility: normalizeMeetingVisibility(session.visibility),
+        createdByUserId: session.createdByUserId,
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         memberIds,
@@ -1168,7 +1214,13 @@ async function pushSessionWithCas(
     }
 
     const row = sessionToDbRow(candidate, tabId);
-    const { id: _id, created_at: _createdAt, sync_version: _sv, ...updateFields } = row;
+    const {
+      id: _id,
+      created_at: _createdAt,
+      created_by_user_id: _createdByUserId,
+      sync_version: _sv,
+      ...updateFields
+    } = row;
     const updatedRow = await runSupabaseQueryWithAuthRetry(
       () =>
         supabase

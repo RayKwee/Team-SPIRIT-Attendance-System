@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 import type { PasswordChangeError } from '../hooks/useSupabaseAuth';
+import type { AdminRemoveAccountResult } from '../lib/adminApi';
 import { DEFAULT_MEMBER_VISIBILITY_PERMISSIONS } from '../lib/clubPostsApi';
 import type {
   AccessScope,
@@ -37,13 +38,16 @@ import {
   PixelRefreshIcon,
   PixelSearchIcon,
   PixelSettingsIcon,
+  PixelShieldIcon,
   PixelStarIcon,
+  PixelTrashIcon,
   PixelUploadIcon,
   PixelUserIcon,
 } from './PixelIcons';
 
 interface SettingsModalProps {
   isOpen: boolean;
+  openPasswordFormOnOpen?: boolean;
   preferences: UserPreferences;
   tutorialStatus: TutorialStatus;
   isCloudConnected: boolean;
@@ -70,6 +74,7 @@ interface SettingsModalProps {
   onResetPreferences: () => void;
   onStartTutorial: () => void;
   onOpenCloudSync: () => void;
+  onOpenCreateAccount?: () => void;
   onChangePassword?: (
     currentPassword: string,
     newPassword: string,
@@ -85,6 +90,7 @@ interface SettingsModalProps {
     targetUserId: string,
     allowBroadView: boolean,
   ) => Promise<UserProfileRecord>;
+  onRemoveAccount?: (targetUserId: string) => Promise<AdminRemoveAccountResult>;
   memberVisibilityPermissions?: MemberVisibilityPermissions;
   isUpdatingSharedIdeaVisibility?: boolean;
   onUpdateMemberVisibilityPermissions?: (
@@ -193,6 +199,7 @@ function getSyncSummaryLabel(
 /** Accessible voxel-styled settings modal for account management, appearance, attendance defaults, and backups. */
 export function SettingsModal({
   isOpen,
+  openPasswordFormOnOpen = false,
   preferences,
   tutorialStatus,
   isCloudConnected,
@@ -219,12 +226,14 @@ export function SettingsModal({
   onResetPreferences,
   onStartTutorial,
   onOpenCloudSync,
+  onOpenCreateAccount,
   onChangePassword,
   onSignOut,
   onRefreshAdminProfiles,
   onUpdateUserAdminRole,
   onLinkUserToMember,
   onUpdateUserVisibilityScope,
+  onRemoveAccount,
   memberVisibilityPermissions = DEFAULT_MEMBER_VISIBILITY_PERMISSIONS,
   isUpdatingSharedIdeaVisibility = false,
   onUpdateMemberVisibilityPermissions,
@@ -281,6 +290,7 @@ export function SettingsModal({
     profile: UserProfileRecord;
     makeAdmin: boolean;
   } | null>(null);
+  const [pendingDeleteAccount, setPendingDeleteAccount] = useState<UserProfileRecord | null>(null);
   const [backupNotice, setBackupNotice] = useState<{
     tone: 'success' | 'error';
     message: string;
@@ -289,8 +299,12 @@ export function SettingsModal({
   useEffect(() => {
     if (!isOpen) return;
 
+    const shouldOpenPasswordForm = Boolean(
+      openPasswordFormOnOpen && isCloudConnected && onChangePassword && userEmail,
+    );
+
     setIsSigningOut(false);
-    setIsPasswordFormOpen(false);
+    setIsPasswordFormOpen(shouldOpenPasswordForm);
     setCurrentPassword('');
     setNewPassword('');
     setConfirmPassword('');
@@ -307,16 +321,21 @@ export function SettingsModal({
     setPermissionsNotice(null);
     setDeletionPolicyNotice(null);
     setPendingRoleChange(null);
+    setPendingDeleteAccount(null);
     setBackupNotice(null);
 
     const focusTimer = window.setTimeout(() => {
-      closeButtonRef.current?.focus();
+      if (shouldOpenPasswordForm) {
+        currentPasswordRef.current?.focus();
+      } else {
+        closeButtonRef.current?.focus();
+      }
     }, 0);
 
     return () => {
       window.clearTimeout(focusTimer);
     };
-  }, [isOpen]);
+  }, [isCloudConnected, isOpen, onChangePassword, openPasswordFormOnOpen, userEmail]);
 
   useEffect(() => {
     if (isCloudConnected) return;
@@ -341,7 +360,8 @@ export function SettingsModal({
         !isUpdatingPassword &&
         !isImporting &&
         !busyRoleUserId &&
-        !pendingRoleChange
+        !pendingRoleChange &&
+        !pendingDeleteAccount
       ) {
         onClose();
       }
@@ -358,6 +378,7 @@ export function SettingsModal({
     isImporting,
     busyRoleUserId,
     pendingRoleChange,
+    pendingDeleteAccount,
     onClose,
   ]);
 
@@ -568,6 +589,32 @@ export function SettingsModal({
     }
   }
 
+  async function handleConfirmDeleteAccount() {
+    if (!pendingDeleteAccount || !onRemoveAccount || busyRoleUserId) return;
+    const target = pendingDeleteAccount;
+    setBusyRoleUserId(target.userId);
+    setAdminNotice(null);
+    try {
+      const result = await onRemoveAccount(target.userId);
+      setAdminNotice({
+        tone: 'success',
+        message:
+          result.mode === 'deleted'
+            ? `Permanently deleted account ${target.email || target.userId}. Club records and attendance history remain preserved.`
+            : `Revoked and disabled all access for ${target.email || target.userId}.`,
+      });
+      setPendingDeleteAccount(null);
+    } catch (error) {
+      setAdminNotice({
+        tone: 'error',
+        message: error instanceof Error ? error.message : 'Unable to delete user account.',
+      });
+      setPendingDeleteAccount(null);
+    } finally {
+      setBusyRoleUserId(null);
+    }
+  }
+
   async function handleLinkMemberChange(profile: UserProfileRecord, targetMemberId: string) {
     if (!onLinkUserToMember || busyRoleUserId) return;
     const nextMemberId = targetMemberId.trim() || null;
@@ -715,7 +762,12 @@ export function SettingsModal({
       className="modal-backdrop"
       role="presentation"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget && !isModalBusy && !pendingRoleChange) {
+        if (
+          event.target === event.currentTarget &&
+          !isModalBusy &&
+          !pendingRoleChange &&
+          !pendingDeleteAccount
+        ) {
           onClose();
         }
       }}
@@ -742,7 +794,7 @@ export function SettingsModal({
             type="button"
             className="modal-close-btn"
             onClick={onClose}
-            disabled={isModalBusy || pendingRoleChange !== null}
+            disabled={isModalBusy || pendingRoleChange !== null || pendingDeleteAccount !== null}
             aria-label="Close settings"
             title="Close (Esc)"
           >
@@ -1039,17 +1091,30 @@ export function SettingsModal({
                   </span>
                 </div>
 
-                <button
-                  type="button"
-                  className="btn-primary settings-signin-btn"
-                  onClick={() => {
-                    onClose();
-                    onOpenCloudSync();
-                  }}
-                >
-                  <PixelLockIcon />
-                  <span>Sign In</span>
-                </button>
+                <div className="settings-account-actions">
+                  <button
+                    type="button"
+                    className="btn-secondary btn-compact"
+                    onClick={() => {
+                      onClose();
+                      onOpenCloudSync();
+                    }}
+                  >
+                    <PixelLockIcon />
+                    <span>Login</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-primary settings-signin-btn"
+                    onClick={() => {
+                      onClose();
+                      (onOpenCreateAccount ?? onOpenCloudSync)();
+                    }}
+                  >
+                    <PixelShieldIcon />
+                    <span>Create Account</span>
+                  </button>
+                </div>
               </div>
             )}
           </section>
@@ -1316,6 +1381,26 @@ export function SettingsModal({
                               >
                                 <PixelStarIcon width={11} height={11} />
                                 <span>{isBusy ? 'Updating...' : 'Elevate to Admin'}</span>
+                              </button>
+                            )}
+
+                            {onRemoveAccount && (
+                              <button
+                                type="button"
+                                className="icon-btn icon-btn-danger"
+                                disabled={isAnyAccountBusy || isSelf || isLastRemainingAdmin}
+                                aria-label={`Delete account ${profile.email || profile.userId}`}
+                                title={
+                                  isSelf
+                                    ? 'You cannot delete your own signed-in account'
+                                    : isLastRemainingAdmin
+                                      ? 'Cannot delete the last remaining Admin'
+                                      : `Delete account ${profile.email || profile.userId}`
+                                }
+                                onClick={() => setPendingDeleteAccount(profile)}
+                              >
+                                <PixelTrashIcon width={12} height={12} />
+                                <span>Delete</span>
                               </button>
                             )}
                           </div>
@@ -1778,7 +1863,7 @@ export function SettingsModal({
               type="button"
               className="btn-secondary"
               onClick={onClose}
-              disabled={isModalBusy || pendingRoleChange !== null}
+              disabled={isModalBusy || pendingRoleChange !== null || pendingDeleteAccount !== null}
             >
               Done
             </button>
@@ -1808,6 +1893,24 @@ export function SettingsModal({
         onCancel={() => {
           if (!busyRoleUserId) {
             setPendingRoleChange(null);
+          }
+        }}
+      />
+
+      <ConfirmDialog
+        isOpen={pendingDeleteAccount !== null}
+        badgeLabel="Delete Account"
+        title={
+          pendingDeleteAccount
+            ? `Delete "${pendingDeleteAccount.email || pendingDeleteAccount.userId}" permanently?`
+            : 'Delete account?'
+        }
+        message="This permanently removes the user account, terminates active sessions immediately, and unlinks any connected roster member. Past attendance history, roster profiles, and submitted project ideas remain safely preserved."
+        confirmLabel="Delete Account"
+        onConfirm={() => void handleConfirmDeleteAccount()}
+        onCancel={() => {
+          if (!busyRoleUserId) {
+            setPendingDeleteAccount(null);
           }
         }}
       />

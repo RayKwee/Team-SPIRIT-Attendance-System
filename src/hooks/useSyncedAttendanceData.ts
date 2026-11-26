@@ -48,6 +48,7 @@ import type {
   MemberProfileInput,
   NewSessionInput,
   RealtimeStatus,
+  SessionUpdateInput,
   SyncConflictItem,
   SyncConflictResolution,
   SyncStatus,
@@ -59,9 +60,11 @@ import {
   applyAnnualProgressionToMember,
   applyMemberProfileUpdate,
   buildClubMember,
+  canUserViewSession,
   formatStudentClassName,
   generateId,
   getPromotionCycleYear,
+  normalizeMeetingVisibility,
   normalizeMemberType,
   resolveStudentClassFields,
   runAnnualClassProgression,
@@ -190,6 +193,7 @@ export interface UseSyncedAttendanceDataResult {
       defaultStatus?: DefaultAssignmentStatus;
     },
   ) => AttendanceSession;
+  updateSession: (sessionId: string, input: SessionUpdateInput) => AttendanceSession | null;
   deleteSession: (sessionId: string) => void;
   addMember: (input: string | MemberProfileInput) => ClubMember;
   addMembersBulk: (inputs: MemberProfileInput[]) => ClubMember[];
@@ -286,6 +290,7 @@ export function useSyncedAttendanceData(
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
   const activeFieldEditsRef = useRef<Set<string>>(new Set());
   const deferredMemberRealtimeRef = useRef<Map<string, SyncedMemberRecord>>(new Map());
+  const deferredSessionRealtimeRef = useRef<Map<string, SyncedSessionRecord>>(new Map());
   const deferredAttendanceRealtimeRef = useRef<Map<string, SyncedAttendanceRecord>>(new Map());
   const prevScopeVersionKeyRef = useRef<string>(scopeVersionKey);
 
@@ -453,9 +458,11 @@ export function useSyncedAttendanceData(
       for (const id of currentDirtySessions) {
         const localRec = current.sessions[id];
         const siblingRec = siblingStore.sessions[id];
+        const isEditingThis = activeFieldEditsRef.current.has(`session:${id}`);
         if (
           localRec &&
-          (!siblingRec ||
+          (isEditingThis ||
+            !siblingRec ||
             (!siblingDirtySessions.has(id) &&
               getEffectiveTimestamp(localRec.updatedAt, localRec.deletedAt) >
                 getEffectiveTimestamp(siblingRec.updatedAt, siblingRec.deletedAt)))
@@ -495,6 +502,11 @@ export function useSyncedAttendanceData(
           const memberId = editKey.slice('member:'.length);
           if (current.members[memberId]) {
             nextMembers[memberId] = current.members[memberId];
+          }
+        } else if (editKey.startsWith('session:')) {
+          const sessionId = editKey.slice('session:'.length);
+          if (current.sessions[sessionId]) {
+            nextSessions[sessionId] = current.sessions[sessionId];
           }
         }
       }
@@ -677,7 +689,8 @@ export function useSyncedAttendanceData(
               const oldId = (payload.old as { id?: string } | null)?.id;
               if (!oldId || !current.sessions[oldId]) return;
               const isDirty = current.dirtySessionIds.includes(oldId);
-              if (isDirty) {
+              const isEditingThis = activeFieldEditsRef.current.has(`session:${oldId}`);
+              if (isDirty || isEditingThis) {
                 const deletedRemote: SyncedSessionRecord = {
                   ...(current.baseSessions[oldId] ?? current.sessions[oldId]),
                   syncVersion: undefined,
@@ -725,9 +738,37 @@ export function useSyncedAttendanceData(
             const incoming = sessionFromDbRow(
               payload.new as Parameters<typeof sessionFromDbRow>[0],
             );
+
+            // Defense-in-depth visibility enforcement for Realtime updates.
+            const canViewIncoming = canUserViewSession(incoming, {
+              isCloudConnected: true,
+              isAdmin: !isReadOnlyCloudRef.current,
+              currentUserId: activeUserId,
+            });
+            if (!canViewIncoming) {
+              if (!current.sessions[incoming.id] && !current.baseSessions[incoming.id]) {
+                return;
+              }
+              const nextSessions = { ...current.sessions };
+              const nextBaseSessions = { ...current.baseSessions };
+              delete nextSessions[incoming.id];
+              delete nextBaseSessions[incoming.id];
+              storeRef.current = {
+                ...current,
+                sessions: nextSessions,
+                baseSessions: nextBaseSessions,
+                dirtySessionIds: current.dirtySessionIds.filter((id) => id !== incoming.id),
+                conflicts: removeConflictByEntity(current.conflicts, 'session', incoming.id),
+              };
+              persistStoreAndNotifyTabs(activeUserId, storeRef.current);
+              refreshDerivedState();
+              return;
+            }
+
             const existing = current.sessions[incoming.id];
             const base = current.baseSessions[incoming.id];
             const isDirty = current.dirtySessionIds.includes(incoming.id);
+            const isEditingThis = activeFieldEditsRef.current.has(`session:${incoming.id}`);
 
             if (
               base?.syncVersion !== undefined &&
@@ -735,6 +776,11 @@ export function useSyncedAttendanceData(
               incoming.syncVersion <= base.syncVersion &&
               !isDirty
             ) {
+              return;
+            }
+
+            if (isEditingThis) {
+              deferredSessionRealtimeRef.current.set(incoming.id, incoming);
               return;
             }
 
@@ -1426,6 +1472,61 @@ export function useSyncedAttendanceData(
           persistStoreAndNotifyTabs(activeUserId, storeRef.current);
           setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
         }
+      } else if (activeUserId && fieldKey.startsWith('session:')) {
+        const sessionId = fieldKey.slice('session:'.length);
+        const deferred = deferredSessionRealtimeRef.current.get(sessionId);
+        if (deferred) {
+          deferredSessionRealtimeRef.current.delete(sessionId);
+          const current = storeRef.current;
+          const isDirty = current.dirtySessionIds.includes(sessionId);
+          const existing = current.sessions[sessionId];
+          const base = current.baseSessions[sessionId];
+          const outcome = reconcileIncomingEntity({
+            local: existing,
+            base,
+            remote: deferred,
+            isDirty,
+            fields: SESSION_MERGE_FIELDS,
+          });
+          if (outcome.action === 'accept_remote') {
+            storeRef.current = {
+              ...current,
+              sessions: { ...current.sessions, [sessionId]: outcome.record },
+              baseSessions: { ...current.baseSessions, [sessionId]: outcome.base },
+              dirtySessionIds: current.dirtySessionIds.filter((id) => id !== sessionId),
+              conflicts: removeConflictByEntity(current.conflicts, 'session', sessionId),
+            };
+          } else if (outcome.action === 'keep_local' || outcome.action === 'merged') {
+            const nextDirty = outcome.needsPush
+              ? Array.from(new Set([...current.dirtySessionIds, sessionId]))
+              : current.dirtySessionIds.filter((id) => id !== sessionId);
+            storeRef.current = {
+              ...current,
+              sessions: { ...current.sessions, [sessionId]: outcome.record },
+              baseSessions: { ...current.baseSessions, [sessionId]: outcome.base },
+              dirtySessionIds: nextDirty,
+              conflicts: removeConflictByEntity(current.conflicts, 'session', sessionId),
+            };
+          } else {
+            storeRef.current = {
+              ...current,
+              baseSessions: { ...current.baseSessions, [sessionId]: outcome.base },
+              dirtySessionIds: current.dirtySessionIds.filter((id) => id !== sessionId),
+              conflicts: upsertConflictItem(
+                current.conflicts,
+                buildSessionConflictItem(
+                  sessionId,
+                  base,
+                  existing!,
+                  deferred,
+                  outcome.conflictingFields,
+                ),
+              ),
+            };
+          }
+          persistStoreAndNotifyTabs(activeUserId, storeRef.current);
+          setSyncStatus(resolveStatusFromStore(storeRef.current, 'synced'));
+        }
       } else if (activeUserId && fieldKey.startsWith('attendance:')) {
         const attKey = fieldKey.slice('attendance:'.length);
         const deferred = deferredAttendanceRealtimeRef.current.get(attKey);
@@ -1556,6 +1657,7 @@ export function useSyncedAttendanceData(
     lastUndoTokenRef.current = null;
     activeFieldEditsRef.current.clear();
     deferredMemberRealtimeRef.current.clear();
+    deferredSessionRealtimeRef.current.clear();
     deferredAttendanceRealtimeRef.current.clear();
     setIsEditingActive(false);
     cleanupRealtimeSubscription();
@@ -1836,6 +1938,8 @@ export function useSyncedAttendanceData(
       const newSessionRecord: SyncedSessionRecord = {
         ...input,
         id: generateId('session'),
+        visibility: normalizeMeetingVisibility(input.visibility),
+        createdByUserId: userIdRef.current ?? undefined,
         createdAt: now,
         updatedAt: now,
         deletedAt: null,
@@ -1888,6 +1992,87 @@ export function useSyncedAttendanceData(
         memberIds: initialMemberIds,
         attendance: initialAttendance,
       };
+    },
+    [mutateStore],
+  );
+
+  const updateSession = useCallback(
+    (sessionId: string, input: SessionUpdateInput): AttendanceSession | null => {
+      let updatedRecord: SyncedSessionRecord | null = null;
+      const cleanedName = input.name.trim();
+      const cleanedDate = input.date.trim();
+      const cleanedTime = input.time.trim();
+      if (!cleanedName || !cleanedDate || !cleanedTime) {
+        return null;
+      }
+      const cleanedLocation = input.location?.trim() || undefined;
+      const cleanedEventType = input.eventType?.trim() || undefined;
+      const cleanedDescription = input.description?.trim() || undefined;
+
+      mutateStore(
+        (prev, now) => {
+          const existing = prev.sessions[sessionId];
+          if (!existing || existing.deletedAt) return prev;
+
+          const currentVisibility = normalizeMeetingVisibility(existing.visibility);
+          const nextVisibility =
+            input.visibility !== undefined
+              ? normalizeMeetingVisibility(input.visibility)
+              : currentVisibility;
+
+          // Prevent another admin from switching a colleague's session to Private.
+          if (
+            nextVisibility === 'private' &&
+            existing.createdByUserId &&
+            userIdRef.current &&
+            existing.createdByUserId !== userIdRef.current
+          ) {
+            return prev;
+          }
+
+          const nextCreatedByUserId =
+            existing.createdByUserId ??
+            (nextVisibility === 'private' && userIdRef.current ? userIdRef.current : undefined);
+
+          const hasChanged =
+            existing.name !== cleanedName ||
+            existing.date !== cleanedDate ||
+            existing.time !== cleanedTime ||
+            (existing.location ?? undefined) !== cleanedLocation ||
+            (existing.eventType ?? undefined) !== cleanedEventType ||
+            (existing.description ?? undefined) !== cleanedDescription ||
+            currentVisibility !== nextVisibility ||
+            existing.createdByUserId !== nextCreatedByUserId;
+
+          if (!hasChanged) return prev;
+
+          const nextSession: SyncedSessionRecord = {
+            ...existing,
+            name: cleanedName,
+            date: cleanedDate,
+            time: cleanedTime,
+            location: cleanedLocation,
+            eventType: cleanedEventType,
+            description: cleanedDescription,
+            visibility: nextVisibility,
+            createdByUserId: nextCreatedByUserId,
+            updatedAt: now,
+            deletedAt: null,
+          };
+          updatedRecord = nextSession;
+
+          return {
+            ...prev,
+            sessions: { ...prev.sessions, [sessionId]: nextSession },
+            dirtySessionIds: Array.from(new Set([...prev.dirtySessionIds, sessionId])),
+          };
+        },
+        { recordUndo: true },
+      );
+
+      if (!updatedRecord) return null;
+      const derived = deriveWorkspaceState(storeRef.current);
+      return derived.sessions.find((session) => session.id === sessionId) ?? null;
     },
     [mutateStore],
   );
@@ -2547,6 +2732,8 @@ export function useSyncedAttendanceData(
                 location: session.location,
                 description: session.description,
                 eventType: session.eventType,
+                visibility: normalizeMeetingVisibility(session.visibility),
+                createdByUserId: session.createdByUserId,
                 createdAt: session.createdAt,
                 updatedAt: now,
                 deletedAt: null,
@@ -2718,6 +2905,7 @@ export function useSyncedAttendanceData(
     resolveConflict,
     resolveAllConflicts,
     createSession,
+    updateSession,
     deleteSession,
     addMember,
     addMembersBulk,

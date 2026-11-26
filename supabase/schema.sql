@@ -1,6 +1,8 @@
 -- Team SPIRIT Attendance System — Supabase Schema & RLS Policies
 -- Run this entire script in your Supabase Dashboard -> SQL Editor -> New Query.
 
+create extension if not exists pgcrypto with schema extensions;
+
 -- 1. Club Members table (with timestamped soft-delete support for conflict resolution)
 create table if not exists public.club_members (
   id text primary key,
@@ -121,7 +123,7 @@ begin
   end if;
 end $$;
 
--- 2. Attendance Sessions table (with timestamped soft-delete & CAS sync_version support)
+-- 2. Attendance Sessions table (with per-meeting visibility, creator ownership, soft-delete & CAS sync_version)
 create table if not exists public.attendance_sessions (
   id text primary key,
   name text not null,
@@ -130,6 +132,10 @@ create table if not exists public.attendance_sessions (
   location text,
   description text,
   event_type text,
+  visibility text not null default 'public'
+    constraint attendance_sessions_visibility_check
+    check (visibility in ('public', 'admins_only', 'private')),
+  created_by_user_id uuid references auth.users(id) on delete set null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   deleted_at timestamptz,
@@ -141,6 +147,29 @@ alter table public.attendance_sessions
   add column if not exists sync_version integer not null default 1;
 alter table public.attendance_sessions
   add column if not exists last_edited_by text;
+alter table public.attendance_sessions
+  add column if not exists visibility text not null default 'public';
+alter table public.attendance_sessions
+  add column if not exists created_by_user_id uuid references auth.users(id) on delete set null;
+
+do $$
+begin
+  update public.attendance_sessions
+  set visibility = 'public'
+  where visibility is null
+     or visibility not in ('public', 'admins_only', 'private');
+
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'attendance_sessions_visibility_check'
+      and conrelid = 'public.attendance_sessions'::regclass
+  ) then
+    alter table public.attendance_sessions
+      add constraint attendance_sessions_visibility_check
+      check (visibility in ('public', 'admins_only', 'private'));
+  end if;
+end $$;
 
 -- 3. Session Attendance & Roster Assignment table (composite PK + soft-delete & CAS sync_version)
 create table if not exists public.session_attendance (
@@ -187,6 +216,56 @@ drop trigger if exists trg_club_members_sync_metadata on public.club_members;
 create trigger trg_club_members_sync_metadata
   before insert or update on public.club_members
   for each row execute function public.bump_sync_metadata();
+
+-- Enforces server-side creator ownership and private-visibility guards on attendance_sessions
+create or replace function public.enforce_attendance_session_ownership()
+returns trigger
+language plpgsql
+as $$
+declare
+  acting_user_id uuid := auth.uid();
+begin
+  new.visibility := coalesce(nullif(btrim(new.visibility), ''), 'public');
+  if new.visibility not in ('public', 'admins_only', 'private') then
+    raise exception 'Invalid meeting visibility: %', new.visibility;
+  end if;
+
+  if tg_op = 'INSERT' then
+    if acting_user_id is not null then
+      new.created_by_user_id := acting_user_id;
+    end if;
+    if new.visibility = 'private' and new.created_by_user_id is null then
+      raise exception 'Private meetings require an authenticated creator.';
+    end if;
+    return new;
+  end if;
+
+  -- Preserve original creator once assigned; allow claiming unowned legacy rows when switching to private.
+  if old.created_by_user_id is not null then
+    new.created_by_user_id := old.created_by_user_id;
+  elsif new.visibility = 'private' and acting_user_id is not null then
+    new.created_by_user_id := acting_user_id;
+  else
+    new.created_by_user_id := old.created_by_user_id;
+  end if;
+
+  if new.visibility = 'private' then
+    if new.created_by_user_id is null then
+      raise exception 'Private meetings require an authenticated creator.';
+    end if;
+    if acting_user_id is not null and new.created_by_user_id <> acting_user_id then
+      raise exception 'Only the meeting creator can set a meeting to Private.';
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_attendance_sessions_ownership on public.attendance_sessions;
+create trigger trg_attendance_sessions_ownership
+  before insert or update on public.attendance_sessions
+  for each row execute function public.enforce_attendance_session_ownership();
 
 drop trigger if exists trg_attendance_sessions_sync_metadata on public.attendance_sessions;
 create trigger trg_attendance_sessions_sync_metadata
@@ -441,6 +520,7 @@ on conflict (id) do nothing;
 create index if not exists idx_club_members_updated_at on public.club_members (updated_at desc);
 create index if not exists idx_club_members_is_legacy on public.club_members (is_legacy);
 create index if not exists idx_attendance_sessions_date on public.attendance_sessions (date desc, time desc);
+create index if not exists idx_attendance_sessions_visibility_creator on public.attendance_sessions (visibility, created_by_user_id);
 create index if not exists idx_session_attendance_updated_at on public.session_attendance (updated_at desc);
 create index if not exists idx_project_ideas_highlighted_created on public.project_ideas (is_highlighted desc, created_at desc);
 create index if not exists idx_project_ideas_submitted_by on public.project_ideas (submitted_by_user_id, created_at desc);
@@ -607,16 +687,69 @@ as $$
   );
 $$;
 
+create or replace function public.can_read_attendance_session(target_session_id text)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.attendance_sessions s
+    where s.id = target_session_id
+      and (
+        auth.uid() is null
+        or (
+          public.is_active_user()
+          and (
+            s.visibility = 'public'
+            or (s.visibility = 'admins_only' and public.is_admin())
+            or (s.visibility = 'private' and s.created_by_user_id = (select auth.uid()))
+          )
+        )
+      )
+  );
+$$;
+
+create or replace function public.can_manage_attendance_session(target_session_id text)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.attendance_sessions s
+    where s.id = target_session_id
+      and (
+        auth.uid() is null
+        or (
+          public.is_admin()
+          and (
+            s.visibility <> 'private'
+            or s.created_by_user_id = (select auth.uid())
+          )
+        )
+      )
+  );
+$$;
+
 revoke all on function public.is_active_user(uuid) from public, anon;
 revoke all on function public.is_admin(uuid) from public, anon;
 revoke all on function public.has_broad_visibility(uuid) from public, anon;
 revoke all on function public.my_linked_member_id(uuid) from public, anon;
 revoke all on function public.is_member_in_session(text, text) from public, anon;
+revoke all on function public.can_read_attendance_session(text) from public, anon;
+revoke all on function public.can_manage_attendance_session(text) from public, anon;
 grant execute on function public.is_active_user(uuid) to authenticated;
 grant execute on function public.is_admin(uuid) to authenticated;
 grant execute on function public.has_broad_visibility(uuid) to authenticated;
 grant execute on function public.my_linked_member_id(uuid) to authenticated;
 grant execute on function public.is_member_in_session(text, text) to authenticated;
+grant execute on function public.can_read_attendance_session(text) to authenticated;
+grant execute on function public.can_manage_attendance_session(text) to authenticated;
 
 -- Finds a unique unlinked active roster member matching an email address (returns null if 0 or >1 match)
 create or replace function public.find_unique_unlinked_member_by_email(target_email text)
@@ -656,7 +789,35 @@ $$;
 
 revoke all on function public.find_unique_unlinked_member_by_email(text) from public, anon, authenticated;
 
--- Automatically assign standard 'member' role to every new or updated Auth user & auto-link exact email match
+-- Auto-verify newly created auth.users rows immediately without email confirmation
+create or replace function public.auto_verify_new_auth_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+begin
+  if new.email_confirmed_at is null then
+    new.email_confirmed_at := now();
+  end if;
+  if coalesce(new.confirmation_token, '') <> '' then
+    new.confirmation_token := '';
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function public.auto_verify_new_auth_user() from public, anon, authenticated;
+
+drop trigger if exists trg_auth_users_auto_verify on auth.users;
+create trigger trg_auth_users_auto_verify
+  before insert on auth.users
+  for each row execute function public.auto_verify_new_auth_user();
+
+-- Assign role strictly by registration flow:
+-- - Self-service registration (`signup_flow = 'self_service_admin'`) -> 'admin'
+-- - Admin-provisioned member accounts (`signup_flow = 'admin_member_provision'`) -> 'member'
+-- - Any other user creation -> safely defaults to 'member'
 create or replace function public.handle_new_auth_user()
 returns trigger
 language plpgsql
@@ -664,21 +825,31 @@ security definer
 set search_path = public, auth
 as $$
 declare
+  signup_flow text := lower(btrim(coalesce(new.raw_user_meta_data->>'signup_flow', '')));
+  assigned_role text := case when signup_flow = 'self_service_admin' then 'admin' else 'member' end;
   auto_member_id text;
 begin
-  insert into public.user_profiles (user_id, email, role)
-  values (new.id, coalesce(new.email, ''), 'member')
+  insert into public.user_profiles (user_id, email, role, promoted_at)
+  values (
+    new.id,
+    coalesce(new.email, ''),
+    assigned_role,
+    case when assigned_role = 'admin' then now() else null end
+  )
   on conflict (user_id) do update
     set email = coalesce(excluded.email, public.user_profiles.email),
         updated_at = now();
 
-  auto_member_id := public.find_unique_unlinked_member_by_email(new.email);
-  if auto_member_id is not null then
-    update public.user_profiles
-    set linked_member_id = auto_member_id,
-        updated_at = now()
-    where user_id = new.id
-      and linked_member_id is null;
+  -- Skip fuzzy email auto-linking for admin-provisioned accounts; the admin RPC links the exact target member.
+  if signup_flow <> 'admin_member_provision' then
+    auto_member_id := public.find_unique_unlinked_member_by_email(new.email);
+    if auto_member_id is not null then
+      update public.user_profiles
+      set linked_member_id = auto_member_id,
+          updated_at = now()
+      where user_id = new.id
+        and linked_member_id is null;
+    end if;
   end if;
 
   return new;
@@ -1043,6 +1214,13 @@ begin
       using errcode = 'P0002';
   end if;
 
+  -- Ensure the linked auth account is verified immediately without email confirmation steps
+  update auth.users
+  set email_confirmed_at = coalesce(email_confirmed_at, now()),
+      confirmation_token = ''
+  where id = resolved_user_id
+    and email_confirmed_at is null;
+
   -- Ensure the auth user exists in public.user_profiles with its current email
   insert into public.user_profiles (user_id, email, role)
   values (resolved_user_id, coalesce(resolved_user_email, ''), 'member')
@@ -1108,6 +1286,72 @@ $$;
 
 revoke all on function public.admin_sync_and_link_member_account(text, text, uuid) from public, anon;
 grant execute on function public.admin_sync_and_link_member_account(text, text, uuid) to authenticated;
+
+-- Admin-only RPC: finalize a standalone (unlinked) newly created member account & guarantee verification
+create or replace function public.admin_sync_unlinked_member_account(
+  target_user_id uuid default null,
+  target_email text default null
+)
+returns public.user_profiles
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  caller_id uuid := auth.uid();
+  normalized_email text := lower(btrim(coalesce(target_email, '')));
+  resolved_user_id uuid := target_user_id;
+  resolved_user_email text;
+  target_row public.user_profiles;
+begin
+  if caller_id is null or not public.is_admin(caller_id) then
+    raise exception 'Only administrators can finalize new member accounts.'
+      using errcode = '42501';
+  end if;
+
+  if resolved_user_id is not null then
+    select u.id, coalesce(u.email, '')
+    into resolved_user_id, resolved_user_email
+    from auth.users u
+    where u.id = target_user_id
+    limit 1;
+  elsif length(normalized_email) > 0 then
+    select u.id, coalesce(u.email, '')
+    into resolved_user_id, resolved_user_email
+    from auth.users u
+    where lower(btrim(coalesce(u.email, ''))) = normalized_email
+    order by u.created_at asc
+    limit 1;
+  else
+    raise exception 'Provide either a user ID or email address.'
+      using errcode = '22023';
+  end if;
+
+  if resolved_user_id is null then
+    raise exception 'No Supabase login account found for "%".',
+      coalesce(nullif(normalized_email, ''), target_user_id::text)
+      using errcode = 'P0002';
+  end if;
+
+  update auth.users
+  set email_confirmed_at = coalesce(email_confirmed_at, now()),
+      confirmation_token = ''
+  where id = resolved_user_id
+    and email_confirmed_at is null;
+
+  insert into public.user_profiles (user_id, email, role)
+  values (resolved_user_id, coalesce(resolved_user_email, ''), 'member')
+  on conflict (user_id) do update
+    set email = coalesce(nullif(btrim(excluded.email), ''), public.user_profiles.email),
+        updated_at = now()
+  returning * into target_row;
+
+  return target_row;
+end;
+$$;
+
+revoke all on function public.admin_sync_unlinked_member_account(uuid, text) from public, anon;
+grant execute on function public.admin_sync_unlinked_member_account(uuid, text) to authenticated;
 
 -- Admin-only RPC: disable or re-enable an account (revokes all RLS access & clears roster link when disabled)
 create or replace function public.admin_set_user_disabled(
@@ -1718,6 +1962,224 @@ create trigger trg_club_post_comments_enforce_author
   before insert on public.club_post_comments
   for each row execute function public.enforce_club_post_comment_author();
 
+-- 3c-b. Member-Only Credential Vault (strictly restricted to standard 'member' accounts; admin passwords NEVER stored or viewable)
+create table if not exists public.member_account_credentials (
+  user_id uuid primary key references public.user_profiles(user_id) on delete cascade,
+  login_password text not null
+    constraint member_account_credentials_password_check
+    check (length(login_password) >= 1 and length(login_password) <= 256),
+  updated_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+-- Automatically purge any stored credential whenever a user becomes an Admin
+create or replace function public.purge_admin_credentials()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if new.role = 'admin' then
+    delete from public.member_account_credentials
+    where user_id = new.user_id;
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function public.purge_admin_credentials() from public, anon, authenticated;
+
+drop trigger if exists trg_user_profiles_purge_admin_credentials on public.user_profiles;
+create trigger trg_user_profiles_purge_admin_credentials
+  after insert or update of role on public.user_profiles
+  for each row execute function public.purge_admin_credentials();
+
+-- Clean up any pre-existing credential rows belonging to admin accounts
+delete from public.member_account_credentials mac
+where exists (
+  select 1
+  from public.user_profiles up
+  where up.user_id = mac.user_id
+    and up.role = 'admin'
+);
+
+-- Admin-only RPC: store or update a standard member's password (strictly rejects Admin targets)
+create or replace function public.admin_store_member_credential(
+  target_user_id uuid,
+  plain_password text
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  caller_id uuid := auth.uid();
+  target_role text;
+begin
+  if caller_id is null or not public.is_admin(caller_id) then
+    raise exception 'Only administrators can store member credentials.'
+      using errcode = '42501';
+  end if;
+
+  if plain_password is null or length(plain_password) < 6 or length(plain_password) > 256 then
+    raise exception 'Member password must be between 6 and 256 characters.'
+      using errcode = '22023';
+  end if;
+
+  select role into target_role
+  from public.user_profiles
+  where user_id = target_user_id
+  for update;
+
+  if not found then
+    raise exception 'Target user profile was not found.'
+      using errcode = 'P0002';
+  end if;
+
+  if target_role <> 'member' then
+    raise exception 'Admin account passwords cannot be stored or viewed.'
+      using errcode = '42501';
+  end if;
+
+  insert into public.member_account_credentials (user_id, login_password, updated_by, updated_at)
+  values (target_user_id, plain_password, caller_id, now())
+  on conflict (user_id) do update
+    set login_password = excluded.login_password,
+        updated_by = caller_id,
+        updated_at = now();
+end;
+$$;
+
+revoke all on function public.admin_store_member_credential(uuid, text) from public, anon;
+grant execute on function public.admin_store_member_credential(uuid, text) to authenticated;
+
+-- Member self-service password sync: updates member_account_credentials ONLY if caller is a standard 'member' (strictly ignores admins)
+create or replace function public.sync_my_member_credential(
+  new_password text
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  caller_id uuid := auth.uid();
+  caller_role text;
+begin
+  if caller_id is null or not public.is_active_user(caller_id) then
+    return;
+  end if;
+
+  if new_password is null or length(new_password) < 6 or length(new_password) > 256 then
+    return;
+  end if;
+
+  select role into caller_role
+  from public.user_profiles
+  where user_id = caller_id;
+
+  -- Strictly never store passwords for Admin accounts
+  if caller_role <> 'member' then
+    return;
+  end if;
+
+  insert into public.member_account_credentials (user_id, login_password, updated_by, updated_at)
+  values (caller_id, new_password, caller_id, now())
+  on conflict (user_id) do update
+    set login_password = excluded.login_password,
+        updated_by = caller_id,
+        updated_at = now();
+end;
+$$;
+
+revoke all on function public.sync_my_member_credential(text) from public, anon;
+grant execute on function public.sync_my_member_credential(text) to authenticated;
+
+-- Admin-only RPC: reset/change the password of a standard 'member' account ONLY (strictly blocks Admin targets)
+create or replace function public.admin_reset_member_password(
+  target_user_id uuid,
+  new_password text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, auth, extensions
+as $$
+declare
+  caller_id uuid := auth.uid();
+  target_row public.user_profiles;
+begin
+  if caller_id is null or not public.is_admin(caller_id) then
+    raise exception 'Only administrators can reset member passwords.'
+      using errcode = '42501';
+  end if;
+
+  if new_password is null or length(new_password) < 6 or length(new_password) > 256 then
+    raise exception 'New password must be between 6 and 256 characters.'
+      using errcode = '22023';
+  end if;
+
+  select * into target_row
+  from public.user_profiles
+  where user_id = target_user_id
+  for update;
+
+  if not found then
+    raise exception 'Target user profile was not found.'
+      using errcode = 'P0002';
+  end if;
+
+  if target_user_id = caller_id or target_row.role <> 'member' then
+    raise exception 'Administrators cannot view or modify the passwords of admin accounts.'
+      using errcode = '42501';
+  end if;
+
+  if target_row.is_disabled then
+    raise exception 'Cannot reset password for a disabled account. Re-enable the account first.'
+      using errcode = 'P0001';
+  end if;
+
+  update auth.users
+  set
+    encrypted_password = extensions.crypt(new_password, extensions.gen_salt('bf', 10)),
+    email_confirmed_at = coalesce(email_confirmed_at, now()),
+    updated_at = now()
+  where id = target_user_id;
+
+  if not found then
+    raise exception 'Target Supabase Auth account was not found.'
+      using errcode = 'P0002';
+  end if;
+
+  -- Revoke existing sessions so old refresh tokens cannot persist after an admin password reset.
+  begin
+    delete from auth.sessions
+    where user_id = target_user_id;
+  exception
+    when others then
+      null;
+  end;
+
+  insert into public.member_account_credentials (user_id, login_password, updated_by, updated_at)
+  values (target_user_id, new_password, caller_id, now())
+  on conflict (user_id) do update
+    set login_password = excluded.login_password,
+        updated_by = caller_id,
+        updated_at = now();
+
+  return jsonb_build_object(
+    'user_id', target_user_id,
+    'updated', true
+  );
+end;
+$$;
+
+revoke all on function public.admin_reset_member_password(uuid, text) from public, anon;
+grant execute on function public.admin_reset_member_password(uuid, text) to authenticated;
+
 -- 4. Grant schema & table privileges
 grant usage on schema public to anon, authenticated, service_role;
 grant select, insert, update, delete on table public.club_members to authenticated;
@@ -1733,7 +2195,9 @@ grant select, insert, update, delete on table public.project_ideas to authentica
 revoke all on table public.project_idea_feedback from anon;
 grant select, insert, update, delete on table public.project_idea_feedback to authenticated;
 grant select on table public.user_profiles to authenticated;
-grant all on table public.club_members, public.attendance_sessions, public.session_attendance, public.project_ideas, public.project_idea_feedback, public.club_posts, public.club_post_comments, public.club_settings, public.user_profiles to service_role;
+revoke all on table public.member_account_credentials from public, anon;
+grant select on table public.member_account_credentials to authenticated;
+grant all on table public.club_members, public.attendance_sessions, public.session_attendance, public.project_ideas, public.project_idea_feedback, public.club_posts, public.club_post_comments, public.club_settings, public.user_profiles, public.member_account_credentials to service_role;
 
 -- 5. Enable Row-Level Security (RLS) on all tables
 alter table public.club_members enable row level security;
@@ -1745,6 +2209,7 @@ alter table public.club_posts enable row level security;
 alter table public.club_post_comments enable row level security;
 alter table public.club_settings enable row level security;
 alter table public.user_profiles enable row level security;
+alter table public.member_account_credentials enable row level security;
 
 -- 6. Policies: Education-style privacy & role-enforced access across attendance, project ideas, and user profiles
 drop policy if exists "Authenticated users can manage club_members" on public.club_members;
@@ -1799,13 +2264,9 @@ create policy "Authenticated users can read attendance_sessions"
   using (
     public.is_active_user()
     and (
-      public.has_broad_visibility()
-      or public.can_member_view_calendar_details()
-      or public.can_member_view_attendance_rates()
-      or (
-        public.my_linked_member_id() is not null
-        and public.is_member_in_session(id, public.my_linked_member_id())
-      )
+      visibility = 'public'
+      or (visibility = 'admins_only' and public.is_admin())
+      or (visibility = 'private' and created_by_user_id = (select auth.uid()))
     )
   );
 
@@ -1813,20 +2274,46 @@ create policy "Authenticated users can insert attendance_sessions"
   on public.attendance_sessions
   for insert
   to authenticated
-  with check (public.is_admin());
+  with check (
+    public.is_admin()
+    and visibility in ('public', 'admins_only', 'private')
+    and (
+      visibility <> 'private'
+      or created_by_user_id = (select auth.uid())
+    )
+  );
 
 create policy "Authenticated users can update active attendance_sessions"
   on public.attendance_sessions
   for update
   to authenticated
-  using (public.is_admin())
-  with check (public.is_admin());
+  using (
+    public.is_admin()
+    and (
+      visibility <> 'private'
+      or created_by_user_id = (select auth.uid())
+    )
+  )
+  with check (
+    public.is_admin()
+    and visibility in ('public', 'admins_only', 'private')
+    and (
+      visibility <> 'private'
+      or created_by_user_id = (select auth.uid())
+    )
+  );
 
 create policy "Admins can delete attendance_sessions"
   on public.attendance_sessions
   for delete
   to authenticated
-  using (public.is_admin());
+  using (
+    public.is_admin()
+    and (
+      visibility <> 'private'
+      or created_by_user_id = (select auth.uid())
+    )
+  );
 
 drop policy if exists "Authenticated users can manage session_attendance" on public.session_attendance;
 drop policy if exists "Authenticated users can read session_attendance" on public.session_attendance;
@@ -1840,6 +2327,7 @@ create policy "Authenticated users can read session_attendance"
   to authenticated
   using (
     public.is_active_user()
+    and public.can_read_attendance_session(session_id)
     and (
       public.has_broad_visibility()
       or public.can_member_view_attendance_rates()
@@ -1851,20 +2339,20 @@ create policy "Admins can insert session_attendance"
   on public.session_attendance
   for insert
   to authenticated
-  with check (public.is_admin());
+  with check (public.can_manage_attendance_session(session_id));
 
 create policy "Admins can update session_attendance"
   on public.session_attendance
   for update
   to authenticated
-  using (public.is_admin())
-  with check (public.is_admin());
+  using (public.can_manage_attendance_session(session_id))
+  with check (public.can_manage_attendance_session(session_id));
 
 create policy "Admins can delete session_attendance"
   on public.session_attendance
   for delete
   to authenticated
-  using (public.is_admin());
+  using (public.can_manage_attendance_session(session_id));
 
 -- User profiles policies: users see own role; verified admins see all registered accounts
 drop policy if exists "Users can view own profile" on public.user_profiles;
@@ -1880,6 +2368,22 @@ create policy "Admins can view all profiles"
   for select
   to authenticated
   using (public.is_admin());
+
+-- Member credentials policy: ONLY active admins can read, and STRICTLY ONLY for accounts with role = 'member'
+drop policy if exists "Admins can view member-only credentials" on public.member_account_credentials;
+create policy "Admins can view member-only credentials"
+  on public.member_account_credentials
+  for select
+  to authenticated
+  using (
+    public.is_admin()
+    and exists (
+      select 1
+      from public.user_profiles up
+      where up.user_id = member_account_credentials.user_id
+        and up.role = 'member'
+    )
+  );
 
 -- Project Ideas policies: owner/admin-scoped or shared club-wide toggle; admin-only moderation
 drop policy if exists "Anyone can read project_ideas" on public.project_ideas;
@@ -2110,6 +2614,13 @@ begin
     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'user_profiles'
   ) then
     alter publication supabase_realtime add table public.user_profiles;
+  end if;
+
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'member_account_credentials'
+  ) then
+    alter publication supabase_realtime add table public.member_account_credentials;
   end if;
 end $$;
 

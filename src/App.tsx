@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { AccountsLeftPanel } from './components/AccountsLeftPanel';
 import { AttendanceLeaderboard } from './components/AttendanceLeaderboard';
+import { AttendanceToolsSection } from './components/AttendanceToolsSection';
 import { AttendanceWorkspace } from './components/AttendanceWorkspace';
-import { CloudSyncModal } from './components/CloudSyncModal';
+import { CloudSyncModal, type AuthModalMode } from './components/CloudSyncModal';
 import { CreateSessionModal } from './components/CreateSessionModal';
 import { Header } from './components/Header';
+import { LandingScreen } from './components/LandingScreen';
+import { LoungeWorkspace } from './components/LoungeWorkspace';
+import { MeetingSettingsModal } from './components/MeetingSettingsModal';
 import { MemberManagerSidebar } from './components/MemberManagerSidebar';
 import { Preloader } from './components/Preloader';
 import { ProjectIdeasWorkspace } from './components/ProjectIdeasWorkspace';
@@ -19,6 +23,7 @@ import { useAdminRole } from './hooks/useAdminRole';
 import { useClubPosts } from './hooks/useClubPosts';
 import { useSupabaseAuth } from './hooks/useSupabaseAuth';
 import { useSyncedAttendanceData } from './hooks/useSyncedAttendanceData';
+import { syncMyMemberCredential } from './lib/adminApi';
 import type {
   AccessScope,
   AttendanceSession,
@@ -29,21 +34,24 @@ import type {
   ClubMember,
   MemberProfileInput,
   NewSessionInput,
+  SessionUpdateInput,
   SyncStatus,
   UserPreferences,
 } from './types/attendance';
 import type { TutorialStepConfig, TutorialStorageState } from './types/tutorial';
 import { canUserDeleteContent } from './types/projectIdeas';
 import {
+  MEETING_VISIBILITY_LABELS,
   generateId,
   getSessionAssignedMembers,
   isLegacyMember,
+  normalizeMeetingVisibility,
   sortSessionsNewestFirst,
   type AnnualProgressionSummary,
 } from './utils/attendance';
 import { getCurrentPeriodLabel, toIsoDateString } from './utils/date';
 import { usePreloaderPhase } from './utils/preloader';
-import { useAppRoute, type AppPage } from './utils/router';
+import { isAttendancePage, useAppRoute, type AppPage } from './utils/router';
 import {
   DEFAULT_PREFERENCES,
   PREFS_STORAGE_KEY,
@@ -69,7 +77,7 @@ export function App() {
   const memberSidebarId = useId();
   const accountsPanelId = useId();
   const [activePage, navigateTo] = useAppRoute();
-  const { authStatus, user, signIn, signOut, changePassword } = useSupabaseAuth();
+  const { authStatus, user, signIn, signUpAdmin, signOut, changePassword } = useSupabaseAuth();
   const isCloudConnected = authStatus === 'authenticated' && Boolean(user?.id);
   const {
     userRole,
@@ -80,6 +88,7 @@ export function App() {
     isRoleLoading,
     roleError,
     profiles: adminProfiles,
+    memberCredentials,
     isProfilesLoading,
     profilesError,
     refreshRoleAndProfiles,
@@ -87,6 +96,7 @@ export function App() {
     updateUserAdminRole,
     linkUserToMember,
     createAndLinkMemberAccount,
+    resetMemberPassword,
     syncAndLinkMemberAccount,
     updateUserVisibilityScope,
     setAccountDisabled,
@@ -148,9 +158,12 @@ export function App() {
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [duplicateSourceSession, setDuplicateSourceSession] =
     useState<AttendanceSession | null>(null);
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [openSettingsToPassword, setOpenSettingsToPassword] = useState(false);
   const [isAccountsPanelOpen, setIsAccountsPanelOpen] = useState(false);
   const [isCloudSyncModalOpen, setIsCloudSyncModalOpen] = useState(false);
+  const [authModalMode, setAuthModalMode] = useState<AuthModalMode>('login');
   const [isConflictModalOpen, setIsConflictModalOpen] = useState(false);
   const [tutorialState, setTutorialState] = useState<TutorialStorageState>(() =>
     loadTutorialState(),
@@ -226,6 +239,7 @@ export function App() {
     resolveConflict,
     resolveAllConflicts,
     createSession,
+    updateSession,
     deleteSession,
     addMember,
     addMembersBulk,
@@ -258,16 +272,23 @@ export function App() {
     [linkedMemberId, members],
   );
 
-  // Enforce member-linking privacy boundaries whenever scope or global permissions change.
+  // Enforce member-linking privacy boundaries and clear stale active/editing session IDs.
   useEffect(() => {
+    if (activeSessionId !== null && !sessions.some((session) => session.id === activeSessionId)) {
+      setActiveSessionId(null);
+    }
+    if (
+      editingSessionId !== null &&
+      (!canManageClubRecords || !sessions.some((session) => session.id === editingSessionId))
+    ) {
+      setEditingSessionId(null);
+    }
+
     if (
       accessScope === 'member_unlinked' &&
       !canViewCalendarDetails &&
       !canViewAttendanceRates
     ) {
-      if (activeSessionId !== null) {
-        setActiveSessionId(null);
-      }
       if (!canBrowseFullRoster && preferences.selectedMemberId !== null) {
         setPreferences((prev) => ({ ...prev, selectedMemberId: null }));
       }
@@ -283,10 +304,13 @@ export function App() {
     accessScope,
     activeSessionId,
     canBrowseFullRoster,
+    canManageClubRecords,
     canViewAttendanceRates,
     canViewCalendarDetails,
+    editingSessionId,
     linkedMemberId,
     preferences.selectedMemberId,
+    sessions,
   ]);
 
   const prevSyncStatusRef = useRef<SyncStatus>(syncStatus);
@@ -313,6 +337,7 @@ export function App() {
     setIsAccountsPanelOpen(false);
     setIsSettingsModalOpen(false);
     setIsCreateModalOpen(false);
+    setEditingSessionId(null);
     setIsConflictModalOpen(false);
     setActiveSessionId(null);
 
@@ -321,8 +346,8 @@ export function App() {
       await signOut();
       pushToast({
         tone: 'error',
-        tag: 'Access Disabled',
-        message: 'Your Team SPIRIT account access has been disabled by an administrator.',
+        tag: 'Access Revoked',
+        message: 'Your Team SPIRIT account access has been disabled or removed by an administrator.',
       });
     })();
   }, [isAccountDisabled, isCloudConnected, prepareForSignOut, pushToast, signOut, user?.id]);
@@ -331,7 +356,7 @@ export function App() {
     containerRevealClass,
     handlePreloaderBeginExit,
     handlePreloaderComplete,
-  } = usePreloaderPhase();
+  } = usePreloaderPhase({ skip: activePage === 'landing' });
 
   const handleDismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((item) => item.id !== id));
@@ -395,6 +420,9 @@ export function App() {
 
   const activeSession = activeSessionId
     ? sessions.find((session) => session.id === activeSessionId) ?? null
+    : null;
+  const editingSession = editingSessionId
+    ? sessions.find((session) => session.id === editingSessionId) ?? null
     : null;
 
   // Persist workspace UI preferences locally and sync theme/density attributes on root.
@@ -468,6 +496,46 @@ export function App() {
     setIsCreateModalOpen(true);
   }
 
+  function handleOpenEditSession(session: AttendanceSession) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('edit meeting settings');
+      return;
+    }
+    setEditingSessionId(session.id);
+  }
+
+  function handleUpdateSession(sessionId: string, input: SessionUpdateInput) {
+    if (!canManageClubRecords) {
+      notifyAdminRequired('edit meeting settings');
+      return;
+    }
+    const previousSession = sessions.find((session) => session.id === sessionId);
+    const updated = updateSession(sessionId, {
+      ...input,
+      visibility: isCloudConnected && isAdmin ? input.visibility : undefined,
+    });
+    if (!updated) return;
+
+    const undoToken = getLastUndoToken();
+    if (activePage === 'calendar' && previousSession && previousSession.date !== updated.date) {
+      setSelectedDateKey(updated.date);
+    }
+
+    const prevVis = normalizeMeetingVisibility(previousSession?.visibility);
+    const nextVis = normalizeMeetingVisibility(updated.visibility);
+    const visibilityNote =
+      isCloudConnected && isAdmin && prevVis !== nextVis
+        ? ` Visibility set to ${MEETING_VISIBILITY_LABELS[nextVis]}.`
+        : '';
+
+    pushToast({
+      tone: 'success',
+      tag: 'Meeting Updated',
+      message: `Saved updates to "${updated.name}".${visibilityNote}`,
+      undoToken,
+    });
+  }
+
   function handleDuplicateSession(session: AttendanceSession) {
     if (!canManageClubRecords) {
       notifyAdminRequired('duplicate sessions');
@@ -478,11 +546,7 @@ export function App() {
   }
 
   function handleSelectSession(sessionId: string) {
-    if (
-      accessScope === 'member_unlinked' &&
-      !canViewCalendarDetails &&
-      !canViewAttendanceRates
-    ) {
+    if (!sessions.some((session) => session.id === sessionId)) {
       return;
     }
     setActiveSessionId(sessionId);
@@ -884,6 +948,16 @@ export function App() {
   }
 
   function handleNavigate(page: AppPage) {
+    if (page === 'landing') {
+      setIsTutorialActive(false);
+      setIsAccountsPanelOpen(false);
+    }
+    if (!isAttendancePage(page)) {
+      setIsAccountsPanelOpen(false);
+      setPreferences((prev) =>
+        prev.isMemberSidebarOpen ? { ...prev, isMemberSidebarOpen: false } : prev,
+      );
+    }
     if (page === 'tracker') {
       setActiveSessionId(null);
     }
@@ -893,11 +967,7 @@ export function App() {
   }
 
   function handleOpenSessionInTracker(sessionId: string) {
-    if (
-      accessScope === 'member_unlinked' &&
-      !canViewCalendarDetails &&
-      !canViewAttendanceRates
-    ) {
+    if (!sessions.some((session) => session.id === sessionId)) {
       navigateTo('tracker');
       return;
     }
@@ -910,6 +980,11 @@ export function App() {
     navigateTo('tracker');
   }
 
+  function handleOpenAuthModal(mode: AuthModalMode) {
+    setAuthModalMode(mode);
+    setIsCloudSyncModalOpen(true);
+  }
+
   async function handleConnectCloudSync(
     email: string,
     password: string,
@@ -919,6 +994,30 @@ export function App() {
     const result = await signIn(email, password);
     if (result.error) {
       setMergeLocalOnNextConnect(false);
+    } else if (activePage === 'landing') {
+      navigateTo('lounge');
+    }
+    return result;
+  }
+
+  async function handleRegisterAdminAccount(
+    email: string,
+    password: string,
+    mergeLocalRecords: boolean,
+  ) {
+    setMergeLocalOnNextConnect(mergeLocalRecords);
+    const result = await signUpAdmin(email, password);
+    if (result.error) {
+      setMergeLocalOnNextConnect(false);
+    } else {
+      pushToast({
+        tone: 'success',
+        tag: 'Admin Account Ready',
+        message: `Created and verified admin account (${email.trim().toLowerCase()}).`,
+      });
+      if (activePage === 'landing') {
+        navigateTo('lounge');
+      }
     }
     return result;
   }
@@ -926,6 +1025,9 @@ export function App() {
   async function handleChangePassword(currentPassword: string, newPassword: string) {
     const result = await changePassword(currentPassword, newPassword);
     if (!result.error) {
+      if (!isAdmin) {
+        void syncMyMemberCredential(newPassword);
+      }
       pushToast({
         tone: 'success',
         tag: 'Password Updated',
@@ -969,6 +1071,7 @@ export function App() {
 
   async function handleDisconnectCloudSync() {
     setIsCreateModalOpen(false);
+    setEditingSessionId(null);
     setIsSettingsModalOpen(false);
     setIsAccountsPanelOpen(false);
     setIsCloudSyncModalOpen(false);
@@ -989,11 +1092,13 @@ export function App() {
     });
   }
 
-  const canInspectSessionsInTour = !(
-    accessScope === 'member_unlinked' &&
-    !canViewCalendarDetails &&
-    !canViewAttendanceRates
-  );
+  const canInspectSessionsInTour =
+    sessions.length > 0 ||
+    !(
+      accessScope === 'member_unlinked' &&
+      !canViewCalendarDetails &&
+      !canViewAttendanceRates
+    );
 
   const activeTutorialSteps = useMemo(
     () =>
@@ -1045,6 +1150,7 @@ export function App() {
     hasAutoTriggeredTutorialRef.current = true;
     setIsCreateModalOpen(false);
     setDuplicateSourceSession(null);
+    setEditingSessionId(null);
     setIsSettingsModalOpen(false);
     setIsAccountsPanelOpen(false);
     setIsCloudSyncModalOpen(false);
@@ -1156,8 +1262,9 @@ export function App() {
     tutorialStepIndex,
   ]);
 
-  // Launch the interactive walkthrough automatically on first visit once the preloader exits.
+  // Launch the interactive walkthrough automatically on first visit once inside the workspace.
   useEffect(() => {
+    if (activePage === 'landing') return;
     if (preloaderPhase !== 'done') return;
     if (hasAutoTriggeredTutorialRef.current) return;
     if (tutorialState.status !== 'unseen') {
@@ -1167,6 +1274,7 @@ export function App() {
     if (
       isTutorialActive ||
       isCreateModalOpen ||
+      editingSessionId !== null ||
       isSettingsModalOpen ||
       isCloudSyncModalOpen ||
       isConflictModalOpen
@@ -1180,6 +1288,8 @@ export function App() {
 
     return () => window.clearTimeout(timer);
   }, [
+    activePage,
+    editingSessionId,
     handleStartTutorial,
     isCloudSyncModalOpen,
     isConflictModalOpen,
@@ -1217,21 +1327,62 @@ export function App() {
   const activeMemberCount = members.filter((member) => !isLegacyMember(member)).length;
   const hasLocalRecords = !isCloudConnected && (members.length > 0 || sessions.length > 0);
 
+  if (activePage === 'landing') {
+    return (
+      <>
+        <LandingScreen
+          themeAccent={preferences.themeAccent}
+          periodLabel={getCurrentPeriodLabel()}
+          isCloudConnected={isCloudConnected}
+          isAdmin={isAdmin}
+          userEmail={user?.email}
+          isAuthModalOpen={isCloudSyncModalOpen}
+          syncStatus={syncStatus}
+          realtimeStatus={realtimeStatus}
+          onEnterSystem={() => handleNavigate('lounge')}
+          onNavigateWorkspace={(page) => handleNavigate(page)}
+          onOpenLogin={() => handleOpenAuthModal('login')}
+          onOpenCreateAccount={() => handleOpenAuthModal('register')}
+        />
+        <CloudSyncModal
+          isOpen={isCloudSyncModalOpen}
+          initialMode={authModalMode}
+          hasLocalRecords={hasLocalRecords}
+          localMemberCount={members.length}
+          localSessionCount={sessions.length}
+          onClose={() => setIsCloudSyncModalOpen(false)}
+          onConnect={handleConnectCloudSync}
+          onRegisterAdmin={handleRegisterAdminAccount}
+        />
+        <ToastContainer
+          toasts={toasts}
+          onDismiss={handleDismissToast}
+          onUndo={handleUndoToast}
+        />
+      </>
+    );
+  }
+
+  const inAttendanceSection = isAttendancePage(activePage);
+  const currentPeriodLabel = getCurrentPeriodLabel();
+
   return (
     <div
-      className={`app-shell ${preferences.isMemberSidebarOpen ? 'is-sidebar-open' : ''} ${
-        isCloudConnected && isAdmin && isAccountsPanelOpen ? 'is-accounts-panel-open' : ''
-      }`}
+      className={`app-shell ${inAttendanceSection ? 'is-attendance-section' : 'is-hangout-section'} ${
+        preferences.isMemberSidebarOpen ? 'is-sidebar-open' : ''
+      } ${isCloudConnected && isAdmin && isAccountsPanelOpen ? 'is-accounts-panel-open' : ''}`}
       data-density={preferences.rosterDensity}
     >
       {preloaderPhase !== 'done' && (
         <Preloader
           ariaLabel={
-            activePage === 'calendar'
-              ? 'Loading Team SPIRIT Session Calendar'
-              : activePage === 'ideas'
-                ? 'Loading Team SPIRIT Updates & Ideas'
-                : 'Loading Team SPIRIT Attendance Dashboard'
+            activePage === 'lounge'
+              ? 'Loading Team SPIRIT Student Lounge'
+              : activePage === 'calendar'
+                ? 'Loading Team SPIRIT Session Calendar'
+                : activePage === 'ideas'
+                  ? 'Loading Team SPIRIT Project Ideas'
+                  : 'Loading Team SPIRIT Attendance Tools'
           }
           onBeginExit={handlePreloaderBeginExit}
           onComplete={handlePreloaderComplete}
@@ -1241,178 +1392,43 @@ export function App() {
       <div className={`app-container ${containerRevealClass}`}>
         <Header
           activePage={activePage}
-          periodLabel={getCurrentPeriodLabel()}
-          memberCount={activeMemberCount}
-          isMemberSidebarOpen={preferences.isMemberSidebarOpen}
-          isAccountsPanelOpen={isCloudConnected && isAdmin && isAccountsPanelOpen}
-          accountsPanelId={accountsPanelId}
-          accountsCount={isCloudConnected && isAdmin ? adminProfiles.length : 0}
-          isTutorialActive={isTutorialActive}
-          sidebarId={memberSidebarId}
           isCloudConnected={isCloudConnected}
           accessScope={accessScope}
-          canBrowseFullRoster={canBrowseFullRoster}
           isAdmin={isAdmin}
           isRoleLoading={isAuthResolving}
           userEmail={user?.email}
           linkedMemberName={linkedMember?.name}
           syncStatus={syncStatus}
-          realtimeStatus={realtimeStatus}
-          pendingSyncCount={pendingCount}
           conflictCount={conflictCount}
-          isEditingActive={isEditingActive}
           syncError={syncError}
           onNavigate={handleNavigate}
           onRetrySync={() => void flushPendingChanges()}
           onOpenConflictModal={() => setIsConflictModalOpen(true)}
-          onOpenCloudSync={() => setIsCloudSyncModalOpen(true)}
-          onToggleMemberSidebar={handleToggleMemberSidebar}
-          onToggleAccountsPanel={
-            isCloudConnected && isAdmin ? handleToggleAccountsPanel : undefined
-          }
-          onStartTutorial={handleStartTutorial}
-          onOpenSettings={() => setIsSettingsModalOpen(true)}
-          onOpenCreateSession={handleOpenCreateSessionModal}
+          onOpenCloudSync={() => handleOpenAuthModal('login')}
+          onOpenSettings={() => {
+            setOpenSettingsToPassword(false);
+            setIsSettingsModalOpen(true);
+          }}
         />
 
         <main className="workspace-main">
           <div key={activePage} className="workspace-view-stage">
-            {activePage === 'tracker' ? (
-              <>
-                <StatsStrip
-                  members={displayedMembers}
-                  sessions={displayedSessions}
-                  activeSession={displayedActiveSession}
-                  accessScope={accessScope}
-                  linkedMember={linkedMember}
-                  canViewAttendanceRates={canViewAttendanceRates}
-                />
-                {displayedActiveSession ? (
-                  <AttendanceWorkspace
-                    activeSession={displayedActiveSession}
-                    members={displayedMembers}
-                    preferences={preferences}
-                    accessScope={accessScope}
-                    linkedMember={linkedMember}
-                    canViewAttendanceRates={canViewAttendanceRates}
-                    canBrowseFullRoster={canBrowseFullRoster}
-                    canManageClubRecords={canManageClubRecords}
-                    onBackToHub={
-                      isTutorialDemoSession ? () => undefined : handleBackToSessionHub
-                    }
-                    onOpenMemberManager={() =>
-                      handleUpdatePreferences({
-                        isMemberSidebarOpen: true,
-                        selectedMemberId:
-                          !canBrowseFullRoster && accessScope === 'member_self'
-                            ? (linkedMemberId ?? null)
-                            : null,
-                      })
-                    }
-                    onOpenMemberProfile={
-                      isTutorialDemoSession ? () => undefined : handleOpenMemberProfile
-                    }
-                    onDeleteSession={
-                      isTutorialDemoSession ? () => undefined : handleDeleteSession
-                    }
-                    onAssignMemberToSession={
-                      isTutorialDemoSession ? () => undefined : handleAssignMemberToSession
-                    }
-                    onAssignMembersToSession={
-                      isTutorialDemoSession ? () => undefined : handleAssignMembersToSession
-                    }
-                    onRemoveMemberFromSession={
-                      isTutorialDemoSession ? () => undefined : handleRemoveMemberFromSession
-                    }
-                    onToggleAttendanceStatus={
-                      isTutorialDemoSession ? () => undefined : handleToggleAttendanceStatus
-                    }
-                    onSetAbsenceReason={
-                      isTutorialDemoSession ? () => undefined : handleSetAbsenceReason
-                    }
-                    onBeginFieldEdit={isTutorialDemoSession ? undefined : beginFieldEdit}
-                    onEndFieldEdit={isTutorialDemoSession ? undefined : endFieldEdit}
-                    onResetSessionMarks={
-                      isTutorialDemoSession ? () => undefined : handleResetSessionMarks
-                    }
-                    onUpdatePreferences={handleUpdatePreferences}
-                  />
-                ) : (
-                  <>
-                    <SessionHub
-                      sessions={sessions}
-                      members={members}
-                      viewMode={preferences.sessionHubViewMode}
-                      accessScope={accessScope}
-                      linkedMemberId={linkedMemberId}
-                      canViewAttendanceRates={canViewAttendanceRates}
-                      canViewCalendarDetails={canViewCalendarDetails}
-                      userEmail={user?.email}
-                      canManageClubRecords={canManageClubRecords}
-                      onRefreshRole={() => void refreshRoleAndProfiles()}
-                      onChangeViewMode={(mode) =>
-                        handleUpdatePreferences({ sessionHubViewMode: mode })
-                      }
-                      onSelectSession={handleSelectSession}
-                      onDuplicateSession={handleDuplicateSession}
-                      onDeleteSession={handleDeleteSession}
-                      onOpenCreateSession={handleOpenCreateSessionModal}
-                    />
-                    {canViewAttendanceRates && !isTutorialDemoSession && (
-                      <AttendanceLeaderboard
-                        members={members}
-                        sessions={sessions}
-                        currentMemberId={linkedMemberId}
-                        canOpenMemberProfile={canBrowseFullRoster}
-                        onOpenMemberProfile={handleOpenMemberProfile}
-                      />
-                    )}
-                  </>
-                )}
-              </>
-            ) : activePage === 'calendar' ? (
-              <SessionCalendarWorkspace
-                sessions={sessions}
-                members={members}
-                selectedDateKey={selectedDateKey}
-                viewMode={preferences.calendarViewMode}
-                accessScope={accessScope}
-                linkedMemberId={linkedMemberId}
-                canViewAttendanceRates={canViewAttendanceRates}
-                canViewCalendarDetails={canViewCalendarDetails}
-                canBrowseFullRoster={canBrowseFullRoster}
-                onChangeViewMode={(mode) =>
-                  handleUpdatePreferences({ calendarViewMode: mode })
-                }
-                onSelectDate={setSelectedDateKey}
-                onOpenCreateSessionForDate={(dateKey) => {
-                  if (!canManageClubRecords) {
-                    notifyAdminRequired('record sessions');
-                    return;
-                  }
-                  setDuplicateSourceSession(null);
-                  setSelectedDateKey(dateKey);
-                  setIsCreateModalOpen(true);
-                }}
-                onOpenSessionInTracker={handleOpenSessionInTracker}
-                onOpenMemberProfile={handleOpenMemberProfile}
-              />
-            ) : (
-              <ProjectIdeasWorkspace
+            {activePage === 'lounge' ? (
+              <LoungeWorkspace
                 userId={isCloudConnected ? (user?.id ?? null) : null}
                 userEmail={user?.email}
                 linkedMember={linkedMember}
                 isAdmin={isAdmin}
+                periodLabel={currentPeriodLabel}
                 posts={clubPosts}
                 comments={clubPostComments}
-                sharedIdeaVisibility={sharedIdeaVisibility}
+                sessions={sessions}
                 memberCanCommentOnPosts={memberVisibilityPermissions.memberCanCommentOnPosts}
                 contentDeletionMode={contentDeletionMode}
                 isPostsLoading={isPostsLoading}
                 postsError={postsError}
                 isPostsLiveConnected={isPostsLiveConnected}
                 isPublishingPost={isPublishingPost}
-                isUpdatingSharedVisibility={isUpdatingSharedIdeaVisibility}
                 onRefreshPostsAndSettings={refreshPostsAndSettings}
                 onPublishPost={publishClubPost}
                 onEditPost={editClubPost}
@@ -1420,10 +1436,182 @@ export function App() {
                 onDeletePost={handleDeleteClubPost}
                 onAddComment={addClubPostComment}
                 onDeleteComment={handleDeleteClubPostComment}
-                onSetSharedIdeaVisibility={setSharedIdeaVisibility}
-                onOpenCloudSync={() => setIsCloudSyncModalOpen(true)}
+                onOpenCloudSync={() => handleOpenAuthModal('login')}
+                onNavigateIdeas={() => handleNavigate('ideas')}
+                onNavigateAttendanceCalendar={() => handleNavigate('calendar')}
                 onNotify={pushToast}
               />
+            ) : activePage === 'ideas' ? (
+              <ProjectIdeasWorkspace
+                userId={isCloudConnected ? (user?.id ?? null) : null}
+                userEmail={user?.email}
+                linkedMember={linkedMember}
+                isAdmin={isAdmin}
+                sharedIdeaVisibility={sharedIdeaVisibility}
+                contentDeletionMode={contentDeletionMode}
+                isUpdatingSharedVisibility={isUpdatingSharedIdeaVisibility}
+                onSetSharedIdeaVisibility={setSharedIdeaVisibility}
+                onOpenCloudSync={() => handleOpenAuthModal('login')}
+                onNotify={pushToast}
+              />
+            ) : (
+              <AttendanceToolsSection
+                activeSubPage={activePage === 'calendar' ? 'calendar' : 'tracker'}
+                periodLabel={currentPeriodLabel}
+                memberCount={activeMemberCount}
+                isMemberSidebarOpen={preferences.isMemberSidebarOpen}
+                isAccountsPanelOpen={isCloudConnected && isAdmin && isAccountsPanelOpen}
+                accountsPanelId={accountsPanelId}
+                accountsCount={isCloudConnected && isAdmin ? adminProfiles.length : 0}
+                isTutorialActive={isTutorialActive}
+                sidebarId={memberSidebarId}
+                isCloudConnected={isCloudConnected}
+                accessScope={accessScope}
+                canBrowseFullRoster={canBrowseFullRoster}
+                isAdmin={isAdmin}
+                syncStatus={syncStatus}
+                realtimeStatus={realtimeStatus}
+                pendingSyncCount={pendingCount}
+                conflictCount={conflictCount}
+                isEditingActive={isEditingActive}
+                syncError={syncError}
+                onNavigate={handleNavigate}
+                onRetrySync={() => void flushPendingChanges()}
+                onOpenConflictModal={() => setIsConflictModalOpen(true)}
+                onToggleMemberSidebar={handleToggleMemberSidebar}
+                onToggleAccountsPanel={
+                  isCloudConnected && isAdmin ? handleToggleAccountsPanel : undefined
+                }
+                onStartTutorial={handleStartTutorial}
+                onOpenCreateSession={handleOpenCreateSessionModal}
+              >
+                {activePage === 'tracker' ? (
+                  <>
+                    <StatsStrip
+                      members={displayedMembers}
+                      sessions={displayedSessions}
+                      activeSession={displayedActiveSession}
+                      accessScope={accessScope}
+                      linkedMember={linkedMember}
+                      canViewAttendanceRates={canViewAttendanceRates}
+                    />
+                    {displayedActiveSession ? (
+                      <AttendanceWorkspace
+                        activeSession={displayedActiveSession}
+                        members={displayedMembers}
+                        preferences={preferences}
+                        accessScope={accessScope}
+                        linkedMember={linkedMember}
+                        canViewAttendanceRates={canViewAttendanceRates}
+                        canBrowseFullRoster={canBrowseFullRoster}
+                        canManageClubRecords={canManageClubRecords}
+                        onBackToHub={
+                          isTutorialDemoSession ? () => undefined : handleBackToSessionHub
+                        }
+                        onOpenMemberManager={() =>
+                          handleUpdatePreferences({
+                            isMemberSidebarOpen: true,
+                            selectedMemberId:
+                              !canBrowseFullRoster && accessScope === 'member_self'
+                                ? (linkedMemberId ?? null)
+                                : null,
+                          })
+                        }
+                        onOpenMemberProfile={
+                          isTutorialDemoSession ? () => undefined : handleOpenMemberProfile
+                        }
+                        onEditSession={
+                          isTutorialDemoSession ? undefined : handleOpenEditSession
+                        }
+                        onDeleteSession={
+                          isTutorialDemoSession ? () => undefined : handleDeleteSession
+                        }
+                        onAssignMemberToSession={
+                          isTutorialDemoSession ? () => undefined : handleAssignMemberToSession
+                        }
+                        onAssignMembersToSession={
+                          isTutorialDemoSession ? () => undefined : handleAssignMembersToSession
+                        }
+                        onRemoveMemberFromSession={
+                          isTutorialDemoSession ? () => undefined : handleRemoveMemberFromSession
+                        }
+                        onToggleAttendanceStatus={
+                          isTutorialDemoSession ? () => undefined : handleToggleAttendanceStatus
+                        }
+                        onSetAbsenceReason={
+                          isTutorialDemoSession ? () => undefined : handleSetAbsenceReason
+                        }
+                        onBeginFieldEdit={isTutorialDemoSession ? undefined : beginFieldEdit}
+                        onEndFieldEdit={isTutorialDemoSession ? undefined : endFieldEdit}
+                        onResetSessionMarks={
+                          isTutorialDemoSession ? () => undefined : handleResetSessionMarks
+                        }
+                        onUpdatePreferences={handleUpdatePreferences}
+                      />
+                    ) : (
+                      <>
+                        <SessionHub
+                          sessions={sessions}
+                          members={members}
+                          viewMode={preferences.sessionHubViewMode}
+                          accessScope={accessScope}
+                          linkedMemberId={linkedMemberId}
+                          canViewAttendanceRates={canViewAttendanceRates}
+                          canViewCalendarDetails={canViewCalendarDetails}
+                          userEmail={user?.email}
+                          canManageClubRecords={canManageClubRecords}
+                          onRefreshRole={() => void refreshRoleAndProfiles()}
+                          onChangeViewMode={(mode) =>
+                            handleUpdatePreferences({ sessionHubViewMode: mode })
+                          }
+                          onSelectSession={handleSelectSession}
+                          onEditSession={handleOpenEditSession}
+                          onDuplicateSession={handleDuplicateSession}
+                          onDeleteSession={handleDeleteSession}
+                          onOpenCreateSession={handleOpenCreateSessionModal}
+                        />
+                        {canViewAttendanceRates && !isTutorialDemoSession && (
+                          <AttendanceLeaderboard
+                            members={members}
+                            sessions={sessions}
+                            currentMemberId={linkedMemberId}
+                            canOpenMemberProfile={canBrowseFullRoster}
+                            onOpenMemberProfile={handleOpenMemberProfile}
+                          />
+                        )}
+                      </>
+                    )}
+                  </>
+                ) : (
+                  <SessionCalendarWorkspace
+                    sessions={sessions}
+                    members={members}
+                    selectedDateKey={selectedDateKey}
+                    viewMode={preferences.calendarViewMode}
+                    accessScope={accessScope}
+                    linkedMemberId={linkedMemberId}
+                    canViewAttendanceRates={canViewAttendanceRates}
+                    canViewCalendarDetails={canViewCalendarDetails}
+                    canBrowseFullRoster={canBrowseFullRoster}
+                    onChangeViewMode={(mode) =>
+                      handleUpdatePreferences({ calendarViewMode: mode })
+                    }
+                    onSelectDate={setSelectedDateKey}
+                    onOpenCreateSessionForDate={(dateKey) => {
+                      if (!canManageClubRecords) {
+                        notifyAdminRequired('record sessions');
+                        return;
+                      }
+                      setDuplicateSourceSession(null);
+                      setSelectedDateKey(dateKey);
+                      setIsCreateModalOpen(true);
+                    }}
+                    onEditSession={canManageClubRecords ? handleOpenEditSession : undefined}
+                    onOpenSessionInTracker={handleOpenSessionInTracker}
+                    onOpenMemberProfile={handleOpenMemberProfile}
+                  />
+                )}
+              </AttendanceToolsSection>
             )}
           </div>
         </main>
@@ -1435,11 +1623,36 @@ export function App() {
           isOpen={isAccountsPanelOpen}
           currentUserId={user?.id ?? null}
           profiles={adminProfiles}
+          memberCredentials={memberCredentials}
           members={members}
           isProfilesLoading={isProfilesLoading}
           profilesError={profilesError}
           onClose={() => setIsAccountsPanelOpen(false)}
           onSyncProfiles={syncAdminProfiles}
+          onEnsureMemberSynced={flushPendingChanges}
+          onCreateAndLinkMemberAccount={createAndLinkMemberAccount}
+          onResetMemberPassword={resetMemberPassword}
+          onSyncMemberEmailToRoster={(targetMember, nextEmail) => {
+            const normalizedEmail = nextEmail.trim().toLowerCase();
+            if (!normalizedEmail) return;
+            handleUpdateMember(targetMember.id, {
+              name: targetMember.name,
+              memberType: targetMember.memberType,
+              classYear: targetMember.classYear,
+              classLetter: targetMember.classLetter,
+              className: targetMember.className,
+              isLegacy: targetMember.isLegacy,
+              retiredAt: targetMember.retiredAt,
+              lastPromotedYear: targetMember.lastPromotedYear,
+              graduationYear: targetMember.graduationYear,
+              role: targetMember.role,
+              email: normalizedEmail,
+              phone: targetMember.phone,
+              handle: targetMember.handle,
+              joinedDate: targetMember.joinedDate,
+              notes: targetMember.notes,
+            });
+          }}
           onUpdateUserAdminRole={updateUserAdminRole}
           onLinkUserToMember={linkUserToMember}
           onSetAccountDisabled={setAccountDisabled}
@@ -1463,6 +1676,7 @@ export function App() {
         canViewAttendanceRates={canViewAttendanceRates}
         isCloudConnected={isCloudConnected}
         isAdmin={isAdmin}
+        currentUserId={user?.id ?? null}
         adminProfiles={isCloudConnected && isAdmin ? adminProfiles : undefined}
         isProfilesLoading={isProfilesLoading}
         onEnsureMemberSynced={flushPendingChanges}
@@ -1474,6 +1688,16 @@ export function App() {
           isCloudConnected && isAdmin ? syncAndLinkMemberAccount : undefined
         }
         onLinkUserToMember={isCloudConnected && isAdmin ? linkUserToMember : undefined}
+        onResetMemberPassword={isCloudConnected && isAdmin ? resetMemberPassword : undefined}
+        onRemoveAccount={isCloudConnected && isAdmin ? removeAccount : undefined}
+        onOpenChangePassword={
+          isCloudConnected && !isAdmin
+            ? () => {
+                setOpenSettingsToPassword(true);
+                setIsSettingsModalOpen(true);
+              }
+            : undefined
+        }
         onNotify={pushToast}
         onSelectMember={(memberId) => handleUpdatePreferences({ selectedMemberId: memberId })}
         onClose={() => handleUpdatePreferences({ isMemberSidebarOpen: false })}
@@ -1491,6 +1715,7 @@ export function App() {
 
       <SettingsModal
         isOpen={isSettingsModalOpen}
+        openPasswordFormOnOpen={openSettingsToPassword}
         preferences={preferences}
         tutorialStatus={tutorialState.status}
         isCloudConnected={isCloudConnected}
@@ -1516,13 +1741,15 @@ export function App() {
         onUpdatePreferences={handleUpdatePreferences}
         onResetPreferences={handleResetPreferences}
         onStartTutorial={handleStartTutorial}
-        onOpenCloudSync={() => setIsCloudSyncModalOpen(true)}
+        onOpenCloudSync={() => handleOpenAuthModal('login')}
+        onOpenCreateAccount={() => handleOpenAuthModal('register')}
         onChangePassword={handleChangePassword}
         onSignOut={handleDisconnectCloudSync}
         onRefreshAdminProfiles={refreshRoleAndProfiles}
         onUpdateUserAdminRole={updateUserAdminRole}
         onLinkUserToMember={linkUserToMember}
         onUpdateUserVisibilityScope={updateUserVisibilityScope}
+        onRemoveAccount={isCloudConnected && isAdmin ? removeAccount : undefined}
         memberVisibilityPermissions={memberVisibilityPermissions}
         isUpdatingSharedIdeaVisibility={isUpdatingSharedIdeaVisibility}
         onUpdateMemberVisibilityPermissions={updateMemberVisibilityPermissions}
@@ -1531,7 +1758,10 @@ export function App() {
         onSetContentDeletionMode={setContentDeletionMode}
         onExportBackup={handleExportBackup}
         onImportBackupFile={handleImportBackupFile}
-        onClose={() => setIsSettingsModalOpen(false)}
+        onClose={() => {
+          setIsSettingsModalOpen(false);
+          setOpenSettingsToPassword(false);
+        }}
       />
 
       <CreateSessionModal
@@ -1545,6 +1775,7 @@ export function App() {
               ).length
             : 0
         }
+        showVisibilityControls={isCloudConnected && isAdmin}
         onClose={() => {
           setIsCreateModalOpen(false);
           setDuplicateSourceSession(null);
@@ -1552,13 +1783,26 @@ export function App() {
         onCreateSession={handleCreateSession}
       />
 
+      <MeetingSettingsModal
+        isOpen={editingSession !== null}
+        session={editingSession}
+        showVisibilityControls={isCloudConnected && isAdmin}
+        currentUserId={isCloudConnected ? (user?.id ?? null) : null}
+        onClose={() => setEditingSessionId(null)}
+        onSave={handleUpdateSession}
+        onBeginFieldEdit={beginFieldEdit}
+        onEndFieldEdit={endFieldEdit}
+      />
+
       <CloudSyncModal
         isOpen={isCloudSyncModalOpen}
+        initialMode={authModalMode}
         hasLocalRecords={hasLocalRecords}
         localMemberCount={members.length}
         localSessionCount={sessions.length}
         onClose={() => setIsCloudSyncModalOpen(false)}
         onConnect={handleConnectCloudSync}
+        onRegisterAdmin={handleRegisterAdminAccount}
       />
 
       <SyncConflictModal

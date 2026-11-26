@@ -31,6 +31,7 @@ import {
   printSessionAttendanceReport,
 } from '../utils/export';
 import { ConfirmDialog } from './ConfirmDialog';
+import { MeetingVisibilityBadge } from './MeetingSettingsModal';
 import {
   PixelArrowLeftIcon,
   PixelCalendarIcon,
@@ -45,6 +46,7 @@ import {
   PixelPrinterIcon,
   PixelRefreshIcon,
   PixelSearchIcon,
+  PixelSettingsIcon,
   PixelTerminalIcon,
   PixelTrashIcon,
   PixelUsersIcon,
@@ -62,6 +64,7 @@ interface AttendanceWorkspaceProps {
   onBackToHub: () => void;
   onOpenMemberManager: () => void;
   onOpenMemberProfile: (memberId: string) => void;
+  onEditSession?: (session: AttendanceSession) => void;
   onDeleteSession: (sessionId: string) => void;
   onAssignMemberToSession: (memberId: string) => void;
   onAssignMembersToSession: (memberIds: string[]) => void;
@@ -231,6 +234,7 @@ export function AttendanceWorkspace({
   onBackToHub,
   onOpenMemberManager,
   onOpenMemberProfile,
+  onEditSession,
   onDeleteSession,
   onAssignMemberToSession,
   onAssignMembersToSession,
@@ -531,6 +535,7 @@ export function AttendanceWorkspace({
                 {activeSession.eventType && (
                   <span className="session-type-tag">{activeSession.eventType}</span>
                 )}
+                <MeetingVisibilityBadge visibility={activeSession.visibility} />
               </div>
               {activeSession.description && (
                 <p className="session-banner-description">{activeSession.description}</p>
@@ -607,6 +612,7 @@ export function AttendanceWorkspace({
               {activeSession.eventType && (
                 <span className="session-type-tag">{activeSession.eventType}</span>
               )}
+              <MeetingVisibilityBadge visibility={activeSession.visibility} />
             </div>
             {activeSession.description && (
               <p className="session-banner-description">{activeSession.description}</p>
@@ -699,6 +705,20 @@ export function AttendanceWorkspace({
         </div>
 
         <div className="panel-header-actions">
+          {canEditSessionChecklist && onEditSession && (
+            <button
+              type="button"
+              className="btn-secondary"
+              disabled={!canManageClubRecords}
+              onClick={() => onEditSession(activeSession)}
+              title="Edit meeting details and visibility"
+              aria-label={`Edit meeting settings for ${activeSession.name}`}
+            >
+              <PixelSettingsIcon />
+              <span>Settings</span>
+            </button>
+          )}
+
           {canEditSessionChecklist && assignedMembers.length > 0 && (
             <button
               type="button"
@@ -787,6 +807,7 @@ export function AttendanceWorkspace({
             {activeSession.eventType && (
               <span className="session-type-tag">{activeSession.eventType}</span>
             )}
+            <MeetingVisibilityBadge visibility={activeSession.visibility} />
           </div>
           {activeSession.description && (
             <p className="session-banner-description">{activeSession.description}</p>

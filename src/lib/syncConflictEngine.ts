@@ -43,6 +43,7 @@ export const SESSION_MERGE_FIELDS: FieldSpec<SyncedSessionRecord>[] = [
   { key: 'location', label: 'Location' },
   { key: 'description', label: 'Description' },
   { key: 'eventType', label: 'Event Type' },
+  { key: 'visibility', label: 'Visibility' },
 ];
 
 export const ATTENDANCE_MERGE_FIELDS: FieldSpec<SyncedAttendanceRecord>[] = [

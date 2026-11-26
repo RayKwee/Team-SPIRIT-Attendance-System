@@ -67,9 +67,9 @@ export function shouldShowPreloaderOnBoot(): boolean {
 }
 
 /** Shared preloader lifecycle hook for the unified SPA shell. */
-export function usePreloaderPhase() {
+export function usePreloaderPhase(options?: { skip?: boolean }) {
   const [preloaderPhase, setPreloaderPhase] = useState<PreloaderPhase>(() =>
-    shouldShowPreloaderOnBoot() ? 'active' : 'done',
+    options?.skip ? 'done' : shouldShowPreloaderOnBoot() ? 'active' : 'done',
   );
 
   const handlePreloaderBeginExit = useCallback(() => {

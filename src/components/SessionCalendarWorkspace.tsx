@@ -31,12 +31,14 @@ import {
   parseJumpDateInput,
   toIsoDateString,
 } from '../utils/date';
+import { MeetingVisibilityBadge } from './MeetingSettingsModal';
 import {
   PixelCalendarIcon,
   PixelChevronIcon,
   PixelClockIcon,
   PixelPinIcon,
   PixelPlusIcon,
+  PixelSettingsIcon,
   PixelTerminalIcon,
 } from './PixelIcons';
 
@@ -53,6 +55,7 @@ interface SessionCalendarWorkspaceProps {
   onChangeViewMode: (mode: CalendarViewMode) => void;
   onSelectDate: (dateKey: string) => void;
   onOpenCreateSessionForDate: (dateKey: string) => void;
+  onEditSession?: (session: AttendanceSession) => void;
   onOpenSessionInTracker: (sessionId: string) => void;
   onOpenMemberProfile: (memberId: string) => void;
 }
@@ -86,6 +89,7 @@ export function SessionCalendarWorkspace({
   onChangeViewMode,
   onSelectDate,
   onOpenCreateSessionForDate,
+  onEditSession,
   onOpenSessionInTracker,
   onOpenMemberProfile,
 }: SessionCalendarWorkspaceProps) {
@@ -504,15 +508,29 @@ export function SessionCalendarWorkspace({
                             {session.eventType && (
                               <span className="session-type-tag">{session.eventType}</span>
                             )}
+                            <MeetingVisibilityBadge visibility={session.visibility} />
                           </div>
-                          <button
-                            type="button"
-                            className="btn-secondary btn-compact"
-                            onClick={() => onOpenSessionInTracker(session.id)}
-                          >
-                            <span>Open in Tracker</span>
-                            <PixelChevronIcon width={11} height={11} />
-                          </button>
+                          <div className="calendar-agenda-actions">
+                            {canCreateSessions && onEditSession && (
+                              <button
+                                type="button"
+                                className="icon-btn"
+                                onClick={() => onEditSession(session)}
+                                aria-label={`Edit meeting settings for ${session.name}`}
+                                title="Edit meeting settings"
+                              >
+                                <PixelSettingsIcon width={12} height={12} />
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              className="btn-secondary btn-compact"
+                              onClick={() => onOpenSessionInTracker(session.id)}
+                            >
+                              <span>Open in Tracker</span>
+                              <PixelChevronIcon width={11} height={11} />
+                            </button>
+                          </div>
                         </div>
 
                         {session.location && (
@@ -954,16 +972,30 @@ export function SessionCalendarWorkspace({
                         {session.eventType && (
                           <span className="session-type-tag">{session.eventType}</span>
                         )}
+                        <MeetingVisibilityBadge visibility={session.visibility} />
                       </div>
 
-                      <button
-                        type="button"
-                        className="btn-secondary btn-compact"
-                        onClick={() => onOpenSessionInTracker(session.id)}
-                      >
-                        <span>Open in Tracker</span>
-                        <PixelChevronIcon width={11} height={11} />
-                      </button>
+                      <div className="calendar-agenda-actions">
+                        {canCreateSessions && onEditSession && (
+                          <button
+                            type="button"
+                            className="icon-btn"
+                            onClick={() => onEditSession(session)}
+                            aria-label={`Edit meeting settings for ${session.name}`}
+                            title="Edit meeting settings"
+                          >
+                            <PixelSettingsIcon width={12} height={12} />
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="btn-secondary btn-compact"
+                          onClick={() => onOpenSessionInTracker(session.id)}
+                        >
+                          <span>Open in Tracker</span>
+                          <PixelChevronIcon width={11} height={11} />
+                        </button>
+                      </div>
                     </div>
 
                     <div className="session-meta-pills">

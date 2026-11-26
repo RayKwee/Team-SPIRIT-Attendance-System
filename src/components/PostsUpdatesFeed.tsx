@@ -29,6 +29,7 @@ import {
 } from './PixelIcons';
 
 interface PostsUpdatesFeedProps {
+  variant?: 'default' | 'lounge';
   userId: string | null;
   posts: ClubPost[];
   comments: ClubPostComment[];
@@ -67,6 +68,7 @@ const POST_CATEGORY_ACCENTS: Record<ClubPostCategory, string> = {
  * with live admin publishing, pinning, resource links, and meeting reminders.
  */
 export function PostsUpdatesFeed({
+  variant = 'default',
   userId,
   posts,
   comments,
@@ -453,15 +455,22 @@ export function PostsUpdatesFeed({
     }
   }
 
+  const isLoungeVariant = variant === 'lounge';
+
   return (
-    <section className="tracker-panel club-posts-panel" aria-label="Club Posts and Updates feed">
+    <section
+      className={`tracker-panel club-posts-panel ${isLoungeVariant ? 'is-lounge-feed' : ''}`}
+      aria-label="Club announcements and updates feed"
+    >
       <div className="tracker-panel-header">
         <div className="panel-title-group">
           <PixelMegaphoneIcon />
-          <h2 className="panel-title">Posts &amp; Updates</h2>
+          <h2 className="panel-title">
+            {isLoungeVariant ? 'Club Announcements' : 'Posts & Updates'}
+          </h2>
           <span className="panel-count">{filteredPosts.length}</span>
           <span className="ideas-public-tag" title="Visible to everyone visiting Team SPIRIT">
-            Public Feed
+            {isLoungeVariant ? 'Community Feed' : 'Public Feed'}
           </span>
           <span
             className={`ideas-live-badge ${isLiveConnected ? 'is-live' : ''}`}

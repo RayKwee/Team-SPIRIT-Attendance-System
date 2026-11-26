@@ -8,6 +8,9 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: 'index.html',
+        lounge: 'lounge.html',
+        attendance: 'attendance.html',
+        tracker: 'tracker.html',
         calendar: 'calendar.html',
         ideas: 'ideas.html',
         updates: 'updates.html',

@@ -643,3 +643,68 @@ export function printMemberProfileReport(
     emptyMessage: 'This member has not been assigned to any sessions yet.',
   });
 }
+
+export interface MemberCredentialExportRow {
+  memberName: string;
+  className: string;
+  clubRole: string;
+  email: string;
+  password: string;
+  status: string;
+}
+
+/** Formats member-only login credentials for fast clipboard copying (strictly excludes Admins). */
+export function buildMemberCredentialsClipboardText(rows: MemberCredentialExportRow[]): string {
+  const header = [
+    'Team SPIRIT — Member Login Credentials',
+    `Generated: ${new Date().toLocaleString()}`,
+    `Total Member Accounts: ${rows.length}`,
+    '----------------------------------------',
+  ];
+
+  const blocks = rows.map((row, idx) => {
+    const metaParts = [row.className, row.clubRole].filter(Boolean);
+    const title = metaParts.length > 0 ? `${row.memberName} (${metaParts.join(' • ')})` : row.memberName;
+    return [
+      `${idx + 1}. ${title}`,
+      `   Email:    ${row.email}`,
+      `   Password: ${row.password || '(Not recorded)'}`,
+    ].join('\n');
+  });
+
+  return [...header, ...blocks].join('\n\n');
+}
+
+/** Downloads a formula-safe CSV file containing standard Member login credentials only. */
+export function exportMemberCredentialsCsv(rows: MemberCredentialExportRow[]): void {
+  const dateStamp = toIsoDateString(new Date());
+  const csvRows: (string | number)[][] = [
+    ['Member Name', 'Class', 'Club Role', 'Login Email', 'Password', 'Account Status'],
+    ...rows.map((row) => [
+      row.memberName,
+      row.className || '—',
+      row.clubRole || '—',
+      row.email,
+      row.password || '(Not recorded)',
+      row.status,
+    ]),
+  ];
+  downloadCsv(`team-spirit-member-credentials-${dateStamp}.csv`, csvRows);
+}
+
+/** Downloads a clean plain-text credential sheet containing standard Member logins only. */
+export function exportMemberCredentialsText(rows: MemberCredentialExportRow[]): void {
+  const dateStamp = toIsoDateString(new Date());
+  const content = buildMemberCredentialsClipboardText(rows);
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `team-spirit-member-credentials-${dateStamp}.txt`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  window.setTimeout(() => {
+    URL.revokeObjectURL(url);
+  }, 1000);
+}

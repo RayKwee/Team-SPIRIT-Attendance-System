@@ -20,7 +20,7 @@ import type {
   MemberType,
   UserProfileRecord,
 } from '../types/attendance';
-import type { AdminCreateAccountResult } from '../lib/adminApi';
+import type { AdminCreateAccountResult, AdminRemoveAccountResult } from '../lib/adminApi';
 import {
   CLASS_LETTERS,
   CLASS_YEARS,
@@ -51,6 +51,7 @@ import {
 } from '../utils/export';
 import { ConfirmDialog } from './ConfirmDialog';
 import { MemberAccountCard } from './MemberAccountCard';
+import { MemberAccountProvisionPanel } from './MemberAccountProvisionPanel';
 import {
   PixelAlertIcon,
   PixelArchiveIcon,
@@ -87,6 +88,7 @@ interface MemberManagerSidebarProps {
   canViewAttendanceRates?: boolean;
   isCloudConnected?: boolean;
   isAdmin?: boolean;
+  currentUserId?: string | null;
   adminProfiles?: UserProfileRecord[];
   isProfilesLoading?: boolean;
   onEnsureMemberSynced?: () => Promise<boolean>;
@@ -106,6 +108,9 @@ interface MemberManagerSidebarProps {
     targetUserId: string,
     targetMemberId: string | null,
   ) => Promise<UserProfileRecord>;
+  onResetMemberPassword?: (targetUserId: string, newPassword: string) => Promise<void>;
+  onRemoveAccount?: (targetUserId: string) => Promise<AdminRemoveAccountResult>;
+  onOpenChangePassword?: () => void;
   onNotify?: (options: {
     tone: 'success' | 'info' | 'warning' | 'error';
     tag: string;
@@ -132,7 +137,7 @@ interface MemberManagerSidebarProps {
   onEndFieldEdit?: (fieldKey: string) => void;
 }
 
-type SidebarViewMode = 'directory' | 'profile' | 'add' | 'edit' | 'bulk_add';
+type SidebarViewMode = 'directory' | 'profile' | 'add' | 'edit' | 'bulk_add' | 'create_account';
 type DirectoryScope = 'active' | 'legacy';
 
 const ROLE_SUGGESTIONS = [
@@ -465,6 +470,7 @@ export function MemberManagerSidebar({
   canViewAttendanceRates = true,
   isCloudConnected = false,
   isAdmin = false,
+  currentUserId = null,
   adminProfiles = [],
   isProfilesLoading = false,
   onEnsureMemberSynced,
@@ -472,6 +478,9 @@ export function MemberManagerSidebar({
   onCreateAndLinkMemberAccount,
   onSyncAndLinkMemberAccount,
   onLinkUserToMember,
+  onResetMemberPassword,
+  onRemoveAccount,
+  onOpenChangePassword,
   onNotify,
   onSelectMember,
   onClose,
@@ -658,12 +667,23 @@ export function MemberManagerSidebar({
       return;
     }
 
-    if (!canEditRoster && (viewMode === 'add' || viewMode === 'edit' || viewMode === 'bulk_add')) {
+    if (
+      !canEditRoster &&
+      (viewMode === 'add' ||
+        viewMode === 'edit' ||
+        viewMode === 'bulk_add' ||
+        viewMode === 'create_account')
+    ) {
       setEditingTargetId(null);
       setEditingBaselineMember(null);
       setFormError('');
       setBulkError('');
       setViewMode(selectedMemberId && selectedMember ? 'profile' : 'directory');
+      return;
+    }
+
+    if (viewMode === 'create_account' && !canManageMemberAccounts) {
+      setViewMode('directory');
       return;
     }
 
@@ -682,6 +702,7 @@ export function MemberManagerSidebar({
     }
   }, [
     canEditRoster,
+    canManageMemberAccounts,
     isUnlinkedMemberScope,
     isSelfOnlyScope,
     linkedMemberId,
@@ -1618,6 +1639,7 @@ export function MemberManagerSidebar({
                         {viewMode === 'add' && 'Add Club Member'}
                         {viewMode === 'bulk_add' && 'Bulk Add Members'}
                         {viewMode === 'edit' && 'Edit Member Profile'}
+                        {viewMode === 'create_account' && 'Member Accounts'}
                       </>
                     )}
               </h2>
@@ -1755,9 +1777,21 @@ export function MemberManagerSidebar({
                 <strong>Profile Not Linked Yet</strong>
                 <span>
                   Your login is active, but an administrator has not linked your account to a Team
-                  SPIRIT roster profile yet. Ask a club admin in Settings → Admin Management to link
-                  your account.
+                  SPIRIT roster profile yet. Ask a club admin in Accounts or Settings to link your
+                  account.
                 </span>
+                {onOpenChangePassword && (
+                  <div className="member-unlinked-actions">
+                    <button
+                      type="button"
+                      className="btn-secondary btn-compact"
+                      onClick={onOpenChangePassword}
+                    >
+                      <PixelKeyIcon width={12} height={12} />
+                      <span>Change Password</span>
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1827,7 +1861,23 @@ export function MemberManagerSidebar({
                         onClick={openBulkAddForm}
                       >
                         <PixelUsersIcon />
-                        <span>Bulk Add Members</span>
+                        <span>Bulk Add</span>
+                      </button>
+                    )}
+
+                    {canManageMemberAccounts && members.length > 0 && (
+                      <button
+                        type="button"
+                        className="btn-secondary btn-compact member-account-entry-btn"
+                        onClick={() => {
+                          exitSelectionMode();
+                          onSelectMember(null);
+                          setViewMode('create_account');
+                        }}
+                        title="Create auto-verified member accounts or manage existing logins"
+                      >
+                        <PixelKeyIcon width={12} height={12} />
+                        <span>Member Accounts</span>
                       </button>
                     )}
 
@@ -2234,6 +2284,26 @@ export function MemberManagerSidebar({
               </div>
             )}
 
+            {canManageMemberAccounts &&
+              viewMode === 'create_account' &&
+              onCreateAndLinkMemberAccount && (
+                <MemberAccountProvisionPanel
+                  members={members}
+                  currentUserId={currentUserId}
+                  adminProfiles={adminProfiles}
+                  onEnsureMemberSynced={onEnsureMemberSynced}
+                  onCreateAndLinkAccount={onCreateAndLinkMemberAccount}
+                  onRemoveAccount={onRemoveAccount}
+                  onSyncMemberEmailToRoster={handleSyncMemberEmailToRoster}
+                  onOpenMemberProfile={(memberId) => {
+                    onSelectMember(memberId);
+                    setViewMode('profile');
+                  }}
+                  onBackToRoster={() => setViewMode('directory')}
+                  onNotify={onNotify}
+                />
+              )}
+
             {!isUnlinkedMemberScope && viewMode === 'profile' && selectedMember && activeProfileStats && (
               <div className="member-profile-view">
                 <div className="member-profile-topbar">
@@ -2247,9 +2317,22 @@ export function MemberManagerSidebar({
                       <span>{isLegacyMember(selectedMember) ? 'Legacy List' : 'Active Roster'}</span>
                     </button>
                   ) : (
-                    <span className="settings-mode-tag is-cloud">
-                      Linked Roster Profile • Read-only
-                    </span>
+                    <div className="member-self-topbar-row">
+                      <span className="settings-mode-tag is-cloud">
+                        Linked Roster Profile • Read-only
+                      </span>
+                      {onOpenChangePassword && (
+                        <button
+                          type="button"
+                          className="btn-secondary btn-compact member-self-password-btn"
+                          onClick={onOpenChangePassword}
+                          title="Change your Team SPIRIT login password"
+                        >
+                          <PixelKeyIcon width={12} height={12} />
+                          <span>Change Password</span>
+                        </button>
+                      )}
+                    </div>
                   )}
 
                   {canEditRoster && (
@@ -2444,6 +2527,7 @@ export function MemberManagerSidebar({
                     <MemberAccountCard
                       member={selectedMember}
                       members={members}
+                      currentUserId={currentUserId}
                       adminProfiles={adminProfiles}
                       isProfilesLoading={isProfilesLoading}
                       onEnsureMemberSynced={onEnsureMemberSynced}
@@ -2451,6 +2535,8 @@ export function MemberManagerSidebar({
                       onCreateAndLinkAccount={onCreateAndLinkMemberAccount}
                       onSyncAndLinkAccount={onSyncAndLinkMemberAccount}
                       onLinkUserToMember={onLinkUserToMember}
+                      onResetMemberPassword={onResetMemberPassword}
+                      onRemoveAccount={onRemoveAccount}
                       onSyncMemberEmailToRoster={handleSyncMemberEmailToRoster}
                       onNotify={onNotify}
                     />

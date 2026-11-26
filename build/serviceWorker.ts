@@ -231,6 +231,9 @@ async function handleGoogleFontAsset(request) {
 
 function getNavigationCandidatePaths(url) {
   const normalizedPathname = url.pathname.replace(/\\/+$/, '').toLowerCase() || '/';
+  if (normalizedPathname.endsWith('/tracker') || normalizedPathname.endsWith('/tracker.html')) {
+    return ['./tracker', './'];
+  }
   if (normalizedPathname.endsWith('/calendar') || normalizedPathname.endsWith('/calendar.html')) {
     return ['./calendar', './'];
   }
@@ -373,7 +376,7 @@ export function teamSpiritStaticCachePlugin(): Plugin {
       server.middlewares.use((req, _res, next) => {
         const incoming = req as { url?: string };
         if (incoming.url) {
-          const match = /^\/(calendar|ideas|updates)\/?(\?.*)?$/i.exec(incoming.url);
+          const match = /^\/(tracker|calendar|ideas|updates)\/?(\?.*)?$/i.exec(incoming.url);
           if (match) {
             incoming.url = `/${match[1].toLowerCase()}.html${match[2] ?? ''}`;
           }
@@ -385,6 +388,7 @@ export function teamSpiritStaticCachePlugin(): Plugin {
     generateBundle(_options, bundle) {
       const precacheSet = new Set<string>([
         './',
+        './tracker',
         './calendar',
         './ideas',
         './updates',

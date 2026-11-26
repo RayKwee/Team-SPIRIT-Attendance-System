@@ -314,3 +314,43 @@ export function PixelBanIcon(props: IconProps) {
     </svg>
   );
 }
+
+export function PixelChatIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M2 2h12v9H7l-3 3v-3H2V2zm2 2v5h8V4H4zm1 2h2v1H5V6zm4 0h2v1H9V6z" />
+    </svg>
+  );
+}
+
+export function PixelLoungeIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M4 1h2v2H4V1zm4 0h2v2H8V1zM2 5h10v6h-1v2H3v-2H2V5zm2 2v4h6V7H4zm8-1h2v4h-2V8h1V7h-1V6zM2 14h10v1H2v-1z" />
+    </svg>
+  );
+}
+
+export function PixelSendIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M1 2h3v1h3v1h3v1h3v1h2v4h-2v1h-3v1H7v1H4v1H1v-4h3V9h5V7H4V6H1V2z" />
+    </svg>
+  );
+}
+
+export function PixelSparkleIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M7 1h2v4h1v1h1v1h4v2h-4v1h-1v1H9v4H7v-4H6v-1H5V9H1V7h4V6h1V5h1V1z" />
+    </svg>
+  );
+}
+
+export function PixelToolsIcon(props: IconProps) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M9 1h4v2h-2v2h2v2h2V3h1v5h-2v1h-2v1h-1v1H9v2H7v2H2v-5h2V8h2V7h1V5h2V1zM4 11v2h2v-2H4z" />
+    </svg>
+  );
+}

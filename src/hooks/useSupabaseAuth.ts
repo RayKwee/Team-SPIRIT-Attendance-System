@@ -7,8 +7,11 @@ export type AuthStatus = 'loading' | 'authenticated' | 'unauthenticated';
 export type AuthErrorCategory =
   | 'validation'
   | 'account_not_found'
+  | 'already_exists'
   | 'invalid_credentials'
   | 'email_unconfirmed'
+  | 'weak_password'
+  | 'signup_disabled'
   | 'rate_limited'
   | 'network'
   | 'unknown';
@@ -19,7 +22,7 @@ export interface AuthLoginError {
   title: string;
   message: string;
   hint: string;
-  field?: 'email' | 'password' | 'both';
+  field?: 'email' | 'password' | 'confirm' | 'both';
 }
 
 export interface PasswordChangeError {
@@ -32,6 +35,7 @@ export interface UseSupabaseAuthResult {
   authStatus: AuthStatus;
   user: User | null;
   signIn: (email: string, password: string) => Promise<{ error: AuthLoginError | null }>;
+  signUpAdmin: (email: string, password: string) => Promise<{ error: AuthLoginError | null }>;
   signOut: () => Promise<void>;
   changePassword: (
     currentPassword: string,
@@ -237,7 +241,109 @@ export function classifySupabaseAuthError(error: unknown): AuthLoginError {
     code: 'AUTH_REJECTED',
     title: 'Authentication Failed',
     message: normalizedMessage || 'Supabase rejected the sign-in request.',
-    hint: 'Verify your account credentials in the Supabase Dashboard or continue in Local-Only Mode.',
+    hint: 'Verify your account credentials or continue in Local-Only Mode.',
+    field: 'both',
+  };
+}
+
+/** Classifies Supabase self-service registration errors into structured, actionable messages. */
+export function classifySupabaseSignUpError(error: unknown): AuthLoginError {
+  const { message, code, name, status } = extractAuthErrorMeta(error);
+  const normalizedCode = code.toLowerCase();
+  const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+
+  if (
+    isOffline ||
+    name === 'AuthRetryableFetchError' ||
+    status === 0 ||
+    (typeof status === 'number' && status >= 500) ||
+    NETWORK_ERROR_PATTERN.test(message)
+  ) {
+    return {
+      category: 'network',
+      code: 'NET_CONNECTION_FAILED',
+      title: 'Network or Connection Issue',
+      message: 'Unable to reach the Supabase authentication server.',
+      hint: 'Check your internet connection and try again, or continue in Local-Only Mode.',
+    };
+  }
+
+  if (
+    normalizedCode === 'signup_disabled' ||
+    /signups? not allowed|signup is disabled|user registration is disabled/i.test(message)
+  ) {
+    return {
+      category: 'signup_disabled',
+      code: 'AUTH_SIGNUP_DISABLED',
+      title: 'Account Registration Disabled',
+      message: 'Supabase currently has new user sign-ups disabled for this project.',
+      hint: 'Enable "Allow new users to sign up" in Supabase Auth settings, then retry.',
+    };
+  }
+
+  if (
+    normalizedCode === 'user_already_exists' ||
+    normalizedCode === 'email_exists' ||
+    /already registered|already exists|duplicate/i.test(message)
+  ) {
+    return {
+      category: 'already_exists',
+      code: 'AUTH_EMAIL_EXISTS',
+      title: 'Account Already Exists',
+      message: 'An account with this email address is already registered.',
+      hint: 'Switch to Login to sign in with your existing credentials.',
+      field: 'email',
+    };
+  }
+
+  if (normalizedCode === 'weak_password' || WEAK_PASSWORD_PATTERN.test(message)) {
+    return {
+      category: 'weak_password',
+      code: 'AUTH_WEAK_PASSWORD',
+      title: 'Password Too Weak',
+      message: message || 'Password must be at least 6 characters long.',
+      hint: 'Choose a stronger password with at least 6 characters.',
+      field: 'password',
+    };
+  }
+
+  if (
+    normalizedCode === 'email_address_invalid' ||
+    normalizedCode === 'validation_failed' ||
+    /invalid email|unable to validate email/i.test(message)
+  ) {
+    return {
+      category: 'validation',
+      code: 'ERR_INVALID_EMAIL',
+      title: 'Invalid Email Address',
+      message: message || 'Please enter a valid email address.',
+      hint: 'Check the email format and try again.',
+      field: 'email',
+    };
+  }
+
+  if (
+    normalizedCode === 'over_email_send_rate_limit' ||
+    normalizedCode === 'over_request_rate_limit' ||
+    status === 429 ||
+    RATE_LIMIT_PATTERN.test(message)
+  ) {
+    return {
+      category: 'rate_limited',
+      code: 'AUTH_RATE_LIMITED',
+      title: 'Too Many Attempts',
+      message: 'Supabase temporarily rate-limited registration requests.',
+      hint: 'Wait a moment before trying again (disabling Confirm Email in Supabase Auth also avoids SMTP limits).',
+      field: 'email',
+    };
+  }
+
+  return {
+    category: 'unknown',
+    code: 'AUTH_SIGNUP_FAILED',
+    title: 'Registration Failed',
+    message: message || 'Unable to create your admin account right now.',
+    hint: 'Verify your details and try again, or continue in Local-Only Mode.',
     field: 'both',
   };
 }
@@ -323,6 +429,90 @@ export function useSupabaseAuth(): UseSupabaseAuthResult {
         return { error: null };
       } catch (error) {
         return { error: classifySupabaseAuthError(error) };
+      }
+    },
+    [],
+  );
+
+  const signUpAdmin = useCallback(
+    async (email: string, password: string): Promise<{ error: AuthLoginError | null }> => {
+      const normalizedEmail = email.trim().toLowerCase();
+      try {
+        const { data, error } = await supabase.auth.signUp({
+          email: normalizedEmail,
+          password,
+          options: {
+            data: {
+              signup_flow: 'self_service_admin',
+            },
+          },
+        });
+
+        if (error) {
+          return { error: classifySupabaseSignUpError(error) };
+        }
+
+        const createdUser = data.user ?? null;
+        if (!createdUser?.id) {
+          return {
+            error: {
+              category: 'unknown',
+              code: 'AUTH_SIGNUP_FAILED',
+              title: 'Registration Failed',
+              message: 'Supabase did not return an account record after registration.',
+              hint: 'Try again or check your Supabase Authentication settings.',
+            },
+          };
+        }
+
+        // Supabase returns a pseudo-user with empty identities if the email already exists while Confirm Email is ON.
+        if (Array.isArray(createdUser.identities) && createdUser.identities.length === 0) {
+          return {
+            error: {
+              category: 'already_exists',
+              code: 'AUTH_EMAIL_EXISTS',
+              title: 'Account Already Exists',
+              message: 'An account with this email address is already registered.',
+              hint: 'Switch to Login to sign in with your existing credentials.',
+              field: 'email',
+            },
+          };
+        }
+
+        if (data.session?.user) {
+          authVersionRef.current += 1;
+          setUser(data.session.user);
+          setAuthStatus('authenticated');
+          return { error: null };
+        }
+
+        // Account is auto-verified by the database trigger; establish an immediate session right away.
+        const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+          email: normalizedEmail,
+          password,
+        });
+
+        if (signInError || !signInData.session?.user) {
+          return {
+            error: signInError
+              ? classifySupabaseAuthError(signInError)
+              : {
+                  category: 'unknown',
+                  code: 'AUTH_SESSION_UNAVAILABLE',
+                  title: 'Account Created — Sign-In Pending',
+                  message:
+                    'Your account was created, but an immediate session could not be started.',
+                  hint: 'Run the updated supabase/schema.sql so auto-verification is active, then log in.',
+                },
+          };
+        }
+
+        authVersionRef.current += 1;
+        setUser(signInData.session.user);
+        setAuthStatus('authenticated');
+        return { error: null };
+      } catch (error) {
+        return { error: classifySupabaseSignUpError(error) };
       }
     },
     [],
@@ -433,6 +623,7 @@ export function useSupabaseAuth(): UseSupabaseAuthResult {
     authStatus,
     user,
     signIn,
+    signUpAdmin,
     signOut,
     changePassword,
   };

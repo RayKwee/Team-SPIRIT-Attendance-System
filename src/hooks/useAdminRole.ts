@@ -2,9 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   adminCreateAndLinkMemberAccount,
   adminLinkUserToMember,
+  adminResetMemberPassword,
   adminSyncAndLinkMemberAccount,
   autoLinkMyMemberProfile,
   fetchAllUserProfiles,
+  fetchMemberCredentials,
   fetchMyUserProfile,
   removeUserAccount,
   setUserAccountDisabled,
@@ -28,6 +30,7 @@ export interface UseAdminRoleResult {
   isRoleLoading: boolean;
   roleError: string | null;
   profiles: UserProfileRecord[];
+  memberCredentials: Record<string, string>;
   isProfilesLoading: boolean;
   profilesError: string | null;
   refreshRoleAndProfiles: () => Promise<void>;
@@ -38,11 +41,12 @@ export interface UseAdminRoleResult {
     targetMemberId: string | null,
   ) => Promise<UserProfileRecord>;
   createAndLinkMemberAccount: (params: {
-    memberId: string;
-    memberName: string;
+    memberId?: string | null;
+    memberName?: string;
     email: string;
     password: string;
   }) => Promise<AdminCreateAccountResult>;
+  resetMemberPassword: (targetUserId: string, newPassword: string) => Promise<void>;
   syncAndLinkMemberAccount: (params: {
     memberId: string;
     email?: string;
@@ -68,6 +72,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
   const [isRoleLoading, setIsRoleLoading] = useState(false);
   const [roleError, setRoleError] = useState<string | null>(null);
   const [profiles, setProfiles] = useState<UserProfileRecord[]>([]);
+  const [memberCredentials, setMemberCredentials] = useState<Record<string, string>>({});
   const [isProfilesLoading, setIsProfilesLoading] = useState(false);
   const [profilesError, setProfilesError] = useState<string | null>(null);
 
@@ -76,7 +81,25 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
   activeUserIdRef.current = userId;
   const userRoleRef = useRef<AccountRole | null>(userRole);
   userRoleRef.current = userRole;
+  const profilesRef = useRef<UserProfileRecord[]>(profiles);
+  profilesRef.current = profiles;
   const requestSeqRef = useRef(0);
+
+  const filterCredentialsToMembersOnly = useCallback(
+    (raw: Record<string, string>, directory: UserProfileRecord[]): Record<string, string> => {
+      const memberIds = new Set(
+        directory.filter((p) => p.role === 'member').map((p) => p.userId),
+      );
+      const filtered: Record<string, string> = {};
+      for (const [uid, pwd] of Object.entries(raw)) {
+        if (memberIds.has(uid) && pwd) {
+          filtered[uid] = pwd;
+        }
+      }
+      return filtered;
+    },
+    [],
+  );
 
   const loadRoleAndDirectory = useCallback(async (targetUserId: string) => {
     const reqId = ++requestSeqRef.current;
@@ -98,6 +121,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
         setLinkedMemberId(null);
         setCanViewAllAttendance(false);
         setProfiles([]);
+        setMemberCredentials({});
         setProfilesError(null);
         setIsProfilesLoading(false);
         return;
@@ -128,9 +152,13 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
         setIsProfilesLoading(true);
         setProfilesError(null);
         try {
-          const allProfiles = await fetchAllUserProfiles();
+          const [allProfiles, rawCreds] = await Promise.all([
+            fetchAllUserProfiles(),
+            fetchMemberCredentials().catch(() => ({})),
+          ]);
           if (!isCurrentRequest()) return;
           setProfiles(allProfiles);
+          setMemberCredentials(filterCredentialsToMembersOnly(rawCreds, allProfiles));
         } catch (dirErr) {
           if (!isCurrentRequest()) return;
           setProfilesError(
@@ -143,6 +171,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
         }
       } else {
         setProfiles([]);
+        setMemberCredentials({});
         setProfilesError(null);
         setIsProfilesLoading(false);
       }
@@ -154,6 +183,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
       setLinkedMemberId(null);
       setCanViewAllAttendance(false);
       setProfiles([]);
+      setMemberCredentials({});
       setProfilesError(null);
       setIsProfilesLoading(false);
       setRoleError(err instanceof Error ? err.message : 'Unable to verify account permissions.');
@@ -162,7 +192,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
         setIsRoleLoading(false);
       }
     }
-  }, []);
+  }, [filterCredentialsToMembersOnly]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -176,6 +206,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
     setCanViewAllAttendance(false);
     setRoleError(null);
     setProfiles([]);
+    setMemberCredentials({});
     setIsProfilesLoading(false);
     setProfilesError(null);
 
@@ -200,6 +231,12 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
             const deletedId = (payload.old as { user_id?: string } | null)?.user_id;
             if (!deletedId) return;
             setProfiles((prev) => prev.filter((p) => p.userId !== deletedId));
+            setMemberCredentials((prev) => {
+              if (!(deletedId in prev)) return prev;
+              const next = { ...prev };
+              delete next[deletedId];
+              return next;
+            });
             if (deletedId === userId) {
               userRoleRef.current = 'member';
               setIsAccountDisabled(true);
@@ -207,12 +244,22 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
               setLinkedMemberId(null);
               setCanViewAllAttendance(false);
               setProfiles([]);
+              setMemberCredentials({});
             }
             return;
           }
 
           if (!payload.new) return;
           const incoming = userProfileFromDbRow(payload.new as DbUserProfileRow);
+          // Immediately strip any cached credential if an account becomes an Admin.
+          if (incoming.role === 'admin') {
+            setMemberCredentials((prev) => {
+              if (!(incoming.userId in prev)) return prev;
+              const next = { ...prev };
+              delete next[incoming.userId];
+              return next;
+            });
+          }
           if (incoming.userId === userId) {
             if (incoming.isDisabled) {
               userRoleRef.current = 'member';
@@ -221,6 +268,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
               setLinkedMemberId(null);
               setCanViewAllAttendance(false);
               setProfiles([]);
+              setMemberCredentials({});
               return;
             }
             const roleChanged = userRoleRef.current !== incoming.role;
@@ -239,6 +287,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
               });
             } else {
               setProfiles([]);
+              setMemberCredentials({});
             }
             if (roleChanged) {
               void loadRoleAndDirectory(userId);
@@ -252,6 +301,36 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
               return [...prev, incoming];
             });
           }
+        },
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'member_account_credentials' },
+        (payload) => {
+          if (!mountedRef.current || activeUserIdRef.current !== userId) return;
+          if (userRoleRef.current !== 'admin') return;
+
+          if (payload.eventType === 'DELETE') {
+            const deletedId = (payload.old as { user_id?: string } | null)?.user_id;
+            if (!deletedId) return;
+            setMemberCredentials((prev) => {
+              if (!(deletedId in prev)) return prev;
+              const next = { ...prev };
+              delete next[deletedId];
+              return next;
+            });
+            return;
+          }
+
+          const row = payload.new as { user_id?: string; login_password?: string } | null;
+          if (!row?.user_id || typeof row.login_password !== 'string') return;
+          const targetProfile = profilesRef.current.find((p) => p.userId === row.user_id);
+          if (targetProfile && targetProfile.role !== 'member') return;
+
+          setMemberCredentials((prev) => ({
+            ...prev,
+            [row.user_id!]: row.login_password!,
+          }));
         },
       )
       .subscribe();
@@ -275,6 +354,14 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
         ? prev.map((p) => (p.userId === updated.userId ? updated : p))
         : [...prev, updated];
     });
+    if (updated.role === 'admin') {
+      setMemberCredentials((prev) => {
+        if (!(updated.userId in prev)) return prev;
+        const next = { ...prev };
+        delete next[updated.userId];
+        return next;
+      });
+    }
     if (updated.userId === activeUserIdRef.current) {
       userRoleRef.current = updated.role;
       setUserRole(updated.role);
@@ -282,6 +369,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
       setCanViewAllAttendance(updated.canViewAllAttendance);
       if (updated.role !== 'admin') {
         setProfiles([]);
+        setMemberCredentials({});
       }
     }
   }, []);
@@ -311,9 +399,13 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
     setIsProfilesLoading(true);
     setProfilesError(null);
     try {
-      const synced = await syncAuthProfiles();
+      const [synced, rawCreds] = await Promise.all([
+        syncAuthProfiles(),
+        fetchMemberCredentials().catch(() => ({})),
+      ]);
       if (mountedRef.current && userRoleRef.current === 'admin') {
         setProfiles(synced);
+        setMemberCredentials(filterCredentialsToMembersOnly(rawCreds, synced));
       }
       return synced;
     } catch (err) {
@@ -326,20 +418,43 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
         setIsProfilesLoading(false);
       }
     }
-  }, []);
+  }, [filterCredentialsToMembersOnly]);
 
   const createAndLinkMemberAccount = useCallback(
     async (params: {
-      memberId: string;
-      memberName: string;
+      memberId?: string | null;
+      memberName?: string;
       email: string;
       password: string;
     }): Promise<AdminCreateAccountResult> => {
       const result = await adminCreateAndLinkMemberAccount(params);
       syncUpdatedProfileIntoState(result.profile);
+      if (mountedRef.current && result.profile.role === 'member' && result.password) {
+        setMemberCredentials((prev) => ({
+          ...prev,
+          [result.profile.userId]: result.password,
+        }));
+      }
       return result;
     },
     [syncUpdatedProfileIntoState],
+  );
+
+  const resetMemberPassword = useCallback(
+    async (targetUserId: string, newPassword: string): Promise<void> => {
+      const targetProfile = profilesRef.current.find((p) => p.userId === targetUserId);
+      if (targetProfile && targetProfile.role !== 'member') {
+        throw new Error('Administrators cannot view or modify the passwords of admin accounts.');
+      }
+      await adminResetMemberPassword(targetUserId, newPassword);
+      if (mountedRef.current) {
+        setMemberCredentials((prev) => ({
+          ...prev,
+          [targetUserId]: newPassword,
+        }));
+      }
+    },
+    [],
   );
 
   const syncAndLinkMemberAccount = useCallback(
@@ -379,6 +494,12 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
       if (!mountedRef.current) return result;
       if (result.mode === 'deleted') {
         setProfiles((prev) => prev.filter((profile) => profile.userId !== targetUserId));
+        setMemberCredentials((prev) => {
+          if (!(targetUserId in prev)) return prev;
+          const next = { ...prev };
+          delete next[targetUserId];
+          return next;
+        });
       } else {
         setProfiles((prev) =>
           prev.map((profile) =>
@@ -409,6 +530,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
     isRoleLoading,
     roleError,
     profiles,
+    memberCredentials,
     isProfilesLoading,
     profilesError,
     refreshRoleAndProfiles,
@@ -416,6 +538,7 @@ export function useAdminRole(userId: string | null): UseAdminRoleResult {
     updateUserAdminRole,
     linkUserToMember,
     createAndLinkMemberAccount,
+    resetMemberPassword,
     syncAndLinkMemberAccount,
     updateUserVisibilityScope,
     setAccountDisabled,
